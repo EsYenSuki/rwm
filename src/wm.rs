@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc::Receiver;
@@ -7,10 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::properties::WmSizeHints;
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ChangeWindowAttributesAux, ClientMessageEvent, ColormapAlloc,
-    ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, Gravity, GrabMode, GrabStatus,
-    InputFocus, KeyPressEvent, ModMask, PropMode, StackMode, Window, WindowClass,
+    ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux, ConnectionExt, CreateWindowAux,
+    EventMask, Gravity, GrabMode, GrabStatus, InputFocus, KeyPressEvent, ModMask, PropMode,
+    StackMode, Window, WindowClass, CONFIGURE_NOTIFY_EVENT,
 };
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::Event;
@@ -19,12 +23,10 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::bar::{
-    BAR_BACKGROUND_PIXEL, BARGAP, CLOCKPAD, Gl, HORIZPADBAR, KBLAYOUTPAD, LAUNCHERS,
+    BAR_BACKGROUND_PIXEL, BARGAP, CLOCKPAD, CursorLoader, HORIZPADBAR, KBLAYOUTPAD, LAUNCHERS,
     LAYOUT_SYMBOL, Metrics, TAG_LABEL, TAGS,
 };
-use crate::render::{
-    self, ClockBar, ClockRenderer, Frame, MonitorBar, RightBar, Renderer, TagsBar, TextBar, TitleBar,
-};
+use crate::drw::Drw;
 use crate::config::{self, BORDERPX, FLOATBAR, TOPBAR};
 use crate::keys::{self, Action, GapScope, Key, MOD_4, TAGMASK, TAG_COUNT};
 use crate::tree::{self, Gaps, Node, Rect};
@@ -35,6 +37,90 @@ const LOCK_MASK: u16 = 1 << 1;
 const MOD2_MASK: u16 = 1 << 4;
 /// dwm's CLEANMASK: every modifier except CapsLock and NumLock (Mod2 here).
 const CLEAN_MASK: u16 = 0xFD & !MOD2_MASK;
+/// Pointer motion throttle during a drag, matching dwm's `1000 / 60`.
+const DRAG_FRAME: Duration = Duration::from_millis(16);
+/// The one cadence for every animated bar value. Clock peaks and scrolling
+/// titles advance on this same grid, so redraws never come from two timers
+/// with different phases.
+const BAR_TICK: Duration = Duration::from_millis(20);
+/// Slow fallback for wakeups that only background threads can cause (PipeWire
+/// peaks and MPRIS snapshots). Used when no bar animation is active.
+const IDLE_POLL: Duration = Duration::from_millis(500);
+/// Scrolling title moves one pixel every two bar ticks (40 ms). A separate
+/// 33 ms timer used to fire between ticks and produced uneven redraw gaps.
+const SCROLL_TICKS: u32 = 2;
+/// Peak sampling stays on `BAR_TICK`, but the clock window is only resized at
+/// this rate. Each resize damages the compositor's frame, so limiting it cuts
+/// the GPU work without making the animation noticeably choppy.
+const CLOCK_RESIZE_TICK: Duration = Duration::from_millis(40);
+/// Don't repaint the MPRIS panel until the interpolated progress bar would
+/// move by about a pixel. This replaces the old once-per-second Position poll.
+const PROGRESS_EPSILON: f32 = 0.005;
+
+/// The parts of `WM_NORMAL_HINTS` dwm's `updatesizehints()` keeps. Zero means
+/// "not specified", as in the C version. Sizes are client sizes, without the
+/// border, because that is what `applysizehints()` operates on.
+#[derive(Clone, Copy, Debug, Default)]
+struct SizeHints {
+    min_w: i32,
+    min_h: i32,
+    max_w: i32,
+    max_h: i32,
+    base_w: i32,
+    base_h: i32,
+    inc_w: i32,
+    inc_h: i32,
+    min_aspect: f64,
+    max_aspect: f64,
+}
+
+/// dwm's `applysizehints()`: clamp a floating client's outer box to the hints
+/// it published. Tiled clients keep the layout's size, as with dwm's
+/// `resizehints = 0`.
+fn constrain_size(hints: &SizeHints, rect: Rect, border: i32, min_bar_height: i32) -> Rect {
+    let mut w = (rect.w as i32 - 2 * border).max(1);
+    let mut h = (rect.h as i32 - 2 * border).max(1);
+    w = w.max(min_bar_height);
+    h = h.max(min_bar_height);
+
+    let base_is_min = hints.base_w == hints.min_w && hints.base_h == hints.min_h;
+    if !base_is_min {
+        w -= hints.base_w;
+        h -= hints.base_h;
+    }
+    if hints.min_aspect > 0.0 && hints.max_aspect > 0.0 {
+        if hints.max_aspect < w as f64 / h as f64 {
+            w = (h as f64 * hints.max_aspect + 0.5) as i32;
+        } else if hints.min_aspect < h as f64 / w as f64 {
+            h = (w as f64 * hints.min_aspect + 0.5) as i32;
+        }
+    }
+    if base_is_min {
+        w -= hints.base_w;
+        h -= hints.base_h;
+    }
+    if hints.inc_w > 0 {
+        w -= w % hints.inc_w;
+    }
+    if hints.inc_h > 0 {
+        h -= h % hints.inc_h;
+    }
+    w = (w + hints.base_w).max(hints.min_w).max(1);
+    h = (h + hints.base_h).max(hints.min_h).max(1);
+    if hints.max_w > 0 {
+        w = w.min(hints.max_w);
+    }
+    if hints.max_h > 0 {
+        h = h.min(hints.max_h);
+    }
+
+    Rect {
+        x: rect.x,
+        y: rect.y,
+        w: (w + 2 * border).max(2 * border + 1) as u32,
+        h: (h + 2 * border).max(2 * border + 1) as u32,
+    }
+}
 
 pub struct Client {
     pub win: Window,
@@ -42,8 +128,13 @@ pub struct Client {
     pub mon: usize,
     /// dwm's `isfloating`: a floating window is outside the tiling tree.
     pub floating: bool,
+    /// Temporarily outside the tiling tree while Super+drag moves it. Its tree
+    /// leaf stays in place, so siblings expand until the drop reinserts it.
+    dragging: bool,
     /// The outer box of a floating window, like dwm's `x`, `y`, `w` and `h`.
     pub geom: Rect,
+    /// dwm's `minw`, `basew`, `incw`, aspect and friends from `WM_NORMAL_HINTS`.
+    hints: SizeHints,
     /// The input-only hover zones over the window's edges and corners, in the
     /// order of `tree::ZONE_EDGES`.
     pub edge_wins: [Window; 8],
@@ -62,15 +153,15 @@ struct ResizeCursors {
 }
 
 /// The resize cursors, named as in AnDWM's `dwm.c` `init cursors`.
-fn create_resize_cursors(gl: &Gl) -> ResizeCursors {
+fn create_resize_cursors(cursors: &CursorLoader) -> ResizeCursors {
     ResizeCursors {
-        moving: gl.load_cursor("fleur"),
-        horizontal: gl.load_cursor("sb_h_double_arrow"),
-        vertical: gl.load_cursor("sb_v_double_arrow"),
-        top_left: gl.load_cursor("top_left_corner"),
-        top_right: gl.load_cursor("top_right_corner"),
-        bottom_left: gl.load_cursor("bottom_left_corner"),
-        bottom_right: gl.load_cursor("bottom_right_corner"),
+        moving: cursors.load("fleur"),
+        horizontal: cursors.load("sb_h_double_arrow"),
+        vertical: cursors.load("sb_v_double_arrow"),
+        top_left: cursors.load("top_left_corner"),
+        top_right: cursors.load("top_right_corner"),
+        bottom_left: cursors.load("bottom_left_corner"),
+        bottom_right: cursors.load("bottom_right_corner"),
     }
 }
 
@@ -130,37 +221,77 @@ pub struct Wm {
     keysyms: Vec<u32>,
     min_keycode: u8,
     atoms: Atoms,
-    /// Text measuring for the layout. Drawing happens on `renderer`.
+    /// Text measuring for the layout, on the same Xlib display as `drw`.
     metrics: Metrics,
-    renderer: Renderer,
-    clock_renderer: ClockRenderer,
+    /// Xlib/Xft/XRender drawing, like C dwm's `drw`.
+    drw: Drw,
+    /// Last clock window state, so animation only repaints when it changes.
+    clock_drawn: RefCell<HashMap<Window, (i32, i32, i32, String, bool)>>,
     visual_id: u32,
     depth: u8,
     clock: String,
-    /// dwm's `clockbar_peak` source. `None` when `CLOCK_ANIMATE` is off.
+    /// Shared PipeWire peak for the animated clock width. It is sampled in the
+    /// main loop instead of a separate fixed-cadence thread, so there is no
+    /// second 50 Hz wakeup just to publish one atomic.
     clock_peak: Option<crate::sound::Peak>,
+    /// Last time the peak was sampled, on the shared `BAR_TICK` grid.
+    clock_anim_last: Instant,
+    /// Last time the clock window was actually resized.
+    clock_resize_last: Instant,
     /// dwm's `clockbar_dynw` minus `clockbar_cw`: px the clock bar grows past
     /// its text width on the selected monitor.
     clock_extra: i32,
-    /// dwm's `stext` (status text) and `kbstr` (keyboard layout).
-    stext: String,
+    /// Typed top-right bar values and `kbstr` (keyboard layout).
+    bar_status: crate::status::Status,
     kbstr: String,
+    /// Set by an event that may change what the bar shows. Window motion and
+    /// client configure events deliberately do not set it.
+    bar_dirty: bool,
+    /// Exposed bar windows must repaint even when their contents are unchanged.
+    /// Only these windows are forced, as in dwm's per-monitor `expose()`.
+    force_windows: RefCell<HashSet<Window>>,
+    /// Bar windows currently mapped. Map/unmap requests are only sent when the
+    /// desired state changes, not on every frame.
+    bar_mapped: RefCell<HashSet<Window>>,
+    /// Last drawing key committed to each bar window. An unchanged section is
+    /// not copied again, so an idle frame sends no X requests at all.
+    bar_drawn: RefCell<HashMap<Window, String>>,
+    /// Whether each monitor's clock window is currently mapped. A remap must
+    /// repaint it even if its text and geometry match the cache.
+    center_shown: RefCell<Vec<bool>>,
+    /// Last names read from clients, so frame builds don't need round trips.
+    name_cache: RefCell<HashMap<Window, String>>,
+    /// Last geometry sent to each managed window, so unchanged layouts cost no
+    /// configure requests. The last field is the border width.
+    geom_cache: RefCell<HashMap<Window, (i32, i32, u32, u32, u32)>>,
+    /// Resize zones owned by this WM. Only newly exposed zones need mapping.
+    mapped_zones: RefCell<HashSet<Window>>,
     status: crate::status::StatusSampler,
     mpris_rx: Receiver<crate::mpris::Snapshot>,
     mpris: crate::mpris::Snapshot,
     mpris_scroll_text: String,
+    /// Last progress value sent to the bar, for change detection without an
+    /// MPRIS Position poll.
+    last_progress: Option<f32>,
     mpris_scroll_px: u32,
-    mpris_scroll_last: Instant,
-    mpris_scroll_accum: Duration,
+    /// Earliest tick at which the scrolling title may advance. Keeping a
+    /// deadline instead of an accumulator locks scrolling to the bar grid.
+    mpris_scroll_next: Instant,
     mpris_hovered: bool,
     mpris_marker_hovered: bool,
     mpris_volume_drag: bool,
     mpris_marker_rect: Option<(i32, i32, i32, i32)>,
+    /// Whether each monitor's top-right bar was raised above client windows for
+    /// the expanded MPRIS panel, so it can be lowered again when the panel
+    /// collapses.
+    mpris_bar_raised: RefCell<Vec<bool>>,
     /// First event code of the XKB extension, or 0 when it is unavailable.
     xkb_event_base: u8,
     /// dwm's `enablegaps`, toggled by `ToggleGaps`.
     gaps_enabled: bool,
     resize_cursors: ResizeCursors,
+    /// Keeps the Xlib connection that owns the themed cursor ids alive.
+    _cursor_loader: CursorLoader,
     pub restart: bool,
 }
 
@@ -180,29 +311,16 @@ pub fn spawn(cmd: &str) -> Result {
     Ok(())
 }
 
-/// A bar-sized window with the GLX `visual` and `depth`, for a GL context to draw into.
-fn gl_window(conn: &RustConnection, root: Window, visual: u32, depth: u8) -> Result<u32> {
-    let win = conn.generate_id()?;
-    let cmap = conn.generate_id()?;
-    conn.create_colormap(ColormapAlloc::NONE, cmap, root, visual)?;
-    conn.create_window(
-        depth,
-        win,
-        root,
-        0,
-        0,
-        1,
-        1,
-        0,
-        WindowClass::INPUT_OUTPUT,
-        visual,
-        &CreateWindowAux::new()
-            .background_pixel(BAR_BACKGROUND_PIXEL)
-            .border_pixel(0)
-            .colormap(cmap),
-    )?
-    .check()?;
-    Ok(win)
+/// Bar windows use the root visual and depth, like C dwm. `Drw` creates its
+/// offscreen pixmap with the same visual so `XCopyArea` is a plain blit.
+fn bar_visual(conn: &RustConnection, root: Window) -> Result<(u32, u8)> {
+    let screen = conn
+        .setup()
+        .roots
+        .iter()
+        .find(|screen| screen.root == root)
+        .ok_or("root screen not found")?;
+    Ok((screen.root_visual, screen.root_depth))
 }
 
 fn now_clock() -> String {
@@ -246,7 +364,7 @@ impl Wm {
             no_animation: intern(b"_NO_ANIMATION")?,
         };
 
-        let gl = Gl::new(|visual, depth| gl_window(&conn, root, visual, depth))?;
+        let (visual_id, depth) = bar_visual(&conn, root)?;
 
         let mut monitors = Vec::new();
         for rect in rects {
@@ -291,16 +409,25 @@ impl Wm {
         let mpris_rx = crate::mpris::start_monitor();
         let mpris = crate::mpris::Snapshot::default();
         let mut status = crate::status::StatusSampler::new();
-        let stext = status.sample_with_mpris(Some(&mpris));
-        let resize_cursors = create_resize_cursors(&gl);
+        let bar_status = status.sample_with_mpris(Some(&mpris));
+        let cursor_loader = CursorLoader::open()?;
+        let resize_cursors = create_resize_cursors(&cursor_loader);
         conn.change_window_attributes(
             root,
-            &ChangeWindowAttributesAux::new().cursor(gl.load_cursor("left_ptr")),
+            &ChangeWindowAttributesAux::new().cursor(cursor_loader.load("left_ptr")),
         )?;
-        let metrics = Metrics::open()?;
-        let (visual_id, depth) = (gl.visual_id, gl.depth);
-        let renderer = render::spawn(gl);
-        let clock_renderer = render::spawn_clock(depth);
+        // Fonts, cursors and every bar pixel use this one Xlib connection, the
+        // same way C dwm shares a single `Display *dpy` for all drawing.
+        let dpy = cursor_loader.display();
+        let screen = cursor_loader.screen();
+        let metrics = Metrics::new(dpy, screen)?;
+        let drw = Drw::new(dpy, screen, root as x11::xlib::Window)?;
+        let clock_peak = if config::CLOCK_ANIMATE {
+            Some(crate::sound::start())
+        } else {
+            None
+        };
+        let monitor_count = monitors.len();
         let mut wm = Wm {
             conn,
             root,
@@ -312,29 +439,41 @@ impl Wm {
             min_keycode,
             atoms,
             metrics,
-            renderer,
-            clock_renderer,
+            drw,
+            clock_drawn: RefCell::new(HashMap::new()),
             visual_id,
             depth,
             clock: now_clock(),
-            clock_peak: config::CLOCK_ANIMATE.then(crate::sound::start),
+            clock_peak,
+            clock_anim_last: Instant::now() - BAR_TICK,
+            clock_resize_last: Instant::now(),
             clock_extra: 0,
-            stext,
+            bar_status,
             kbstr: "us".to_string(),
+            bar_dirty: true,
+            force_windows: RefCell::new(HashSet::new()),
+            bar_mapped: RefCell::new(HashSet::new()),
+            bar_drawn: RefCell::new(HashMap::new()),
+            center_shown: RefCell::new(vec![false; monitor_count]),
+            name_cache: RefCell::new(HashMap::new()),
+            geom_cache: RefCell::new(HashMap::new()),
+            mapped_zones: RefCell::new(HashSet::new()),
             status,
             mpris_rx,
             mpris,
             mpris_scroll_text: String::new(),
+            last_progress: None,
             mpris_scroll_px: 0,
-            mpris_scroll_last: Instant::now(),
-            mpris_scroll_accum: Duration::ZERO,
+            mpris_scroll_next: Instant::now(),
             mpris_hovered: false,
             mpris_marker_hovered: false,
             mpris_volume_drag: false,
             mpris_marker_rect: None,
+            mpris_bar_raised: RefCell::new(vec![false; monitor_count]),
             xkb_event_base: 0,
             gaps_enabled: true,
             resize_cursors,
+            _cursor_loader: cursor_loader,
             restart: false,
         };
         wm.conn.change_property32(
@@ -542,6 +681,42 @@ impl Wm {
         self.metrics.bar_height()
     }
 
+    /// dwm's `updatesizehints()`, using x11rb's `WM_SIZE_HINTS` parser.
+    fn read_size_hints(&self, win: Window) -> Result<SizeHints> {
+        let Some(parsed) = WmSizeHints::get_normal_hints(&self.conn, win)?.reply()? else {
+            return Ok(SizeHints::default());
+        };
+        let (min_w, min_h) = parsed.min_size.unwrap_or((0, 0));
+        let (max_w, max_h) = parsed.max_size.unwrap_or((0, 0));
+        let (base_w, base_h) = parsed.base_size.unwrap_or((min_w, min_h));
+        let (inc_w, inc_h) = parsed.size_increment.unwrap_or((0, 0));
+        let (min_aspect, max_aspect) = parsed.aspect.map_or((0.0, 0.0), |(lo, hi)| {
+            let lo = if lo.numerator != 0 {
+                lo.denominator as f64 / lo.numerator as f64
+            } else {
+                0.0
+            };
+            let hi = if hi.denominator != 0 {
+                hi.numerator as f64 / hi.denominator as f64
+            } else {
+                0.0
+            };
+            (lo, hi)
+        });
+        Ok(SizeHints {
+            min_w: min_w.max(0),
+            min_h: min_h.max(0),
+            max_w: max_w.max(0),
+            max_h: max_h.max(0),
+            base_w: base_w.max(0),
+            base_h: base_h.max(0),
+            inc_w: inc_w.max(0),
+            inc_h: inc_h.max(0),
+            min_aspect,
+            max_aspect,
+        })
+    }
+
     /// The monitor's area below the bar, set by `update_bar_pos`.
     fn work(&self, mi: usize) -> Rect {
         let m = &self.monitors[mi];
@@ -552,14 +727,18 @@ impl Wm {
     fn tiled_order(&self, mi: usize) -> Vec<Window> {
         self.clients
             .iter()
-            .filter(|c| c.mon == mi && !c.floating && self.is_visible(c))
+            .filter(|c| c.mon == mi && !c.floating && !c.dragging && self.is_visible(c))
             .map(|c| c.win)
             .collect()
     }
 
     /// The outer box `win` is drawn in: its floating geometry or its tile.
     fn geometry(&self, mi: usize, win: Window) -> Option<Rect> {
-        if let Some(c) = self.clients.iter().find(|c| c.win == win && c.floating) {
+        if let Some(c) = self
+            .clients
+            .iter()
+            .find(|c| c.win == win && (c.floating || c.dragging))
+        {
             return Some(c.geom);
         }
         self.layout_mon(mi).into_iter().find(|(w, _)| *w == win).map(|(_, r)| r)
@@ -654,6 +833,7 @@ impl Wm {
                     )?
                     .check()?;
                 self.conn.map_window(*win)?;
+                self.bar_mapped.borrow_mut().insert(*win);
             }
             let m = &mut self.monitors[mi];
             [m.barwin, m.bartitlewin, m.barkbwin, m.barcenterwin, m.barrightwin] = wins;
@@ -724,7 +904,12 @@ impl Wm {
     fn barwidths(&self, mi: usize) -> BarWidths {
         let m = &self.monitors[mi];
         let barw = if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww };
-        let mut rw = self.metrics.status_width(&self.stext) + HORIZPADBAR;
+        let status_w = if let Some(custom) = &self.bar_status.custom {
+            self.metrics.status_width(custom)
+        } else {
+            self.metrics.status_runs_width(&self.bar_status)
+        };
+        let mut rw = status_w + HORIZPADBAR;
         if self.mpris_hovered && mi == self.selmon && self.mpris.present {
             rw = rw.max(320 + HORIZPADBAR);
         }
@@ -779,29 +964,122 @@ impl Wm {
         Some((cx + (cw + 2 * BARGAP) / 2 - dcw / 2, dcw))
     }
 
+    /// Maps or unmaps a bar window only when its state actually changes. The
+    /// old code sent MapWindow for every mapped window on every bar frame.
+    fn set_mapped(&self, win: Window, map: bool) -> Result {
+        let mut mapped = self.bar_mapped.borrow_mut();
+        if mapped.contains(&win) == map {
+            return Ok(());
+        }
+        if map {
+            self.conn.map_window(win)?;
+            mapped.insert(win);
+        } else {
+            self.conn.unmap_window(win)?;
+            mapped.remove(&win);
+        }
+        Ok(())
+    }
+
+    /// Whether a bar section needs its pixels copied again. An Expose event
+    /// forces a repaint even when the cached key matches.
+    fn section_changed(&self, win: Window, key: &str) -> bool {
+        self.force_windows.borrow().contains(&win)
+            || self.bar_drawn.borrow().get(&win).map(String::as_str) != Some(key)
+    }
+
+    /// Configures `win` only when its geometry actually changes. This keeps the
+    /// per-tick bar layout work from generating X requests and damage. Returns
+    /// whether a configure request was sent.
+    fn configure_cached(
+        &self,
+        win: Window,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        border: u32,
+    ) -> Result<bool> {
+        let (w, h) = (w.max(1) as u32, h.max(1) as u32);
+        let key = (x, y, w, h, border);
+        if self.geom_cache.borrow().get(&win) == Some(&key) {
+            return Ok(false);
+        }
+        self.conn.configure_window(
+            win,
+            &ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(w)
+                .height(h)
+                .border_width(border),
+        )?;
+        self.geom_cache.borrow_mut().insert(win, key);
+        Ok(true)
+    }
+
+    fn place_cached(&self, win: Window, x: i32, y: i32, w: i32, h: i32) -> Result {
+        self.configure_cached(win, x, y, w, h, 0)?;
+        Ok(())
+    }
+
+    /// dwm's `configure()`: tells the client the geometry the WM settled on.
+    /// The X server also reports the real configure, but the explicit one is
+    /// what dwm sends and some clients rely on it to repaint during a drag.
+    fn send_configure(&self, win: Window, rect: Rect, inner_w: u32, inner_h: u32) -> Result {
+        let event = ConfigureNotifyEvent {
+            response_type: CONFIGURE_NOTIFY_EVENT,
+            sequence: 0,
+            event: win,
+            window: win,
+            above_sibling: NONE,
+            x: rect.x as i16,
+            y: rect.y as i16,
+            width: inner_w as u16,
+            height: inner_h as u16,
+            border_width: BORDERPX as u16,
+            override_redirect: false,
+        };
+        self.conn.send_event(false, win, EventMask::STRUCTURE_NOTIFY, event)?;
+        Ok(())
+    }
+
+    /// Configures one client and sends dwm's synthetic `ConfigureNotify` only
+    /// when the geometry changed. Returns the geometry actually applied, after
+    /// `WM_NORMAL_HINTS` for floating clients, and whether it changed.
+    fn place_client(&self, c: &Client, rect: Rect) -> Result<(Rect, bool)> {
+        let rect = if c.floating {
+            constrain_size(&c.hints, rect, BORDERPX, self.bar_h())
+        } else {
+            rect
+        };
+        let inner_w = (rect.w as i32 - 2 * BORDERPX).max(1) as u32;
+        let inner_h = (rect.h as i32 - 2 * BORDERPX).max(1) as u32;
+        let changed = self.configure_cached(
+            c.win,
+            rect.x,
+            rect.y,
+            inner_w as i32,
+            inner_h as i32,
+            BORDERPX as u32,
+        )?;
+        if changed {
+            self.send_configure(c.win, rect, inner_w, inner_h)?;
+        }
+        Ok((rect, changed))
+    }
+
     /// dwm's `resizebarwin()`, without the systray, Finder, notification and
     /// MPRIS sections. The clock window is placed by the clock thread.
     fn resize_bar_win(&self, mi: usize) -> Result {
         let m = &self.monitors[mi];
         let bh = self.bar_h();
-        let conn = &self.conn;
-        let place = |win: Window, x: i32, y: i32, w: i32, h: i32| -> Result {
-            conn.configure_window(
-                win,
-                &ConfigureWindowAux::new()
-                    .x(x)
-                    .y(y)
-                    .width(w.max(1) as u32)
-                    .height(h.max(1) as u32),
-            )?;
-            Ok(())
-        };
-
         if !m.showbar {
             for win in [m.barwin, m.bartitlewin, m.barcenterwin, m.barkbwin, m.barrightwin] {
-                place(win, m.wx, m.by, 1, bh)?;
+                self.place_cached(win, m.wx, m.by, 1, bh)?;
             }
-            self.conn.unmap_window(m.mpris_markerwin)?;
+            self.set_mapped(m.mpris_markerwin, false)?;
+            self.center_shown.borrow_mut()[mi] = false;
             return Ok(());
         }
 
@@ -809,20 +1087,26 @@ impl Wm {
         let lx = if FLOATBAR { m.wx + m.gaps.ov } else { m.wx };
         let rx = lx + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw;
 
-        place(m.barwin, lx, m.by, b.tw, bh)?;
+        self.place_cached(m.barwin, lx, m.by, b.tw, bh)?;
 
         let kx = lx + b.tw + BARGAP;
-        place(m.barkbwin, kx, m.by, b.kw, bh)?;
-        self.conn.map_window(m.barkbwin)?;
+        self.place_cached(m.barkbwin, kx, m.by, b.kw, bh)?;
+        self.set_mapped(m.barkbwin, true)?;
 
         let titlex = kx + b.kw + BARGAP;
-        place(m.bartitlewin, titlex, m.by, b.tlw, bh)?;
-        self.conn.map_window(m.bartitlewin)?;
+        self.place_cached(m.bartitlewin, titlex, m.by, b.tlw, bh)?;
+        self.set_mapped(m.bartitlewin, true)?;
 
-        if self.clock_place(mi).is_some() {
-            self.conn.map_window(m.barcenterwin)?;
-        } else {
-            self.conn.unmap_window(m.barcenterwin)?;
+        let show_clock = self.clock_place(mi).is_some();
+        self.set_mapped(m.barcenterwin, show_clock)?;
+        let was_shown = self.center_shown.borrow()[mi];
+        if was_shown != show_clock {
+            self.center_shown.borrow_mut()[mi] = show_clock;
+            // A remapped clock window needs an explicit repaint even when its
+            // text and size match the last draw.
+            if show_clock {
+                self.force_windows.borrow_mut().insert(m.barcenterwin);
+            }
         }
 
         let right_h = if self.mpris_hovered && mi == self.selmon && self.mpris.present {
@@ -830,8 +1114,30 @@ impl Wm {
         } else {
             bh
         };
-        place(m.barrightwin, rx, m.by, b.rw, right_h)?;
-        self.conn.map_window(m.barrightwin)?;
+        self.place_cached(m.barrightwin, rx, m.by, b.rw, right_h)?;
+        self.set_mapped(m.barrightwin, true)?;
+        Ok(())
+    }
+
+    /// Raise or lower the top-right bar and its volume marker relative to
+    /// client windows. On hover the panel grows to two rows and can overlap a
+    /// floating client, so while expanded it must sit on top of every window;
+    /// otherwise the extra row is hidden and its controls cannot be clicked.
+    /// With no sibling, `ABOVE`/`BELOW` are exactly the requests XRaiseWindow
+    /// and XLowerWindow send: top and bottom of the root's stacking order.
+    fn stack_mpris_bar(&self, mi: usize, above: bool) -> Result {
+        let m = &self.monitors[mi];
+        let aux = ConfigureWindowAux::new()
+            .stack_mode(if above { StackMode::ABOVE } else { StackMode::BELOW });
+        if above {
+            // Raise the panel first so the marker ends up on top of it.
+            self.conn.configure_window(m.barrightwin, &aux)?;
+            self.conn.configure_window(m.mpris_markerwin, &aux)?;
+        } else {
+            // Unwind in the opposite order when the panel collapses.
+            self.conn.configure_window(m.mpris_markerwin, &aux)?;
+            self.conn.configure_window(m.barrightwin, &aux)?;
+        }
         Ok(())
     }
 
@@ -884,40 +1190,42 @@ impl Wm {
         Ok(())
     }
 
-    /// Moves and sizes `win` to the outer box `r`. The client area is inset
-    /// by the border on each side, as in dwm's resize().
-    fn place(&self, win: Window, r: Rect) -> Result {
-        let inner_w = (r.w as i32 - 2 * BORDERPX).max(1) as u32;
-        let inner_h = (r.h as i32 - 2 * BORDERPX).max(1) as u32;
-        self.conn.configure_window(
-            win,
-            &ConfigureWindowAux::new()
-                .x(r.x)
-                .y(r.y)
-                .width(inner_w)
-                .height(inner_h)
-                .border_width(BORDERPX as u32),
-        )?;
-        Ok(())
-    }
-
-    fn apply_layout(&self) -> Result {
-        let mut boxes: Vec<(Window, Rect)> = Vec::new();
+    fn apply_layout(&mut self) -> Result {
+        let mut boxes: Vec<(Window, Rect, bool)> = Vec::new();
         for mi in 0..self.monitors.len() {
             self.resize_bar_win(mi)?;
             for (win, r) in self.layout_mon(mi) {
-                self.place(win, r)?;
-                boxes.push((win, r));
+                let Some(idx) = self.clients.iter().position(|c| c.win == win) else {
+                    continue;
+                };
+                let (rect, changed) = self.place_client(&self.clients[idx], r)?;
+                self.clients[idx].geom = rect;
+                boxes.push((win, rect, changed));
             }
         }
         // Oldest first, so the newest floating window ends up on top.
-        for c in self.clients.iter().rev().filter(|c| c.floating && self.is_visible(c)) {
-            self.place(c.win, c.geom)?;
+        let floating: Vec<(usize, Rect)> = self
+            .clients
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, c)| c.floating && self.is_visible(c))
+            .map(|(i, c)| (i, c.geom))
+            .collect();
+        for (idx, geom) in floating {
+            let (rect, changed) = self.place_client(&self.clients[idx], geom)?;
+            self.clients[idx].geom = rect;
             self.conn.configure_window(
-                c.win,
+                self.clients[idx].win,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
-            boxes.push((c.win, c.geom));
+            boxes.push((self.clients[idx].win, rect, changed));
+        }
+        // A tiled client being moved is visible, but its leaf is hidden from
+        // layout_mon() so its siblings take the whole workspace. Keep its
+        // zones at the last dragged position without reconfiguring the client.
+        for c in self.clients.iter().filter(|c| c.dragging && self.is_visible(c)) {
+            boxes.push((c.win, c.geom, false));
         }
         let shown: HashSet<Window> = self
             .clients
@@ -929,15 +1237,28 @@ impl Wm {
             if shown.contains(&c.win) {
                 self.conn.map_window(c.win)?;
             } else {
+                // Drop the cached geometry while hidden. A client may change its
+                // own size on UnmapNotify, and the next arrange must configure
+                // it again when its tag becomes visible.
+                self.geom_cache.borrow_mut().remove(&c.win);
                 self.conn.unmap_window(c.win)?;
             }
         }
-        for c in &self.clients {
-            match boxes.iter().find(|(w, _)| *w == c.win) {
-                Some((_, r)) => self.place_edge_zones(c, *r)?,
+        for idx in 0..self.clients.len() {
+            let win = self.clients[idx].win;
+            match boxes.iter().find(|(w, _, _)| *w == win) {
+                Some((_, r, changed)) => {
+                    let zones = self.clients[idx].edge_wins;
+                    // Floating clients are restacked above on every layout, so
+                    // their zones need to follow even when the box is unchanged.
+                    let restack = *changed || self.clients[idx].floating || self.clients[idx].dragging;
+                    self.place_edge_zones(zones, win, *r, restack)?;
+                }
                 None => {
-                    for zone in c.edge_wins {
+                    for zone in self.clients[idx].edge_wins {
                         self.conn.unmap_window(zone)?;
+                        self.mapped_zones.borrow_mut().remove(&zone);
+                        self.geom_cache.borrow_mut().remove(&zone);
                     }
                 }
             }
@@ -946,30 +1267,75 @@ impl Wm {
         Ok(())
     }
 
-    /// Puts the hover zones of `c` over its outer box `r`, each directly above
+    /// Puts the hover zones of `win` over its outer box `r`, each directly above
     /// the window so that other windows still stack over it correctly.
-    fn place_edge_zones(&self, c: &Client, r: Rect) -> Result {
-        let zones = tree::edge_zones(r, config::RESIZE_EDGE_PX);
-        for (zone, z) in c.edge_wins.iter().zip(zones) {
-            self.conn.configure_window(
-                *zone,
-                &ConfigureWindowAux::new()
-                    .x(z.x)
-                    .y(z.y)
-                    .width(z.w.max(1))
-                    .height(z.h.max(1))
-                    .sibling(c.win)
-                    .stack_mode(StackMode::ABOVE),
-            )?;
-            self.conn.map_window(*zone)?;
+    fn place_edge_zones(
+        &self,
+        zones: [Window; 8],
+        win: Window,
+        r: Rect,
+        restack: bool,
+    ) -> Result {
+        let rects = tree::edge_zones(r, config::RESIZE_EDGE_PX);
+        let mut mapped = self.mapped_zones.borrow_mut();
+        for (zone, z) in zones.iter().zip(rects) {
+            let changed = self.configure_cached(*zone, z.x, z.y, z.w as i32, z.h as i32, 0)?;
+            if changed || restack || !mapped.contains(zone) {
+                self.conn.configure_window(
+                    *zone,
+                    &ConfigureWindowAux::new()
+                        .sibling(win)
+                        .stack_mode(StackMode::ABOVE),
+                )?;
+            }
+            if changed || !mapped.contains(zone) {
+                self.conn.map_window(*zone)?;
+                mapped.insert(*zone);
+            }
         }
         Ok(())
+    }
+
+    /// Reconcile `mi`'s tiling tree with the current client list. A leaf can go
+    /// missing when a drop lands where no tile contains the pointer, or when a
+    /// window is moved between tags; once a visible client has no leaf it is
+    /// skipped by `layout_mon()`, so it stops resizing, loses its resize zones
+    /// and new windows appear to tile on top of it at full size. Hidden clients
+    /// keep their leaves so their place in the layout survives a tag switch.
+    fn sync_tree(&mut self, mi: usize) {
+        let managed: HashSet<Window> = self.clients.iter().map(|c| c.win).collect();
+        let mut leaves = Vec::new();
+        if let Some(t) = &self.monitors[mi].tree {
+            t.leaves(&mut leaves);
+        }
+        for win in leaves {
+            if !managed.contains(&win) {
+                let tree = &mut self.monitors[mi].tree;
+                *tree = tree.take().and_then(|t| t.remove(win));
+            }
+        }
+
+        let visible: Vec<Window> = self
+            .clients
+            .iter()
+            .filter(|c| c.mon == mi && !c.floating && self.is_visible(c))
+            .map(|c| c.win)
+            .collect();
+        let area = self.tile_area(mi);
+        for win in visible {
+            let has_leaf = self.monitors[mi].tree.as_ref().is_some_and(|t| t.has_leaf(win));
+            if !has_leaf {
+                let tree = &mut self.monitors[mi].tree;
+                *tree = Some(tree::append(tree.take(), win, area));
+            }
+        }
     }
 
     fn arrange(&mut self) -> Result {
         for mi in 0..self.monitors.len() {
             self.ensure_sel(mi);
             self.update_bar_pos(mi);
+            self.sync_tree(mi);
         }
         self.apply_layout()?;
         self.focus()
@@ -990,12 +1356,7 @@ impl Wm {
         let tree = &mut self.monitors[mi].tree;
         match target {
             Some((target, rect)) => {
-                let side_by_side = rect.w > rect.h;
-                let new_first = if side_by_side {
-                    mx < rect.x + (rect.w / 2) as i32
-                } else {
-                    my < rect.y + (rect.h / 2) as i32
-                };
+                let (new_first, side_by_side) = tree::split_for_drop(rect, (mx, my));
                 if let Some(t) = tree.as_mut() {
                     t.insert(target, win, new_first, side_by_side);
                 }
@@ -1028,7 +1389,20 @@ impl Wm {
             )?;
             *slot = zone;
         }
-        self.clients.insert(0, Client { win, tags, mon: mi, floating: false, geom, edge_wins });
+        let hints = self.read_size_hints(win).unwrap_or_default();
+        self.clients.insert(
+            0,
+            Client {
+                win,
+                tags,
+                mon: mi,
+                floating: false,
+                dragging: false,
+                geom,
+                hints,
+                edge_wins,
+            },
+        );
         self.selmon = mi;
         self.monitors[mi].sel = Some(win);
         self.conn.change_window_attributes(
@@ -1044,8 +1418,12 @@ impl Wm {
             return Ok(());
         };
         let client = self.clients.remove(idx);
+        self.name_cache.borrow_mut().remove(&win);
+        self.geom_cache.borrow_mut().remove(&win);
         for zone in client.edge_wins {
             self.conn.destroy_window(zone)?;
+            self.geom_cache.borrow_mut().remove(&zone);
+            self.mapped_zones.borrow_mut().remove(&zone);
         }
         let m = &mut self.monitors[client.mon];
         m.tree = m.tree.take().and_then(|t| t.remove(win));
@@ -1056,20 +1434,26 @@ impl Wm {
     }
 
     fn client_name(&self, win: Window) -> String {
+        if let Some(name) = self.name_cache.borrow().get(&win) {
+            return name.clone();
+        }
         let utf8 = self
             .conn
             .get_property(false, win, self.atoms.net_wm_name, self.atoms.utf8_string, 0, 256)
             .ok()
             .and_then(|c| c.reply().ok());
-        if let Some(r) = utf8.filter(|r| !r.value.is_empty()) {
-            return String::from_utf8_lossy(&r.value).into_owned();
-        }
-        self.conn
-            .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| String::from_utf8_lossy(&r.value).into_owned())
-            .unwrap_or_default()
+        let name = if let Some(r) = utf8.filter(|r| !r.value.is_empty()) {
+            String::from_utf8_lossy(&r.value).into_owned()
+        } else {
+            self.conn
+                .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+                .unwrap_or_default()
+        };
+        self.name_cache.borrow_mut().insert(win, name.clone());
+        name
     }
 
     /// Redraws every shown bar. Returns true when the clock text changed.
@@ -1082,29 +1466,48 @@ impl Wm {
         true
     }
 
-    /// dwm's `updateclockbar()` width step: maps the PipeWire peak to extra
-    /// clock width, the same truncation as `clock_draw_loop`. Returns true when
-    /// the width changed.
-    pub fn update_clock_anim(&mut self) -> bool {
-        let extra = match &self.clock_peak {
-            Some(peak) => {
-                let level = crate::sound::read(peak);
-                (level * config::CLOCK_ANIM_EXTRA as f32) as i32
-            }
-            None => 0,
+    /// Current peak-derived width in pixels, without changing any state.
+    fn pending_clock_extra(&self) -> i32 {
+        let Some(peak) = self.clock_peak.as_ref() else {
+            return 0;
         };
-        if extra == self.clock_extra {
+        let level = crate::sound::read(peak);
+        if level < config::CLOCK_PEAK_EPSILON {
+            return 0;
+        }
+        let step = config::CLOCK_ANIM_STEP.max(1);
+        let raw = (level * config::CLOCK_ANIM_EXTRA as f32) as i32;
+        ((raw / step) * step).clamp(0, config::CLOCK_ANIM_EXTRA)
+    }
+
+    /// Samples the PipeWire peak on the shared `BAR_TICK` grid. Returns true
+    /// when the quantized width changed.
+    pub fn update_clock_anim(&mut self) -> bool {
+        if self.clock_peak.is_none() {
+            return false;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.clock_anim_last) < BAR_TICK {
+            return false;
+        }
+        self.clock_anim_last = now;
+
+        let extra = self.pending_clock_extra();
+        if extra == self.clock_extra
+            || now.duration_since(self.clock_resize_last) < CLOCK_RESIZE_TICK
+        {
             return false;
         }
         self.clock_extra = extra;
+        self.clock_resize_last = now;
         true
     }
 
     /// Redraws every shown bar. Returns true when the status text changed.
     pub fn update_status(&mut self) -> bool {
         let new_status = self.status.sample_with_mpris(Some(&self.mpris));
-        if new_status != self.stext {
-            self.stext = new_status;
+        if new_status.key() != self.bar_status.key() {
+            self.bar_status = new_status;
             true
         } else {
             false
@@ -1128,15 +1531,20 @@ impl Wm {
         if scroll_text != self.mpris_scroll_text {
             self.mpris_scroll_text = scroll_text;
             self.mpris_scroll_px = 0;
-            self.mpris_scroll_accum = Duration::ZERO;
-            self.mpris_scroll_last = Instant::now();
+            self.mpris_scroll_next = Instant::now();
         }
+        let artwork_changed = match (&self.mpris.artwork, &snapshot.artwork) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+            _ => true,
+        };
         let changed = self.mpris.present != snapshot.present
             || self.mpris.playing != snapshot.playing
             || self.mpris.service != snapshot.service
             || self.mpris.artist != snapshot.artist
             || self.mpris.title != snapshot.title
             || self.mpris.art_url != snapshot.art_url
+            || artwork_changed
             || self.mpris.progress != snapshot.progress
             || (self.mpris.volume - snapshot.volume).abs() > 0.001;
         self.mpris = snapshot;
@@ -1150,32 +1558,41 @@ impl Wm {
     }
 
     pub fn update_mpris_scroll(&mut self) -> bool {
-        if !self.mpris.present || !self.mpris.playing || self.mpris_scroll_text.is_empty() {
-            self.mpris_scroll_last = Instant::now();
-            self.mpris_scroll_accum = Duration::ZERO;
+        if !self.scroll_active() {
+            self.mpris_scroll_next = Instant::now();
             return false;
         }
-        let text_width = self.metrics.text_width(&self.mpris_scroll_text);
-        if text_width + 16 <= 240 {
-            self.mpris_scroll_px = 0;
-            self.mpris_scroll_last = Instant::now();
-            self.mpris_scroll_accum = Duration::ZERO;
-            return false;
-        }
-
         let now = Instant::now();
-        let elapsed = now.duration_since(self.mpris_scroll_last).min(Duration::from_millis(250));
-        self.mpris_scroll_last = now;
-        self.mpris_scroll_accum += elapsed;
-        let frame = Duration::from_nanos(33_333_333);
-        let steps = (self.mpris_scroll_accum.as_nanos() / frame.as_nanos()) as u32;
-        if steps == 0 {
+        if now < self.mpris_scroll_next {
             return false;
         }
-        self.mpris_scroll_accum -= frame * steps;
+        self.mpris_scroll_next = now + BAR_TICK * SCROLL_TICKS;
+        let text_width = self.metrics.text_width(&self.mpris_scroll_text);
         let cycle = (text_width + 32).max(1) as u32;
-        self.mpris_scroll_px = (self.mpris_scroll_px + steps) % cycle;
+        self.mpris_scroll_px = (self.mpris_scroll_px + 1) % cycle;
         true
+    }
+
+    /// Whether a title is currently scrolling. Both the scroll step and the
+    /// main loop's next deadline use this, so they cannot disagree.
+    fn scroll_active(&self) -> bool {
+        if !self.mpris.present || !self.mpris.playing || self.mpris_scroll_text.is_empty() {
+            return false;
+        }
+        self.metrics.text_width(&self.mpris_scroll_text) + 16 > 240
+    }
+
+    /// Deadline for the next bar tick. The main loop blocks on the X connection
+    /// until this instant or an event, making this the only wakeup source.
+    pub fn next_tick(&self) -> Instant {
+        let mut next = self.status.next_sample();
+        if self.pending_clock_extra() != self.clock_extra {
+            next = next.min(self.clock_resize_last + CLOCK_RESIZE_TICK);
+        }
+        if self.scroll_active() {
+            next = next.min(self.mpris_scroll_next);
+        }
+        next.min(Instant::now() + IDLE_POLL)
     }
 
     /// Recomputes and updates the positions and widths of all bar windows.
@@ -1186,17 +1603,48 @@ impl Wm {
         Ok(())
     }
 
-    /// dwm's `drawbar()` for each shown monitor, one window per section. The
-    /// layout and the MPRIS marker window are set here, and the pixels are
-    /// drawn by the render thread from the frame built here.
-    pub fn draw_bars(&mut self, redraw_bars: bool) -> Result {
+    /// Configures and draws one clock window synchronously, like C dwm's
+    /// `drawclockbar()` followed by `drw_map()`. A window whose position, size,
+    /// text and focus did not change is not touched at all, so PipeWire noise
+    /// cannot keep the compositor busy.
+    fn draw_clock(&mut self, mi: usize) -> Result {
+        let m = &self.monitors[mi];
+        let Some((x, w)) = self.clock_place(mi) else {
+            return Ok(());
+        };
+        let (win, y) = (m.barcenterwin, m.by);
+        let focused = mi == self.selmon;
+        let text = self.clock.clone();
+        let forced = self.force_windows.borrow().contains(&win);
+        let key = (x, y, w, text.clone(), focused);
+        if !forced && self.clock_drawn.borrow().get(&win) == Some(&key) {
+            return Ok(());
+        }
+        let bh = self.bar_h();
+        let (dw, dh) = (w.max(1) as u32, bh.max(1) as u32);
+        self.place_cached(win, x, y, w, bh)?;
+        self.conn.flush()?;
+        self.drw.resize(dw, dh);
+        self.drw.clock(&self.metrics, dw as i32, &text, focused);
+        self.drw.map(win as x11::xlib::Window, dw, dh);
+        self.clock_drawn.borrow_mut().insert(win, key);
+        Ok(())
+    }
+
+    /// dwm's `drawbar()` for each shown monitor. Every section is drawn into
+    /// the one Xlib `drw` drawable, copied into its window and flushed before
+    /// the next section, exactly like the C version.
+    pub fn draw_bars(&mut self) -> Result {
+        // The geometry changes were queued on the x11rb connection; send them
+        // before the Xlib pixels land so a resized window gets the new frame.
+        self.conn.flush()?;
         self.mpris_marker_rect = None;
-        let mut frame = Frame { monitors: Vec::new() };
-        let mut clocks: Vec<ClockBar> = Vec::new();
-        for (mi, m) in self.monitors.iter().enumerate() {
-            if !m.showbar {
+        let bh = self.bar_h().max(1);
+        for mi in 0..self.monitors.len() {
+            if !self.monitors[mi].showbar {
                 continue;
             }
+            let m = &self.monitors[mi];
             let occupied = self
                 .clients
                 .iter()
@@ -1205,107 +1653,143 @@ impl Wm {
             let title = m.sel.map(|w| self.client_name(w));
             let focused = mi == self.selmon;
             let b = self.barwidths(mi);
-            let right = if mi == self.selmon && self.mpris_hovered && self.mpris.present {
-                let rw = b.rw.max(1);
-                let (marker_x, marker_y, marker_w, marker_h) = crate::bar::mpris_knob(
-                    rw,
-                    self.bar_h(),
-                    self.mpris.volume,
-                    self.mpris_marker_hovered,
-                );
+            let (barwin, titlewin, kbwin, rightwin, marker_win) =
+                (m.barwin, m.bartitlewin, m.barkbwin, m.barrightwin, m.mpris_markerwin);
+            let selected = self.tags_of(mi);
+            let kbstr = self.kbstr.clone();
+            let status = self.bar_status.clone();
+            let player = self.mpris.clone();
+            let (scroll, progress, marker_hovered) =
+                (self.mpris_scroll_px, self.mpris.current_progress(), self.mpris_marker_hovered);
+
+            let tw = b.tw.max(1) as u32;
+            let tag_key = format!("tags:{tw}:{occupied}:{selected}");
+            if self.section_changed(barwin, &tag_key) {
+                self.drw.resize(tw, bh as u32);
+                self.drw.tags(&self.metrics, tw as i32, occupied, selected);
+                self.drw.map(barwin as x11::xlib::Window, tw, bh as u32);
+                self.bar_drawn.borrow_mut().insert(barwin, tag_key);
+            }
+
+            let tlw = b.tlw.max(1) as u32;
+            let title_key = format!("title:{tlw}:{title:?}:{focused}");
+            if self.section_changed(titlewin, &title_key) {
+                self.drw.resize(tlw, bh as u32);
+                self.drw.title(&self.metrics, tlw as i32, title.as_deref(), focused);
+                self.drw.map(titlewin as x11::xlib::Window, tlw, bh as u32);
+                self.bar_drawn.borrow_mut().insert(titlewin, title_key);
+            }
+
+            let kw = b.kw.max(1) as u32;
+            let kb_key = format!("kb:{kw}:{kbstr}:{focused}");
+            if self.section_changed(kbwin, &kb_key) {
+                self.drw.resize(kw, bh as u32);
+                self.drw.kb(&self.metrics, kw as i32, &kbstr, focused);
+                self.drw.map(kbwin as x11::xlib::Window, kw, bh as u32);
+                self.bar_drawn.borrow_mut().insert(kbwin, kb_key);
+            }
+
+            if mi == self.selmon && self.mpris_hovered && self.mpris.present {
+                // The expanded panel covers the row below the bar. Re-assert
+                // it above every window on each frame so a client raised by a
+                // focus change or a layout pass cannot bury it again.
+                self.stack_mpris_bar(mi, true)?;
+                self.mpris_bar_raised.borrow_mut()[mi] = true;
+                let rw = b.rw.max(1) as u32;
+                let ph = (bh * 2) as u32;
+                let (marker_x, marker_y, marker_w, marker_h) =
+                    crate::bar::mpris_knob(rw as i32, bh, player.volume, marker_hovered);
                 let lx = if FLOATBAR { m.wx + m.gaps.ov } else { m.wx };
                 let rx = lx + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw;
                 let x = rx + marker_x;
                 let y = m.by + marker_y;
-                self.conn.configure_window(
-                    m.mpris_markerwin,
-                    &ConfigureWindowAux::new()
-                        .x(x)
-                        .y(y)
-                        .width(marker_w as u32)
-                        .height(marker_h as u32),
-                )?;
-                self.conn.map_window(m.mpris_markerwin)?;
+                self.place_cached(marker_win, x, y, marker_w, marker_h)?;
+                self.set_mapped(marker_win, true)?;
                 self.mpris_marker_rect = Some((x, y, marker_w, marker_h));
-                RightBar::Panel {
-                    win: m.barrightwin,
-                    w: b.rw,
-                    text: self.stext.clone(),
-                    player: self.mpris.clone(),
-                    scroll: self.mpris_scroll_px,
-                    marker_hovered: self.mpris_marker_hovered,
-                }
+                self.drw.resize(rw, ph);
+                self.drw.mpris_panel(
+                    &self.metrics,
+                    rw as i32,
+                    &status,
+                    &player,
+                    scroll,
+                    marker_hovered,
+                );
+                self.drw.map(rightwin as x11::xlib::Window, rw, ph);
+                // The panel has state the collapsed cache cannot describe.
+                self.bar_drawn.borrow_mut().remove(&rightwin);
             } else {
-                self.conn.unmap_window(m.mpris_markerwin)?;
-                RightBar::Status {
-                    win: m.barrightwin,
-                    w: b.rw,
-                    text: self.stext.clone(),
-                    scroll: self.mpris_scroll_px,
-                    progress: self.mpris.progress,
+                // Restore the normal stacking when the panel collapses.
+                let was_raised = self.mpris_bar_raised.borrow()[mi];
+                if was_raised {
+                    self.stack_mpris_bar(mi, false)?;
+                    self.mpris_bar_raised.borrow_mut()[mi] = false;
                 }
-            };
-            if let Some((x, dcw)) = self.clock_place(mi) {
-                clocks.push(ClockBar {
-                    win: m.barcenterwin,
-                    x,
-                    y: m.by,
-                    w: dcw,
-                    text: self.clock.clone(),
-                    focused,
-                });
+                self.set_mapped(marker_win, false)?;
+                let rw = b.rw.max(1) as u32;
+                let progress_key = progress.map(|p| (p * 10_000.0) as u32);
+                let right_key = format!("status:{rw}:{bh}:{}:{scroll}:{progress_key:?}", status.key());
+                if self.section_changed(rightwin, &right_key) {
+                    self.drw.resize(rw, bh as u32);
+                    if let Some(custom) = &status.custom {
+                        self.drw.status(&self.metrics, rw as i32, custom, scroll, progress);
+                    } else {
+                        self.drw.status_runs(&self.metrics, rw as i32, &status, scroll, progress);
+                    }
+                    self.drw.map(rightwin as x11::xlib::Window, rw, bh as u32);
+                    self.bar_drawn.borrow_mut().insert(rightwin, right_key);
+                }
             }
-            frame.monitors.push(MonitorBar {
-                tags: TagsBar {
-                    win: m.barwin,
-                    w: b.tw,
-                    occupied,
-                    selected: self.tags_of(mi),
-                },
-                title: TitleBar {
-                    win: m.bartitlewin,
-                    w: b.tlw,
-                    name: title,
-                    focused,
-                },
-                kb: TextBar {
-                    win: m.barkbwin,
-                    w: b.kw,
-                    text: self.kbstr.clone(),
-                    focused,
-                },
-                right,
-            });
+            self.draw_clock(mi)?;
         }
         self.conn.flush()?;
-        // The render thread swaps buffers on its own connection. Wait until
-        // the server has applied the moves and resizes above, so each swap
-        // lands on a window of the size it was drawn for.
-        self.conn.get_input_focus()?.reply()?;
-        self.clock_renderer.submit(clocks);
-        if redraw_bars {
-            self.renderer.submit(frame);
-        }
+        self.force_windows.borrow_mut().clear();
         Ok(())
     }
 
     /// One pass of the bar's per-tick work: applies state changes, then
-    /// redraws the bars if anything changed or `dirty` was set by an event.
-    pub fn refresh(&mut self, dirty: bool) -> Result {
-        let mut bars = dirty;
+    /// redraws the bars only when their contents or layout changed. Window
+    /// motion and client configure events do not get here.
+    pub fn refresh(&mut self) -> Result {
+        let mut bars = std::mem::take(&mut self.bar_dirty);
         if self.update_mpris() {
             bars = true;
         }
-        let clock = self.update_clock() | self.update_clock_anim();
+        if self.update_clock() {
+            // The clock text can change the width budget, which moves and
+            // resizes the other bar sections too.
+            bars = true;
+        }
+        let clock_anim = self.update_clock_anim();
         if self.update_status() {
             bars = true;
         }
         if self.update_mpris_scroll() {
             bars = true;
         }
-        if bars || clock {
+        // Position changes are interpolated from the last D-Bus reading. Only
+        // repaint when the progress bar would visibly move.
+        let progress = self.mpris.current_progress();
+        let progress_changed = match (progress, self.last_progress) {
+            (Some(now), Some(before)) => (now - before).abs() >= PROGRESS_EPSILON,
+            (None, None) => false,
+            _ => true,
+        };
+        if progress_changed {
+            self.last_progress = progress;
+            bars = true;
+        }
+        if bars {
             self.update_bars_geometry()?;
-            self.draw_bars(bars)?;
+            self.draw_bars()?;
+        } else if clock_anim {
+            // Only the center window's width changed: redraw just the clocks.
+            for mi in 0..self.monitors.len() {
+                if self.monitors[mi].showbar {
+                    self.draw_clock(mi)?;
+                }
+            }
+            self.conn.flush()?;
         }
         Ok(())
     }
@@ -1396,26 +1880,101 @@ impl Wm {
                 if !self.is_managed(e.window) {
                     self.manage(e.window)?;
                 }
+                self.bar_dirty = true;
             }
             // Hidden clients are unmapped by apply_layout, so UnmapNotify is
             // not a sign that a client went away. DestroyNotify handles that.
             Event::UnmapNotify(_) => {}
-            Event::DestroyNotify(e) => self.unmanage(e.window)?,
+            Event::DestroyNotify(e) => {
+                self.unmanage(e.window)?;
+                self.bar_dirty = true;
+            }
             Event::ConfigureRequest(e) => {
-                if self.is_managed(e.window) {
-                    self.apply_layout()?;
+                if let Some((idx, mi, floating)) = self.clients.iter().enumerate().find_map(
+                    |(i, c)| {
+                        (c.win == e.window).then_some((i, c.mon, c.floating))
+                    },
+                ) {
+                    if floating {
+                        // C's configurerequest(): accept geometry changes for a
+                        // floating client, then place only that client.
+                        let geom = self.clients[idx].geom;
+                        let mask = u16::from(e.value_mask);
+                        let mut rect = Rect {
+                            x: if mask & u16::from(ConfigWindow::X) != 0 {
+                                e.x as i32
+                            } else {
+                                geom.x
+                            },
+                            y: if mask & u16::from(ConfigWindow::Y) != 0 {
+                                e.y as i32
+                            } else {
+                                geom.y
+                            },
+                            w: if mask & u16::from(ConfigWindow::WIDTH) != 0 {
+                                e.width as u32
+                            } else {
+                                geom.w
+                            },
+                            h: if mask & u16::from(ConfigWindow::HEIGHT) != 0 {
+                                e.height as u32
+                            } else {
+                                geom.h
+                            },
+                        };
+                        let m = self.monitors[mi].rect;
+                        if rect.x >= m.x + m.w as i32 {
+                            rect.x = m.x + m.w as i32 - rect.w as i32;
+                        }
+                        if rect.y >= m.y + m.h as i32 {
+                            rect.y = m.y + m.h as i32 - rect.h as i32;
+                        }
+                        if rect.x + rect.w as i32 <= m.x {
+                            rect.x = m.x;
+                        }
+                        if rect.y + rect.h as i32 <= m.y {
+                            rect.y = m.y;
+                        }
+                        self.clients[idx].geom = rect;
+                        self.place_floating(e.window)?;
+                    } else if let Some(rect) = self.geometry(mi, e.window) {
+                        // A tiled client cannot resize itself. Tell it the
+                        // geometry dwm chose instead of relaying the request.
+                        let inner_w = (rect.w as i32 - 2 * BORDERPX).max(1) as u32;
+                        let inner_h = (rect.h as i32 - 2 * BORDERPX).max(1) as u32;
+                        self.send_configure(e.window, rect, inner_w, inner_h)?;
+                        self.conn.flush()?;
+                    }
                 } else {
-                    self.conn.configure_window(
-                        e.window,
-                        &ConfigureWindowAux::new()
-                            .x(e.x as i32)
-                            .y(e.y as i32)
-                            .width(e.width as u32)
-                            .height(e.height as u32),
-                    )?;
+                    let mask = u16::from(e.value_mask);
+                    let mut aux = ConfigureWindowAux::new();
+                    if mask & u16::from(ConfigWindow::X) != 0 {
+                        aux = aux.x(e.x as i32);
+                    }
+                    if mask & u16::from(ConfigWindow::Y) != 0 {
+                        aux = aux.y(e.y as i32);
+                    }
+                    if mask & u16::from(ConfigWindow::WIDTH) != 0 {
+                        aux = aux.width(e.width as u32);
+                    }
+                    if mask & u16::from(ConfigWindow::HEIGHT) != 0 {
+                        aux = aux.height(e.height as u32);
+                    }
+                    if mask & u16::from(ConfigWindow::BORDER_WIDTH) != 0 {
+                        aux = aux.border_width(e.border_width as u32);
+                    }
+                    if mask & u16::from(ConfigWindow::SIBLING) != 0 {
+                        aux = aux.sibling(e.sibling);
+                    }
+                    if mask & u16::from(ConfigWindow::STACK_MODE) != 0 {
+                        aux = aux.stack_mode(e.stack_mode);
+                    }
+                    self.conn.configure_window(e.window, &aux)?;
+                    self.conn.flush()?;
                 }
             }
             Event::EnterNotify(e) => {
+                self.bar_dirty = true;
                 if let Some(mi) = self.monitors.iter().position(|m| {
                     m.barrightwin == e.event || m.mpris_markerwin == e.event
                 }) {
@@ -1442,6 +2001,7 @@ impl Wm {
                 }
             }
             Event::LeaveNotify(e) => {
+                self.bar_dirty = true;
                 if let Some(mi) = self.monitors.iter().position(|m| {
                     m.barrightwin == e.event || m.mpris_markerwin == e.event
                 }) {
@@ -1466,6 +2026,7 @@ impl Wm {
                 }
             }
             Event::ButtonPress(e) => {
+                self.bar_dirty = true;
                 let state = u16::from(e.state) & CLEAN_MASK;
                 let at = (e.root_x as i32, e.root_y as i32);
                 let owner = self.clients.iter().find_map(|c| {
@@ -1500,6 +2061,7 @@ impl Wm {
                 }
             }
             Event::ButtonRelease(e) => {
+                self.bar_dirty = true;
                 if self.monitors.iter().any(|m| {
                     m.barrightwin == e.event || m.mpris_markerwin == e.event
                 }) {
@@ -1514,28 +2076,64 @@ impl Wm {
                     }) {
                         let x = e.root_x as i32 - self.rightbar_x(mi);
                         self.set_mpris_volume_from_x(mi, x);
+                        self.bar_dirty = true;
                     }
                 }
             }
-            Event::KeyPress(e) => self.key_press(e)?,
+            Event::KeyPress(e) => {
+                self.key_press(e)?;
+                self.bar_dirty = true;
+            }
             Event::PropertyNotify(e)
-                if e.window == self.root
-                    && (e.atom == u32::from(AtomEnum::WM_NAME) || e.atom == self.atoms.net_wm_name) =>
+                if e.atom == u32::from(AtomEnum::WM_NAME) || e.atom == self.atoms.net_wm_name =>
             {
-                let prop = self
-                    .conn
-                    .get_property(false, self.root, e.atom, AtomEnum::ANY, 0, 1024)
-                    .ok()
-                    .and_then(|c| c.reply().ok());
-                if let Some(r) = prop {
-                    let text = String::from_utf8_lossy(&r.value).into_owned();
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        self.status.set_custom(Some(text.to_string()));
-                    } else {
-                        self.status.set_custom(None);
+                if e.window == self.root {
+                    let prop = self
+                        .conn
+                        .get_property(false, self.root, e.atom, AtomEnum::ANY, 0, 1024)
+                        .ok()
+                        .and_then(|c| c.reply().ok());
+                    if let Some(r) = prop {
+                        let text = String::from_utf8_lossy(&r.value).into_owned();
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            self.status.set_custom(Some(text.to_string()));
+                        } else {
+                            self.status.set_custom(None);
+                        }
+                        self.update_status();
                     }
-                    self.update_status();
+                } else {
+                    // A client renamed itself; drop the cached title and let
+                    // the next frame show the new name.
+                    self.name_cache.borrow_mut().remove(&e.window);
+                }
+                self.bar_dirty = true;
+            }
+            Event::PropertyNotify(e) if e.atom == u32::from(AtomEnum::WM_NORMAL_HINTS) => {
+                let Some(idx) = self.clients.iter().position(|c| c.win == e.window) else {
+                    return Ok(());
+                };
+                let hints = self.read_size_hints(e.window).unwrap_or_default();
+                self.clients[idx].hints = hints;
+                if self.clients[idx].floating && self.is_visible(&self.clients[idx]) {
+                    let geom = self.clients[idx].geom;
+                    self.clients[idx].geom = geom;
+                    self.place_floating(e.window)?;
+                }
+            }
+            Event::Expose(e) => {
+                // Like dwm's expose(), only the last event in a batch needs a
+                // repaint, and only the window that was actually exposed. A
+                // global force here makes every GL section swap during a drag.
+                if e.count == 0
+                    && self.monitors.iter().any(|m| {
+                        [m.barwin, m.bartitlewin, m.barkbwin, m.barcenterwin, m.barrightwin]
+                            .contains(&e.window)
+                    })
+                {
+                    self.force_windows.borrow_mut().insert(e.window);
+                    self.bar_dirty = true;
                 }
             }
             _ => {}
@@ -1598,6 +2196,7 @@ impl Wm {
         &mut self,
         win: Window,
         cursor: u32,
+        throttle_motion: bool,
         mut on_motion: impl FnMut(&mut Wm, i32, i32) -> Result,
     ) -> Result<Option<(i32, i32)>> {
         let reply = self
@@ -1617,31 +2216,79 @@ impl Wm {
             return Ok(None);
         }
         self.set_no_animation(win, true)?;
-        loop {
-            // Polls instead of blocking, so the bar keeps updating during the drag.
-            let mut latest = None;
-            let mut handled = false;
-            while let Some(event) = self.conn.poll_for_event()? {
-                handled = true;
-                match event {
-                    Event::MotionNotify(e) => latest = Some((e.root_x as i32, e.root_y as i32)),
-                    Event::ButtonRelease(e) => {
-                        let end = (e.root_x as i32, e.root_y as i32);
-                        on_motion(self, end.0, end.1)?;
-                        self.set_no_animation(win, false)?;
-                        self.conn.ungrab_pointer(CURRENT_TIME)?;
-                        self.conn.flush()?;
-                        return Ok(Some(end));
+        let mut last_frame = Instant::now();
+        let mut last_bar_tick = Instant::now();
+        let mut latest = None;
+        let mut end: Option<(i32, i32)> = None;
+        let result = (|| -> Result {
+            loop {
+                // dwm's drag_next_event() blocks on the X connection until an event
+                // arrives or the next bar tick is due. Sleeping and polling at a
+                // fixed 5 ms here burns CPU and adds a wakeup of latency to every
+                // pointer update.
+                let mut pending = self.conn.poll_for_event()?;
+                if pending.is_none() {
+                    self.wait_event(DRAG_FRAME.saturating_sub(last_frame.elapsed()))?;
+                    pending = self.conn.poll_for_event()?;
+                }
+                while let Some(event) = pending {
+                    match event {
+                        Event::MotionNotify(e) => {
+                            latest = Some((e.root_x as i32, e.root_y as i32))
+                        }
+                        Event::ButtonRelease(e) => {
+                            let pos = (e.root_x as i32, e.root_y as i32);
+                            on_motion(self, pos.0, pos.1)?;
+                            end = Some(pos);
+                            return Ok(());
+                        }
+                        other => self.handle(other)?,
                     }
-                    other => self.handle(other)?,
+                    pending = self.conn.poll_for_event()?;
+                }
+                // dwm's movemouse() applies the newest queued position right after
+                // draining the motion burst; only resizemouse() uses the 60 Hz gate.
+                if !throttle_motion && let Some((x, y)) = latest.take() {
+                    on_motion(self, x, y)?;
+                }
+                // Apply only the newest resize position, at most once per frame.
+                if last_frame.elapsed() >= DRAG_FRAME {
+                    if throttle_motion && let Some((x, y)) = latest.take() {
+                        on_motion(self, x, y)?;
+                    }
+                    last_frame = Instant::now();
+                }
+                // Bar animation uses the same 20 ms grid as the main loop, not
+                // the 16 ms pointer gate, so drags cannot run a second clock.
+                if last_bar_tick.elapsed() >= BAR_TICK {
+                    self.refresh()?;
+                    last_bar_tick = Instant::now();
                 }
             }
-            if let Some((x, y)) = latest {
-                on_motion(self, x, y)?;
+        })();
+        let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        let _ = self.set_no_animation(win, false);
+        let _ = self.conn.flush();
+        result.map(|_| end)
+    }
+
+    /// Waits until the X connection has an event or `timeout` expires. The
+    /// main loop uses this instead of an unconditional sleep, so an event is
+    /// handled as soon as it arrives like C dwm's blocking `XNextEvent`.
+    pub fn wait_event(&self, timeout: Duration) -> Result {
+        let mut pfd = libc::pollfd {
+            fd: self.conn.stream().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        if unsafe { libc::poll(&mut pfd, 1, ms) } < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err.into());
             }
-            self.refresh(handled)?;
-            thread::sleep(Duration::from_millis(5));
         }
+        Ok(())
     }
 
     fn set_no_animation(&self, win: Window, on: bool) -> Result {
@@ -1674,19 +2321,66 @@ impl Wm {
 
     /// Moves one floating window and its hover zones to their current
     /// geometry, leaving the tiled windows alone.
-    fn place_floating(&self, win: Window) -> Result {
-        let Some(c) = self.clients.iter().find(|c| c.win == win) else {
+    fn place_floating(&mut self, win: Window) -> Result {
+        self.place_floating_inner(win, true)
+    }
+
+    /// The drag path uses this with `restack = false`: raising the window once
+    /// at the start of the drag already put its zones above it, so repeating
+    /// eight stack requests per frame only delays the client's redraw.
+    fn place_floating_inner(&mut self, win: Window, restack: bool) -> Result {
+        let Some(idx) = self.clients.iter().position(|c| c.win == win) else {
             return Ok(());
         };
-        self.place(c.win, c.geom)?;
-        self.place_edge_zones(c, c.geom)?;
+        let (rect, _) = self.place_client(&self.clients[idx], self.clients[idx].geom)?;
+        let zones = self.clients[idx].edge_wins;
+        self.clients[idx].geom = rect;
+        self.place_edge_zones(zones, win, rect, restack)?;
         self.conn.flush()?;
         Ok(())
     }
 
-    /// dwm's `movemouse()` and `placemouse()`. A floating window follows the
-    /// pointer. A tiled one follows it too and is re-inserted at the tile under
-    /// the pointer on release.
+    /// Geometry while dragging. The grab offset stays under the pointer and
+    /// the window keeps its size, exactly like a floating drag.
+    fn drag_geom((x, y): (i32, i32), (ox, oy): (i32, i32), current: Rect) -> Rect {
+        Rect { x: x - ox, y: y - oy, w: current.w, h: current.h }
+    }
+
+    /// Nearest tile to a point. A drop can land in a gap or on the bar, where no
+    /// tile contains the pointer; Hyprland falls back to the closest node.
+    fn nearest_tile<'a>(
+        leaves: &'a [(Window, Rect)],
+        (px, py): (i32, i32),
+    ) -> Option<&'a (Window, Rect)> {
+        let px = px as i64;
+        let py = py as i64;
+        leaves.iter().min_by_key(|(_, r)| {
+            let (left, right) = (r.x as i64, r.x as i64 + r.w as i64);
+            let (top, bottom) = (r.y as i64, r.y as i64 + r.h as i64);
+            let dx = if px < left {
+                left - px
+            } else if px >= right {
+                px - right
+            } else {
+                0
+            };
+            let dy = if py < top {
+                top - py
+            } else if py >= bottom {
+                py - bottom
+            } else {
+                0
+            };
+            dx * dx + dy * dy
+        })
+    }
+
+    /// dwm's `movemouse()` with Hyprland-style dwindle dragging. A floating
+    /// window follows the pointer. A tiled window is temporarily taken out of
+    /// the tree at its current size, so its siblings expand while it follows
+    /// the pointer. On release it is removed
+    /// first, then reinserted as an even split into the tile under the pointer
+    /// in the expanded layout, the same order `onWindowCreatedTiling` uses.
     fn movemouse(&mut self, win: Window, (px, py): (i32, i32)) -> Result {
         let Some((mi, floating)) = self
             .clients
@@ -1704,26 +2398,42 @@ impl Wm {
         self.focus()?;
         if floating {
             self.raise_floating(win)?;
+        } else {
+            // Hide the tiled leaf so siblings expand into the whole workspace,
+            // but keep the client visible and movable at its current size.
+            if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
+                c.dragging = true;
+                c.geom = start;
+            }
+            // Raise once at drag start. apply_layout() only restacks the zones;
+            // repeated stack requests per frame delay the client's redraw.
+            self.conn.configure_window(
+                win,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+            self.apply_layout()?;
         }
         let (ox, oy) = (px - start.x, py - start.y);
-        let end = self.drag_pointer(win, self.resize_cursors.moving, |wm, x, y| {
-            if floating {
-                if let Some(c) = wm.clients.iter_mut().find(|c| c.win == win) {
-                    c.geom.x = x - ox;
-                    c.geom.y = y - oy;
-                }
-                return wm.place_floating(win);
+        let drag = self.drag_pointer(win, self.resize_cursors.moving, false, |wm, x, y| {
+            if let Some(c) = wm.clients.iter_mut().find(|c| c.win == win) {
+                c.geom = Self::drag_geom((x, y), (ox, oy), c.geom);
             }
-            wm.conn.configure_window(
-                win,
-                &ConfigureWindowAux::new()
-                    .x(x - ox)
-                    .y(y - oy)
-                    .stack_mode(StackMode::ABOVE),
-            )?;
-            wm.conn.flush()?;
-            Ok(())
-        })?;
+            wm.place_floating_inner(win, false)
+        });
+        // Clear the temporary state before any layout decision, including when
+        // the drag failed or the pointer grab never succeeded.
+        if !floating {
+            if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
+                c.dragging = false;
+            }
+        }
+        let end = match drag {
+            Ok(end) => end,
+            Err(err) => {
+                self.arrange()?;
+                return Err(err);
+            }
+        };
         let Some((dx, dy)) = end else {
             return self.arrange();
         };
@@ -1736,32 +2446,42 @@ impl Wm {
         if floating {
             return self.arrange();
         }
-        let leaves = self.layout_mon(tm);
+        // Remove the dragged window before looking at the layout, just like
+        // Hyprland's onWindowRemovedTiling() before onWindowCreatedTiling().
+        // Otherwise the target is still in its pre-drag half, whose aspect ratio
+        // flips on every drop and makes repeated drops alternate split axes.
+        {
+            let tree = &mut self.monitors[tm].tree;
+            *tree = tree.take().and_then(|t| t.remove(win));
+        }
+        let leaves: Vec<(Window, Rect)> = self.layout_mon(tm).into_iter().collect();
         let target = leaves
             .iter()
             .copied()
-            .find(|(w, r)| *w != win && r.contains(dx, dy));
-        if let Some((target, rect)) = target {
-            let side_by_side = rect.w > rect.h;
-            let new_first = if side_by_side {
-                dx < rect.x + (rect.w / 2) as i32
-            } else {
-                dy < rect.y + (rect.h / 2) as i32
-            };
-            let tree = &mut self.monitors[tm].tree;
-            *tree = tree.take().and_then(|t| t.remove(win));
-            if let Some(t) = tree.as_mut() {
-                t.insert(target, win, new_first, side_by_side);
+            .find(|(_, r)| r.contains(dx, dy))
+            .or_else(|| Self::nearest_tile(&leaves, (dx, dy)).copied());
+        match target {
+            Some((target, rect)) => {
+                let (new_first, side_by_side) = tree::split_for_drop(rect, (dx, dy));
+                if let Some(t) = self.monitors[tm].tree.as_mut() {
+                    t.insert(target, win, new_first, side_by_side);
+                }
+            }
+            None => {
+                // No tile under the pointer: append beside whatever is left of
+                // the tree. Replacing it with a single leaf would drop the
+                // hidden leaves of other tags and break those tags on return.
+                let area = self.tile_area(tm);
+                let tree = &mut self.monitors[tm].tree;
+                *tree = Some(tree::append(tree.take(), win, area));
             }
         }
         self.arrange()
     }
 
-    /// dwm's `resizemouse()`. The part of the window the press landed in picks
-    /// the edges that move. A floating window changes its size by the
-    /// pointer's movement from the press, with the opposite edges staying put.
-    /// A tiled window stays tiled: the split boundaries on the chosen edges
-    /// follow the pointer.
+    /// dwm's `resizemouse()`. A press on an edge zone resizes the tiling tree
+    /// boundaries. A tiled window always stays tiled; a floating one follows
+    /// the pointer at the same 60 Hz gate dwm uses.
     fn resizemouse(
         &mut self,
         win: Window,
@@ -1786,17 +2506,17 @@ impl Wm {
         let cursor = self.resize_cursor(Some(edges));
         if floating {
             self.raise_floating(win)?;
-            self.drag_pointer(win, cursor, |wm, x, y| {
+            self.drag_pointer(win, cursor, true, |wm, x, y| {
                 let geom = tree::resize_rect(rect, edges, (x - mx, y - my));
                 if let Some(c) = wm.clients.iter_mut().find(|c| c.win == win) {
                     c.geom = geom;
                 }
-                wm.place_floating(win)
+                wm.place_floating_inner(win, false)
             })?;
             return self.arrange();
         }
         let (mut lx, mut ly) = (mx, my);
-        self.drag_pointer(win, cursor, |wm, x, y| {
+        self.drag_pointer(win, cursor, true, |wm, x, y| {
             wm.resize_tiled(mi, win, edges, (x - lx, y - ly));
             (lx, ly) = (x, y);
             wm.apply_layout()
@@ -1805,7 +2525,13 @@ impl Wm {
     }
 
     /// Moves the tree boundaries next to the tiled window `win` on `edges`.
-    fn resize_tiled(&mut self, mi: usize, win: Window, edges: (bool, bool, bool, bool), delta: (i32, i32)) {
+    fn resize_tiled(
+        &mut self,
+        mi: usize,
+        win: Window,
+        edges: (bool, bool, bool, bool),
+        delta: (i32, i32),
+    ) {
         let vis: HashSet<Window> = self.tiled_order(mi).into_iter().collect();
         let gaps = self.effective_gaps(mi);
         let area = self.tile_area(mi);
@@ -1815,7 +2541,7 @@ impl Wm {
     }
 
     /// dwm's `togglefloating()`: moves the selected window between the tiling
-    /// tree and the floating layer.
+    /// tree and the floating layer without losing its place in the tree.
     fn togglefloating(&mut self) -> Result {
         let mi = self.selmon;
         let Some(sel) = self.monitors[mi].sel else {
@@ -1825,30 +2551,26 @@ impl Wm {
             return Ok(());
         };
         if c.floating {
-            let area = self.tile_area(mi);
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
                 c.floating = false;
             }
-            let tree = &mut self.monitors[mi].tree;
-            *tree = Some(tree::append(tree.take(), sel, area));
+            // A floated window keeps its leaf in the tree; tiled_order() hides
+            // it while floating, so toggling back restores the old split.
+            if !self.monitors[mi].tree.as_ref().is_some_and(|t| t.has_leaf(sel)) {
+                let area = self.tile_area(mi);
+                let tree = &mut self.monitors[mi].tree;
+                *tree = Some(tree::append(tree.take(), sel, area));
+            }
         } else {
             let Some(rect) = self.geometry(mi, sel) else {
                 return Ok(());
             };
-            self.float_window(mi, sel, rect);
+            if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
+                c.floating = true;
+                c.geom = rect;
+            }
         }
         self.arrange()
-    }
-
-    /// Takes `win` out of the tiling tree and gives it `rect` as its floating
-    /// geometry. The caller arranges the layout.
-    fn float_window(&mut self, mi: usize, win: Window, rect: Rect) {
-        let tree = &mut self.monitors[mi].tree;
-        *tree = tree.take().and_then(|t| t.remove(win));
-        if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
-            c.floating = true;
-            c.geom = rect;
-        }
     }
 
     fn view(&mut self, ui: u32) -> Result {
@@ -2164,5 +2886,63 @@ impl Wm {
             GapScope::OuterV => ov += d,
         }
         self.setgaps(oh, ov, ih, iv)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn box_(w: u32, h: u32) -> Rect {
+        Rect { x: 10, y: 20, w, h }
+    }
+
+    #[test]
+    fn size_hints_enforce_minimum() {
+        let hints = SizeHints { min_w: 200, min_h: 100, base_w: 200, base_h: 100, ..Default::default() };
+        let got = constrain_size(&hints, box_(110, 70), 2, 0);
+        assert_eq!((got.w, got.h), (204, 104));
+        assert_eq!((got.x, got.y), (10, 20));
+    }
+
+    #[test]
+    fn size_hints_apply_base_and_increment() {
+        let hints = SizeHints { base_w: 10, base_h: 20, inc_w: 10, inc_h: 10, ..Default::default() };
+        let got = constrain_size(&hints, box_(123, 133), 0, 0);
+        assert_eq!((got.w, got.h), (120, 130));
+    }
+
+    #[test]
+    fn size_hints_enforce_maximum() {
+        let hints = SizeHints { max_w: 300, max_h: 200, ..Default::default() };
+        let got = constrain_size(&hints, box_(500, 500), 0, 0);
+        assert_eq!((got.w, got.h), (300, 200));
+    }
+
+    #[test]
+    fn drag_geom_keeps_grab_offset_and_size_instead_of_centering_on_pointer() {
+        let start = Rect { x: 100, y: 200, w: 1000, h: 500 };
+        let (ox, oy) = (300, 120); // grabbed at (400, 320)
+
+        // First motion without moving the pointer: no jump and no resize.
+        assert_eq!(
+            Wm::drag_geom((400, 320), (ox, oy), start),
+            start
+        );
+        // Moving the pointer moves the top-left by the same amount, size intact.
+        assert_eq!(
+            Wm::drag_geom((700, 520), (ox, oy), start),
+            Rect { x: 400, y: 400, w: 1000, h: 500 }
+        );
+    }
+
+    #[test]
+    fn nearest_tile_picks_closest_box_in_a_gap() {
+        let leaves = [
+            (1, Rect { x: 0, y: 0, w: 400, h: 500 }),
+            (2, Rect { x: 420, y: 0, w: 400, h: 500 }),
+        ];
+        assert_eq!(Wm::nearest_tile(&leaves, (410, 250)).map(|(w, _)| *w), Some(1));
+        assert_eq!(Wm::nearest_tile(&leaves, (425, 250)).map(|(w, _)| *w), Some(2));
     }
 }

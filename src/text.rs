@@ -1,12 +1,16 @@
 //! Port of dwm's drw.c text layer: the fontset, the Xft metrics behind
-//! `TEXTW`, and the fallback and ellipsis walk of `drw_text`. Widths come from
-//! the same Xft and fontconfig calls the fork makes, so every width matches.
-//! Glyphs are rasterized with fontdue and drawn by the OpenGL bar.
+//! `TEXTW`, and the fallback and ellipsis walk of `drw_text`. Drawing is done
+//! by `drw.rs` with `XftDrawStringUtf8`, exactly like the C version.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 
+use x11::xft::{
+    FcCharSet, FcPattern, XftCharExists, XftFont, XftFontMatch, XftFontOpenName, XftFontOpenPattern,
+    XftTextExtentsUtf8,
+};
 use x11::xlib::Display;
+use x11::xrender::XGlyphInfo;
 
 /// The fork's `fonts[]` in config.def.h order.
 pub const FONTS: [&str; 9] = [
@@ -24,67 +28,22 @@ pub const FONTS: [&str; 9] = [
 const NOMATCHES_LEN: usize = 64;
 const FC_TRUE: c_int = 1;
 const FC_MATCH_PATTERN: c_int = 0;
-const FC_RESULT_MATCH: c_int = 0;
-const DPI: f64 = 96.0;
-
-#[repr(C)]
-struct XftFontRaw {
-    ascent: c_int,
-    descent: c_int,
-    height: c_int,
-    max_advance_width: c_int,
-    charset: *mut c_void,
-    pattern: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct XGlyphInfo {
-    width: u16,
-    height: u16,
-    x: i16,
-    y: i16,
-    x_off: i16,
-    y_off: i16,
-}
-
-#[link(name = "Xft")]
-unsafe extern "C" {
-    fn XftFontOpenName(dpy: *mut Display, screen: c_int, name: *const c_char) -> *mut XftFontRaw;
-    fn XftFontOpenPattern(dpy: *mut Display, pattern: *mut c_void) -> *mut XftFontRaw;
-    fn XftFontMatch(
-        dpy: *mut Display,
-        screen: c_int,
-        pattern: *const c_void,
-        result: *mut c_int,
-    ) -> *mut c_void;
-    fn XftCharExists(dpy: *mut Display, font: *mut XftFontRaw, ucs4: u32) -> c_int;
-    fn XftTextExtentsUtf8(
-        dpy: *mut Display,
-        font: *mut XftFontRaw,
-        string: *const u8,
-        len: c_int,
-        extents: *mut XGlyphInfo,
-    );
-}
 
 #[link(name = "fontconfig")]
 unsafe extern "C" {
-    fn FcNameParse(name: *const u8) -> *mut c_void;
-    fn FcPatternDuplicate(p: *const c_void) -> *mut c_void;
-    fn FcPatternAddCharSet(p: *mut c_void, object: *const c_char, c: *mut c_void) -> c_int;
-    fn FcPatternAddBool(p: *mut c_void, object: *const c_char, value: c_int) -> c_int;
-    fn FcConfigSubstitute(config: *mut c_void, p: *mut c_void, kind: c_int) -> c_int;
-    fn FcDefaultSubstitute(p: *mut c_void);
-    fn FcCharSetCreate() -> *mut c_void;
-    fn FcCharSetAddChar(c: *mut c_void, ucs4: u32) -> c_int;
-    fn FcCharSetDestroy(c: *mut c_void);
-    fn FcPatternGetString(p: *const c_void, object: *const c_char, n: c_int, s: *mut *mut u8) -> c_int;
-    fn FcPatternGetDouble(p: *const c_void, object: *const c_char, n: c_int, d: *mut f64) -> c_int;
-    fn FcPatternGetInteger(p: *const c_void, object: *const c_char, n: c_int, i: *mut c_int) -> c_int;
+    fn FcNameParse(name: *const c_char) -> *mut FcPattern;
+    fn FcPatternDuplicate(p: *const FcPattern) -> *mut FcPattern;
+    fn FcPatternAddCharSet(p: *mut FcPattern, object: *const c_char, c: *mut FcCharSet) -> c_int;
+    fn FcPatternAddBool(p: *mut FcPattern, object: *const c_char, value: c_int) -> c_int;
+    fn FcConfigSubstitute(config: *mut c_void, p: *mut FcPattern, kind: c_int) -> c_int;
+    fn FcDefaultSubstitute(p: *mut FcPattern);
+    fn FcCharSetCreate() -> *mut FcCharSet;
+    fn FcCharSetAddChar(c: *mut FcCharSet, ucs4: u32) -> c_int;
+    fn FcCharSetDestroy(c: *mut FcCharSet);
 }
 
 /// One drawing step produced by `drw_text`, in the order dwm performs it.
+#[derive(Debug, Clone)]
 pub enum Op {
     /// `XFillRectangle` with the scheme background.
     Fill { x: i32, y: i32, w: u32, h: u32 },
@@ -92,51 +51,31 @@ pub enum Op {
     Text { font: usize, x: i32, baseline: i32, text: String },
 }
 
-/// dwm's `Fnt`: one Xft font plus the fontdue copy used for rasterizing.
+/// dwm's `Fnt`: an Xft font plus the pattern used for fontconfig fallback.
 pub struct Fnt {
-    xft: *mut XftFontRaw,
-    /// The fontconfig pattern of fonts from a name; dwm's `drw->fonts->pattern`.
-    pattern: *mut c_void,
+    dpy: *mut Display,
+    pub xft: *mut XftFont,
+    /// FcNameParse pattern of a font loaded by name. Fallback needs it.
+    pattern: *mut FcPattern,
     pub h: i32,
     pub ascent: i32,
-    pub px: f32,
-    pub glyphs: Option<fontdue::Font>,
+}
+
+impl Drop for Fnt {
+    fn drop(&mut self) {
+        unsafe {
+            x11::xft::XftFontClose(self.dpy, self.xft);
+            if !self.pattern.is_null() {
+                FcPatternDestroy(self.pattern);
+            }
+        }
+    }
 }
 
 impl Fnt {
-    unsafe fn from_xft(xft: *mut XftFontRaw, pattern: *mut c_void) -> Fnt {
-        unsafe {
-            let (ascent, descent) = ((*xft).ascent, (*xft).descent);
-            let mut px = 0.0f64;
-            let mut file: *mut u8 = ptr::null_mut();
-            let mut index: c_int = 0;
-            let fp = (*xft).pattern;
-            if FcPatternGetDouble(fp, c"pixelsize".as_ptr(), 0, &mut px) != FC_RESULT_MATCH {
-                let mut size = 0.0f64;
-                FcPatternGetDouble(fp, c"size".as_ptr(), 0, &mut size);
-                px = size * DPI / 72.0;
-            }
-            let mut glyphs = None;
-            if FcPatternGetString(fp, c"file".as_ptr(), 0, &mut file) == FC_RESULT_MATCH {
-                FcPatternGetInteger(fp, c"index".as_ptr(), 0, &mut index);
-                let path = std::ffi::CStr::from_ptr(file as *const c_char).to_string_lossy().into_owned();
-                if let Ok(data) = std::fs::read(&path) {
-                    let settings = fontdue::FontSettings {
-                        collection_index: index.max(0) as u32,
-                        ..Default::default()
-                    };
-                    glyphs = fontdue::Font::from_bytes(data, settings).ok();
-                }
-            }
-            Fnt {
-                xft,
-                pattern,
-                h: ascent + descent,
-                ascent,
-                px: px as f32,
-                glyphs,
-            }
-        }
+    unsafe fn from_xft(dpy: *mut Display, xft: *mut XftFont, pattern: *mut FcPattern) -> Fnt {
+        let (ascent, descent) = unsafe { ((*xft).ascent, (*xft).descent) };
+        Fnt { dpy, xft, pattern, h: ascent + descent, ascent }
     }
 }
 
@@ -161,12 +100,12 @@ impl Fontset {
                     eprintln!("error, cannot load font from name: '{name}'");
                     continue;
                 }
-                let pattern = FcNameParse(c.as_ptr() as *const u8);
+                let pattern = FcNameParse(c.as_ptr());
                 if pattern.is_null() {
                     eprintln!("error, cannot parse font name to pattern: '{name}'");
                     continue;
                 }
-                fonts.push(Fnt::from_xft(xft, pattern));
+                fonts.push(Fnt::from_xft(dpy, xft, pattern));
             }
         }
         if fonts.is_empty() {
@@ -203,28 +142,23 @@ impl Fontset {
         self.walk(x, y, w, h, lpad, text, true, ops)
     }
 
-    /// Xft advance of one character in fontset entry `font`.
-    pub fn advance(&self, font: usize, ch: char) -> i32 {
-        let mut buf = [0u8; 4];
-        let s = ch.encode_utf8(&mut buf);
-        let mut ext = XGlyphInfo::default();
-        unsafe {
-            XftTextExtentsUtf8(self.dpy, self.fonts[font].xft, s.as_ptr(), s.len() as c_int, &mut ext);
-        }
-        ext.x_off as i32
-    }
-
     fn exists(&self, font: usize, cp: u32) -> bool {
         unsafe { XftCharExists(self.dpy, self.fonts[font].xft, cp) != 0 }
     }
 
     /// Width of one character segment in fontset entry `font`.
     fn extent(&self, font: usize, s: &str) -> u32 {
-        let mut ext = XGlyphInfo::default();
+        let mut ext: XGlyphInfo = unsafe { std::mem::zeroed() };
         unsafe {
-            XftTextExtentsUtf8(self.dpy, self.fonts[font].xft, s.as_ptr(), s.len() as c_int, &mut ext);
+            XftTextExtentsUtf8(
+                self.dpy,
+                self.fonts[font].xft,
+                s.as_ptr(),
+                s.len() as c_int,
+                &mut ext,
+            );
         }
-        ext.x_off as i32 as u32
+        ext.xOff as i32 as u32
     }
 
     /// Loads a fallback font for `cp` the way dwm's `drw_text` does and appends
@@ -239,19 +173,22 @@ impl Fontset {
             FcPatternAddBool(pattern, c"scalable".as_ptr(), FC_TRUE);
             FcConfigSubstitute(ptr::null_mut(), pattern, FC_MATCH_PATTERN);
             FcDefaultSubstitute(pattern);
-            let mut result: c_int = 0;
+            let mut result = x11::xft::FcResult::NoMatch;
             let matched = XftFontMatch(self.dpy, self.screen, pattern, &mut result);
             FcCharSetDestroy(charset);
+            FcPatternDestroy(pattern);
             if matched.is_null() {
                 return None;
             }
             let xft = XftFontOpenPattern(self.dpy, matched);
+            FcPatternDestroy(matched);
             if !xft.is_null() {
-                let fnt = Fnt::from_xft(xft, ptr::null_mut());
+                let fnt = Fnt::from_xft(self.dpy, xft, ptr::null_mut());
                 if XftCharExists(self.dpy, xft, cp) != 0 {
                     self.fonts.push(fnt);
                     return Some(self.fonts.len() - 1);
                 }
+                // `fnt` drops here, closing the font we could not use.
             }
             self.nomatch_idx += 1;
             self.nomatches[self.nomatch_idx % NOMATCHES_LEN] = cp;
@@ -381,3 +318,7 @@ impl Fontset {
     }
 }
 
+#[link(name = "fontconfig")]
+unsafe extern "C" {
+    fn FcPatternDestroy(p: *mut FcPattern);
+}

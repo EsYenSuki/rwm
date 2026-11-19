@@ -1,5 +1,8 @@
 use std::fs;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use crate::bar::col;
@@ -13,6 +16,114 @@ pub enum StatusToken {
     Reset,
     Forward(i32),
     Rect(i32, i32, u32, u32),
+}
+
+/// One painted run of the status bar: a string and the two colors it is drawn
+/// with. Layout and color decisions live in `Status::runs`, so the renderer
+/// never has to interpret markup characters to know what to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRun {
+    pub text: String,
+    pub fg: u32,
+    pub bg: u32,
+    /// Draw with the animated, clipped scroll field instead of plain text.
+    pub scroll: bool,
+}
+
+/// The top-right bar's state as typed values. Icons are derived from the
+/// readings and only change when the underlying state changes; the text
+/// values are the parts that get re-polled. Nothing here is a markup string.
+#[derive(Debug, Clone)]
+pub struct Status {
+    /// Custom root-window text. When set it replaces the built-in cells.
+    pub custom: Option<String>,
+    /// Scrolling title while a player is playing, empty otherwise.
+    pub playing: Option<String>,
+    pub battery_icon: &'static str,
+    pub battery_percent: i32,
+    pub cpu_percent: f32,
+    pub mem_icon: &'static str,
+    pub mem_text: String,
+    pub mem_warn: bool,
+    pub wifi_icon: &'static str,
+    pub wifi_text: String,
+}
+
+impl Status {
+    /// Value used by the bar cache. Only the polled values appear here, so a
+    /// stable idle reading keeps the right window untouched.
+    pub fn key(&self) -> String {
+        if let Some(custom) = &self.custom {
+            return format!("custom:{custom}");
+        }
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            self.playing.as_deref().unwrap_or(""),
+            self.battery_icon,
+            self.battery_percent,
+            self.cpu_percent,
+            self.mem_icon,
+            self.mem_text,
+            self.mem_warn,
+            self.wifi_icon,
+            self.wifi_text,
+        )
+    }
+
+    /// The status cells in the exact dwm left-to-right order. Each run carries
+    /// its own foreground and background, so the drawn pixels are fully
+    /// described here with no `^c`/`^b` markup in between. `scroll` marks the
+    /// animated MPRIS field, which the renderer clips and advances itself.
+    pub fn runs(&self) -> Vec<StatusRun> {
+        const SAV: u32 = 0xa6e3a1;
+        const BAT: u32 = 0x96cdfb;
+        const DIM: u32 = 0x1e1d2d;
+        const VAL: u32 = 0xd9e0ee;
+        const NORM: u32 = 0x585767;
+        const CPU_BG: u32 = 0xa6e3a1;
+        const VAL_BG: u32 = 0x282737;
+        const WIFI_BG: u32 = 0x96cdfb;
+        const PLAY_BG: u32 = 0xb8e9b4;
+        let mem_fg = if self.mem_warn { 0xed8796 } else { DIM };
+
+        if let Some(playing) = &self.playing {
+            let runs = vec![
+                StatusRun { text: String::new(), fg: SAV, bg: DIM, scroll: false },
+                StatusRun { text: " ".into(), fg: SAV, bg: DIM, scroll: false },
+                StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
+                StatusRun { text: " 󰎆".into(), fg: DIM, bg: PLAY_BG, scroll: false },
+                StatusRun { text: format!(" {playing}"), fg: DIM, bg: PLAY_BG, scroll: true },
+                StatusRun { text: " ".into(), fg: mem_fg, bg: DIM, scroll: false },
+                StatusRun { text: format!(" {}", self.mem_icon), fg: mem_fg, bg: WIFI_BG, scroll: false },
+                StatusRun { text: " ".into(), fg: mem_fg, bg: WIFI_BG, scroll: false },
+                StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
+                StatusRun { text: format!(" {}", self.wifi_icon), fg: DIM, bg: WIFI_BG, scroll: false },
+                StatusRun { text: " ".into(), fg: DIM, bg: WIFI_BG, scroll: false },
+                StatusRun { text: format!(" {}", self.battery_icon), fg: BAT, bg: DIM, scroll: false },
+                StatusRun { text: " ".into(), fg: BAT, bg: DIM, scroll: false },
+            ];
+            return runs;
+        }
+
+        vec![
+            StatusRun { text: "  ".into(), fg: SAV, bg: DIM, scroll: false },
+            StatusRun { text: self.battery_icon.into(), fg: BAT, bg: DIM, scroll: false },
+            StatusRun { text: format!(" {}%", self.battery_percent), fg: BAT, bg: DIM, scroll: false },
+            StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
+            StatusRun { text: " ".into(), fg: DIM, bg: CPU_BG, scroll: false },
+            StatusRun { text: " ".into(), fg: VAL, bg: CPU_BG, scroll: false },
+            StatusRun { text: format!(" {:>4.1}% ", self.cpu_percent), fg: VAL, bg: VAL_BG, scroll: false },
+            StatusRun { text: " ".into(), fg: mem_fg, bg: DIM, scroll: false },
+            StatusRun { text: format!(" {}", self.mem_icon), fg: mem_fg, bg: CPU_BG, scroll: false },
+            StatusRun { text: " ".into(), fg: VAL, bg: CPU_BG, scroll: false },
+            StatusRun { text: format!(" {} ", self.mem_text), fg: VAL, bg: VAL_BG, scroll: false },
+            StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
+            StatusRun { text: format!(" {}", self.wifi_icon), fg: DIM, bg: WIFI_BG, scroll: false },
+            StatusRun { text: " ".into(), fg: VAL, bg: WIFI_BG, scroll: false },
+            StatusRun { text: format!(" {} ", self.wifi_text), fg: VAL, bg: VAL_BG, scroll: false },
+            StatusRun { text: " ".into(), fg: NORM, bg: DIM, scroll: false },
+        ]
+    }
 }
 
 pub fn parse_color(s: &str) -> Option<[f32; 4]> {
@@ -110,26 +221,92 @@ pub fn parse_status(text: &str) -> Vec<StatusToken> {
     tokens
 }
 
+/// Watches NetworkManager D-Bus signals and sets a flag when the active
+/// connection may have changed. Returns the flag plus whether the signal
+/// source is available; when it is not, the sampler keeps its slow fallback
+/// poll for setups that use iwctl or similar.
+pub fn start_wifi_monitor() -> (Arc<AtomicBool>, bool) {
+    let dirty = Arc::new(AtomicBool::new(false));
+    let Ok(conn) = zbus::blocking::Connection::system() else {
+        return (dirty, false);
+    };
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&conn) else {
+        return (dirty, false);
+    };
+    // Without NetworkManager there are no signals to listen for (iwctl and
+    // friends use other mechanisms), so keep the slow fallback poll.
+    let Ok(names) = dbus.list_names() else {
+        return (dirty, false);
+    };
+    if !names.iter().any(|name| name.as_str() == "org.freedesktop.NetworkManager") {
+        return (dirty, false);
+    }
+    let rules = [
+        "type='signal',sender='org.freedesktop.NetworkManager',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
+        "type='signal',sender='org.freedesktop.NetworkManager',member='StateChanged'",
+    ];
+    for rule in rules {
+        let Ok(parsed) = zbus::OwnedMatchRule::try_from(rule) else {
+            continue;
+        };
+        if dbus.add_match_rule(parsed.into()).is_err() {
+            return (dirty, false);
+        }
+    }
+    let writer = dirty.clone();
+    if thread::Builder::new()
+        .name("rwm-wifi".into())
+        .spawn(move || {
+            let events = zbus::blocking::MessageIterator::from(&conn);
+            for _ in events {
+                writer.store(true, Ordering::Release);
+            }
+        })
+        .is_err()
+    {
+        return (dirty, false);
+    }
+    (dirty, true)
+}
+
 pub struct StatusSampler {
     last_total: u64,
     last_active: u64,
     last_sample_time: Instant,
     last_wifi_time: Instant,
+    /// NetworkManager signal listener state. With signals available, WiFi is
+    /// only re-read when this flag is set; otherwise the 3 s fallback applies.
+    wifi_dirty: Arc<AtomicBool>,
+    wifi_signals: bool,
     cached_wifi: (bool, String, &'static str),
-    cached_status: String,
+    cached_status: Status,
     cached_mpris_key: String,
     custom: Option<String>,
 }
 
 impl StatusSampler {
     pub fn new() -> Self {
+        let (wifi_dirty, wifi_signals) = start_wifi_monitor();
         let mut s = Self {
             last_total: 0,
             last_active: 0,
             last_sample_time: Instant::now() - std::time::Duration::from_secs(10),
             last_wifi_time: Instant::now() - std::time::Duration::from_secs(10),
+            wifi_dirty,
+            wifi_signals,
             cached_wifi: (false, String::new(), "󰤭"),
-            cached_status: String::new(),
+            cached_status: Status {
+                custom: None,
+                playing: None,
+                battery_icon: "󰁹",
+                battery_percent: 100,
+                cpu_percent: 0.0,
+                mem_icon: "󰾆",
+                mem_text: "0Mi".into(),
+                mem_warn: false,
+                wifi_icon: "󰤭",
+                wifi_text: "Disconnected".into(),
+            },
             cached_mpris_key: String::new(),
             custom: None,
         };
@@ -141,14 +318,31 @@ impl StatusSampler {
         self.custom = text;
     }
 
-    pub fn sample(&mut self) -> String {
+    pub fn sample(&mut self) -> Status {
         self.sample_with_mpris(None)
     }
 
-    pub fn sample_with_mpris(&mut self, mpris: Option<&crate::mpris::Snapshot>) -> String {
+    /// When the cached status becomes stale, so the main loop can sleep until
+    /// then instead of waking on a fixed timer.
+    pub fn next_sample(&self) -> Instant {
+        self.last_sample_time + std::time::Duration::from_secs(1)
+    }
+
+    pub fn sample_with_mpris(&mut self, mpris: Option<&crate::mpris::Snapshot>) -> Status {
         let has_player = mpris.is_some_and(|player| player.present);
         if !has_player && let Some(ref custom) = self.custom {
-            return custom.clone();
+            return Status {
+                custom: Some(custom.clone()),
+                playing: None,
+                battery_icon: "",
+                battery_percent: 0,
+                cpu_percent: 0.0,
+                mem_icon: "",
+                mem_text: String::new(),
+                mem_warn: false,
+                wifi_icon: "",
+                wifi_text: String::new(),
+            };
         }
         let mpris_key = match mpris {
             Some(player) if player.present && player.playing => {
@@ -160,11 +354,10 @@ impl StatusSampler {
         let now = Instant::now();
         // Update every 1000ms
         if now.duration_since(self.last_sample_time).as_millis() >= 1000
-            || self.cached_status.is_empty()
             || self.cached_mpris_key != mpris_key
         {
             self.last_sample_time = now;
-            self.cached_status = self.generate_system_status(mpris);
+            self.cached_status = self.generate_status(mpris);
             self.cached_mpris_key = mpris_key;
         }
         self.cached_status.clone()
@@ -172,7 +365,13 @@ impl StatusSampler {
 
     fn get_wifi(&mut self) -> (bool, String, &'static str) {
         let now = Instant::now();
-        if now.duration_since(self.last_wifi_time).as_secs() >= 3 || self.cached_wifi.1.is_empty() {
+        let signaled = self.wifi_dirty.swap(false, Ordering::AcqRel);
+        let due = if self.wifi_signals {
+            signaled
+        } else {
+            now.duration_since(self.last_wifi_time).as_secs() >= 3
+        };
+        if due || self.cached_wifi.1.is_empty() {
             self.last_wifi_time = now;
             let refreshed = Self::read_wifi();
             if refreshed.1 != "Connected"
@@ -186,16 +385,14 @@ impl StatusSampler {
         self.cached_wifi.clone()
     }
 
-    fn generate_system_status(&mut self, mpris: Option<&crate::mpris::Snapshot>) -> String {
-        let has_player = mpris.is_some_and(|player| player.present);
+    fn generate_status(&mut self, mpris: Option<&crate::mpris::Snapshot>) -> Status {
         let mpris_player = mpris.filter(|player| player.present && player.playing);
-        let mpris_playing = mpris_player.is_some();
         let cpu = self.read_cpu();
         let (mem_percent, mem_text) = Self::read_memory();
         let (cap, charging) = Self::read_battery();
         let (wifi_ok, ssid, wicon) = self.get_wifi();
 
-        let bicon = if charging {
+        let battery_icon = if charging {
             "󰂄"
         } else if cap >= 90 {
             "󰁹"
@@ -215,32 +412,18 @@ impl StatusSampler {
             "󰓅"
         };
 
-        let mem_color = if mem_percent < 80 { "#1E1D2D" } else { "#ed8796" };
-        let wifi_str = if wifi_ok { &ssid } else { "Disconnected" };
-
-        let sav_icon = "";
-
-        if has_player && mpris_playing {
-            let player = mpris_player.expect("playing player snapshot");
-            let player_text = player.scroll_text();
-            return format!(
-                "^c#a6e3a1^{sav_icon} ^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^^m^ {player_text}^M^^d^^c{mem_color}^ ^b#96CDFB^ {mem_icon} ^d^^c#1E1D2D^ ^b#96CDFB^ {wicon} ^d^^c#96CDFB^ {bicon}^b#1E1D2D^ "
-            );
+        Status {
+            custom: None,
+            playing: mpris_player.map(|player| player.scroll_text()),
+            battery_icon,
+            battery_percent: cap,
+            cpu_percent: cpu,
+            mem_icon,
+            mem_text,
+            mem_warn: mem_percent >= 80,
+            wifi_icon: wicon,
+            wifi_text: if wifi_ok { ssid } else { "Disconnected".into() },
         }
-
-        // Exact dwm.c status layout for systems without active playback.
-        format!(
-            "^c#a6e3a1^{sav_icon}  ^c#96CDFB^{bicon} {cap}%^c#1E1D2D^ ^b#a6e3a1^ ^c#D9E0EE^ ^b#282737^ {cpu:>4.1}% ^d^^c{mem_color}^ ^b#a6e3a1^ {mem_icon}^c#D9E0EE^ ^b#282737^ {mem_text} ^d^^c#1E1D2D^ ^b#96CDFB^ {wicon}^c#D9E0EE^ ^b#282737^ {wifi_str} ^d^^b#1E1D2D^ ",
-            sav_icon = sav_icon,
-            bicon = bicon,
-            cap = cap,
-            cpu = cpu,
-            mem_color = mem_color,
-            mem_icon = mem_icon,
-            mem_text = mem_text,
-            wicon = wicon,
-            wifi_str = wifi_str,
-        )
     }
 
     fn read_cpu(&mut self) -> f32 {
@@ -569,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_active_mpris_status_matches_dwm_markup() {
+    fn test_active_mpris_status_is_typed() {
         let player = crate::mpris::Snapshot {
             present: true,
             playing: true,
@@ -578,11 +761,11 @@ mod tests {
             ..crate::mpris::Snapshot::default()
         };
         let mut sampler = StatusSampler::new();
-        let status = sampler.generate_system_status(Some(&player));
-        assert!(status.contains(
-            "^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^^m^ [EXAMPLE BAND]  A Song^M^"
-        ));
-        assert!(status.ends_with("^b#1E1D2D^ "));
+        let status = sampler.generate_status(Some(&player));
+        assert_eq!(status.playing.as_deref(), Some("[EXAMPLE BAND]  A Song"));
+        assert_eq!(status.custom, None);
+        let runs = status.runs();
+        assert!(runs.iter().any(|run| run.text == " 󰎆" && run.bg == 0xb8e9b4));
     }
 
     #[test]
@@ -596,7 +779,7 @@ mod tests {
         };
         let mut sampler = StatusSampler::new();
         let status = sampler.sample_with_mpris(Some(&player));
-        assert!(status.contains("^m^ [EXAMPLE BAND]  A Song^M^"));
+        assert_eq!(status.playing.as_deref(), Some("[EXAMPLE BAND]  A Song"));
     }
 
     #[test]
@@ -611,21 +794,51 @@ mod tests {
         };
         let paused = crate::mpris::Snapshot { playing: false, ..playing.clone() };
         let mut sampler = StatusSampler::new();
-        assert!(sampler.sample_with_mpris(Some(&playing)).contains("^m^"));
+        assert!(sampler.sample_with_mpris(Some(&playing)).playing.is_some());
         let status = sampler.sample_with_mpris(Some(&paused));
-        assert!(!status.contains("^m^"));
-        assert!(status.contains(""));
+        assert!(status.playing.is_none());
+        let runs = status.runs();
+        assert!(runs.iter().any(|run| run.text == " " && run.bg == 0xa6e3a1));
+        assert!(runs.iter().any(|run| run.fg == 0x96cdfb && run.text.contains('%')));
     }
 
     #[test]
-    fn test_status_sampler_runs() {
+    fn test_status_sampler_runs_are_markup_free() {
         let mut sampler = StatusSampler::new();
         let status = sampler.sample();
-        assert!(!status.is_empty());
-        assert!(status.contains(""));
-        assert!(status.contains("^c#"));
-        // Check character spacing elements
-        assert!(status.contains("^b#a6e3a1^ "));
-        assert!(status.contains("^b#282737^"));
+        assert!(status.playing.is_none());
+        let runs = status.runs();
+        assert!(runs.iter().any(|run| run.text == " "));
+        assert!(runs.iter().any(|run| run.bg == 0x282737));
+        assert!(runs.iter().all(|run| !run.text.contains('^')));
+    }
+
+    #[test]
+    fn test_status_runs_match_dwm_layout() {
+        let status = Status {
+            custom: None,
+            playing: None,
+            battery_icon: "󰁹",
+            battery_percent: 85,
+            cpu_percent: 12.3,
+            mem_icon: "󰾆",
+            mem_text: "3.2Gi".into(),
+            mem_warn: false,
+            wifi_icon: "󰤨",
+            wifi_text: "MyWiFi".into(),
+        };
+        let runs = status.runs();
+        let texts: Vec<&str> = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "  ", "󰁹", " 85%", " ", " ", " ", " 12.3% ",
+                " ", " 󰾆", " ", " 3.2Gi ", " ", " 󰤨", " ", " MyWiFi ", " ",
+            ]
+        );
+        assert_eq!(runs[4].bg, 0xa6e3a1);
+        assert_eq!(runs[6].bg, 0x282737);
+        assert_eq!(runs[9].bg, 0xa6e3a1);
+        assert_eq!(runs[12].bg, 0x96cdfb);
     }
 }

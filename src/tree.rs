@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use x11rb::protocol::xproto::Window;
 
+use crate::config;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -182,56 +184,14 @@ impl Node {
         }
     }
 
-    /// Moves the split boundaries next to `win` on the chosen sides by the
-    /// drag `(dx, dy)`. `want` is `(left, right, top, bottom)`. A boundary is
-    /// only moved when the window touches it, and the deepest split wins, so
-    /// the boundary nearest each chosen side is the one that moves.
-    fn resize_boundaries(
-        &mut self,
-        rect: Rect,
-        vis: &HashSet<Window>,
-        gaps: &Gaps,
-        win: Window,
-        want: &mut (bool, bool, bool, bool),
-        (dx, dy): (i32, i32),
-    ) {
+    /// Collects every leaf window into `out`, including hidden ones. Used to
+    /// reconcile the tree with the current client list.
+    pub fn leaves(&self, out: &mut Vec<Window>) {
         match self {
-            Node::Leaf(_) => {}
-            Node::Split { side_by_side, ratio, first, second } => {
-                let (fv, sv) = (first.any_visible(vis), second.any_visible(vis));
-                if !(fv && sv) {
-                    if fv {
-                        first.resize_boundaries(rect, vis, gaps, win, want, (dx, dy));
-                    } else if sv {
-                        second.resize_boundaries(rect, vis, gaps, win, want, (dx, dy));
-                    }
-                    return;
-                }
-                let gap = if *side_by_side { gaps.iv } else { gaps.ih };
-                let (a, b) = rect.split(*side_by_side, gap, *ratio);
-                let in_first = first.has_leaf(win);
-                if in_first {
-                    first.resize_boundaries(a, vis, gaps, win, want, (dx, dy));
-                } else {
-                    second.resize_boundaries(b, vis, gaps, win, want, (dx, dy));
-                }
-                let side = match (*side_by_side, in_first) {
-                    (true, true) => &mut want.1,
-                    (true, false) => &mut want.0,
-                    (false, true) => &mut want.3,
-                    (false, false) => &mut want.2,
-                };
-                if !*side {
-                    return;
-                }
-                *side = false;
-                let total = if *side_by_side { rect.w as i32 - gap } else { rect.h as i32 - gap }.max(0);
-                if total < 2 {
-                    return;
-                }
-                let step = if *side_by_side { dx } else { dy };
-                let len = first_len(total, *ratio) + step;
-                *ratio = len.clamp(1, total - 1) as f64 / total as f64;
+            Node::Leaf(w) => out.push(*w),
+            Node::Split { first, second, .. } => {
+                first.leaves(out);
+                second.leaves(out);
             }
         }
     }
@@ -278,11 +238,32 @@ impl Node {
         }
     }
 
-    /// Replaces the leaf `target` with a split holding `target` and `new`.
+    /// Replaces the leaf `target` with an even dwindle split holding `target`
+    /// and `new`.
     pub fn insert(&mut self, target: Window, new: Window, new_first: bool, side_by_side: bool) -> bool {
+        self.insert_with_ratio(
+            target,
+            new,
+            new_first,
+            side_by_side,
+            config::DWINDLE_DEFAULT_SPLIT_SHARE,
+        )
+    }
+
+    /// Replaces the leaf `target` with a split holding `target` and `new`. The
+    /// ratio is the first half's share; dwindle drops use `insert()` instead,
+    /// which always uses the default even share.
+    pub fn insert_with_ratio(
+        &mut self,
+        target: Window,
+        new: Window,
+        new_first: bool,
+        side_by_side: bool,
+        ratio: f64,
+    ) -> bool {
         if let Node::Split { first, second, .. } = self {
-            return first.insert(target, new, new_first, side_by_side)
-                || second.insert(target, new, new_first, side_by_side);
+            return first.insert_with_ratio(target, new, new_first, side_by_side, ratio)
+                || second.insert_with_ratio(target, new, new_first, side_by_side, ratio);
         }
         let Node::Leaf(w) = *self else { return false };
         if w != target {
@@ -295,7 +276,7 @@ impl Node {
         };
         *self = Node::Split {
             side_by_side,
-            ratio: 0.5,
+            ratio: ratio.clamp(0.1, 0.9),
             first: Box::new(first),
             second: Box::new(second),
         };
@@ -322,6 +303,260 @@ impl Node {
     }
 }
 
+/// Rescales the ratios inside `node` so its along-axis length changes from
+/// `old_len` to `new_len` while every leaf keeps its pixel size except the one
+/// next to the moved boundary, which absorbs the difference. `anchor_second`
+/// means the second child (right/bottom) is the one away from the boundary.
+/// A cross-axis split has all its leaves spanning the full length, so it can
+/// only scale as a whole and no internal ratio needs to change.
+fn rescale_subtree(
+    node: &mut Node,
+    axis_side_by_side: bool,
+    gaps: &Gaps,
+    old_len: i32,
+    new_len: i32,
+    anchor_second: bool,
+) {
+    let Node::Split { side_by_side, ratio, first, second } = node else {
+        return;
+    };
+    if *side_by_side != axis_side_by_side {
+        return;
+    }
+    let gap = if axis_side_by_side { gaps.iv } else { gaps.ih };
+    let old_usable = (old_len - gap).max(1);
+    let new_usable = (new_len - gap).max(1);
+    let old_first = first_len(old_usable, *ratio);
+    let old_second = (old_usable - old_first).max(0);
+    let delta = new_len - old_len;
+
+    let (new_first, new_second) = if anchor_second {
+        (old_first, (old_second + delta).max(0))
+    } else {
+        ((old_first + delta).max(0), old_second)
+    };
+    *ratio = (new_first as f64 / new_usable as f64).clamp(0.01, 0.99);
+
+    if anchor_second {
+        rescale_subtree(second, axis_side_by_side, gaps, old_second, new_second, true);
+    } else {
+        rescale_subtree(first, axis_side_by_side, gaps, old_first, new_first, false);
+    }
+}
+
+/// One split on the path from the tree root to the window being resized,
+/// captured before any ratio changes. Hyprland keeps the same information in
+/// every node's cached `box`.
+#[derive(Clone, Copy, Debug)]
+struct PathEntry {
+    side_by_side: bool,
+    child_first: bool,
+    total: i32,
+    first: i32,
+}
+
+/// Walks root-to-leaf to `win`, pushing a `PathEntry` for each split that
+/// actually separates two visible children. Splits with a hidden child have
+/// no boundary to move, so they are traversed without an entry. The returned
+/// path is leaf-first, matching the direction Hyprland walks parent links.
+fn collect_path(
+    node: &Node,
+    rect: Rect,
+    vis: &HashSet<Window>,
+    win: Window,
+    gaps: &Gaps,
+    path: &mut Vec<PathEntry>,
+) -> bool {
+    let Node::Split { side_by_side, ratio, first, second } = node else {
+        return matches!(node, Node::Leaf(w) if *w == win);
+    };
+    let (fv, sv) = (first.any_visible(vis), second.any_visible(vis));
+    if !fv || !sv {
+        return if fv {
+            collect_path(first, rect, vis, win, gaps, path)
+        } else if sv {
+            collect_path(second, rect, vis, win, gaps, path)
+        } else {
+            false
+        };
+    }
+    let gap = if *side_by_side { gaps.iv } else { gaps.ih };
+    let (a, b) = rect.split(*side_by_side, gap, *ratio);
+    let child_first = first.has_leaf(win);
+    let found = if child_first {
+        collect_path(first, a, vis, win, gaps, path)
+    } else {
+        collect_path(second, b, vis, win, gaps, path)
+    };
+    if found {
+        let len = (if *side_by_side { rect.w } else { rect.h }) as i32;
+        let total = (len - gap).max(0);
+        path.push(PathEntry {
+            side_by_side: *side_by_side,
+            child_first,
+            total,
+            first: first_len(total, *ratio),
+        });
+    }
+    found
+}
+
+/// The split on the dragged side of one axis, scanning the path from the
+/// window towards the root. Moving this split's boundary is what resizes the
+/// window: any shallower same-axis split would move a whole subtree instead.
+fn resize_outer(path: &[PathEntry], side_by_side: bool, drag_first: bool) -> Option<usize> {
+    for i in (0..path.len()).rev() {
+        let e = &path[i];
+        if e.side_by_side == side_by_side && e.child_first == drag_first {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// What to do with one split's ratio when applying the plan top-down.
+#[derive(Clone, Copy)]
+enum RatioTarget {
+    /// Set the ratio directly. Used at the outer split, whose own box does not
+    /// change size; only its boundary moves.
+    Fraction(f64),
+    /// Keep the first child at this many pixels. `total` is recomputed from
+    /// the split's current box, so the far edge stays anchored even when an
+    /// ancestor grew by a fraction of the drag.
+    First(i32),
+    /// Keep the second child at this many pixels.
+    Second(i32),
+}
+
+/// A planned ratio change at one split on the focused path.
+#[derive(Clone, Copy)]
+struct RatioChange {
+    target: RatioTarget,
+    /// The outer split's other child shrinks as the focused side grows.
+    /// `(anchor_second, old_len, new_len)` lets that child's far-side leaves
+    /// keep their pixel sizes while the leaf next to the boundary absorbs it.
+    sibling: Option<(bool, i32, i32)>,
+}
+
+/// Plans the ratio changes for one axis into `plan`, which is indexed in the
+/// same root-first order as `path`.
+fn apply_axis(
+    plan: &mut [Option<RatioChange>],
+    path: &[PathEntry],
+    side_by_side: bool,
+    drag_first: bool,
+    d: i32,
+) {
+    let Some(outer) = resize_outer(path, side_by_side, drag_first) else {
+        return;
+    };
+    let e = &path[outer];
+    if e.total < 2 {
+        return;
+    }
+    let new_first = (e.first + d).clamp(1, e.total - 1);
+    let applied = new_first - e.first;
+    let sibling = if e.child_first {
+        // Focused side is first; the second child loses `applied` pixels.
+        (false, e.total - e.first, e.total - e.first - applied)
+    } else {
+        // Focused side is second; the first child loses `-applied` pixels.
+        (true, e.first, e.first + applied)
+    };
+    plan[outer] = Some(RatioChange {
+        target: RatioTarget::Fraction(new_first as f64 / e.total as f64),
+        sibling: Some(sibling),
+    });
+
+    // Every deeper split on the far side of the drag contributes length to
+    // the window's far edge. Each one must keep its *other* child's pixel
+    // length, otherwise that edge drifts as the outer boundary moves. A
+    // spawned window adds another such split (the split it created), which is
+    // exactly the case the old single-inner compensation could not handle.
+    for i in (outer + 1)..path.len() {
+        let a = &path[i];
+        if a.side_by_side != side_by_side || a.child_first == drag_first {
+            continue;
+        }
+        let kept = if a.child_first {
+            // Window is first; the second child sits behind the far edge.
+            a.total - a.first
+        } else {
+            // Window is second; the first child sits behind the far edge.
+            a.first
+        };
+        let target = if a.child_first {
+            RatioTarget::Second(kept)
+        } else {
+            RatioTarget::First(kept)
+        };
+        plan[i] = Some(RatioChange { target, sibling: None });
+    }
+}
+
+fn axis_total(rect: Rect, side_by_side: bool, gaps: &Gaps) -> i32 {
+    let gap = if side_by_side { gaps.iv } else { gaps.ih };
+    let len = if side_by_side { rect.w } else { rect.h };
+    (len as i32 - gap).max(0)
+}
+
+/// Applies the planned ratios while walking back down the focused path.
+/// `depth` counts only splits with two visible children, like `collect_path`.
+fn apply_plan(
+    node: &mut Node,
+    rect: Rect,
+    vis: &HashSet<Window>,
+    gaps: &Gaps,
+    win: Window,
+    plan: &[Option<RatioChange>],
+    depth: usize,
+) {
+    let Node::Split { side_by_side, ratio, first, second } = node else {
+        return;
+    };
+    let (fv, sv) = (first.any_visible(vis), second.any_visible(vis));
+    if !(fv && sv) {
+        if fv {
+            apply_plan(first, rect, vis, gaps, win, plan, depth);
+        } else if sv {
+            apply_plan(second, rect, vis, gaps, win, plan, depth);
+        }
+        return;
+    }
+    let child_first = first.has_leaf(win);
+    if let Some(change) = plan.get(depth).copied().flatten() {
+        match change.target {
+            RatioTarget::Fraction(r) => *ratio = r.clamp(0.0, 1.0),
+            RatioTarget::First(keep) => {
+                let total = axis_total(rect, *side_by_side, gaps);
+                if total > 0 {
+                    *ratio = keep.clamp(0, total) as f64 / total as f64;
+                }
+            }
+            RatioTarget::Second(keep) => {
+                let total = axis_total(rect, *side_by_side, gaps);
+                if total > 0 {
+                    *ratio = (total - keep.clamp(0, total)) as f64 / total as f64;
+                }
+            }
+        }
+        if let Some((anchor_second, old_len, new_len)) = change.sibling {
+            if child_first {
+                rescale_subtree(second, *side_by_side, gaps, old_len, new_len, anchor_second);
+            } else {
+                rescale_subtree(first, *side_by_side, gaps, old_len, new_len, anchor_second);
+            }
+        }
+    }
+    let gap = if *side_by_side { gaps.iv } else { gaps.ih };
+    let (a, b) = rect.split(*side_by_side, gap, *ratio);
+    if child_first {
+        apply_plan(first, a, vis, gaps, win, plan, depth + 1);
+    } else {
+        apply_plan(second, b, vis, gaps, win, plan, depth + 1);
+    }
+}
+
 /// Resizes tiled `win` by moving the boundaries on its chosen `edges` by the
 /// drag `(dx, dy)`. `rect` is the area of the whole tree.
 pub fn resize_tiled(
@@ -333,8 +568,39 @@ pub fn resize_tiled(
     edges: (bool, bool, bool, bool),
     delta: (i32, i32),
 ) {
-    let mut want = edges;
-    node.resize_boundaries(rect, vis, gaps, win, &mut want, delta);
+    let (left, right, top, bottom) = edges;
+    if !(left || right || top || bottom) {
+        return;
+    }
+    let mut path = Vec::new();
+    if !collect_path(node, rect, vis, win, gaps, &mut path) {
+        return;
+    }
+    path.reverse();
+    let mut plan = vec![None; path.len()];
+    if left || right {
+        apply_axis(&mut plan, &path, true, right, delta.0);
+    }
+    if top || bottom {
+        apply_axis(&mut plan, &path, false, bottom, delta.1);
+    }
+    apply_plan(node, rect, vis, gaps, win, &plan, 0);
+}
+
+/// Hyprland's dwindle split decision for a spawn or a pointer drop: wide tiles
+/// split left/right, tall tiles split top/bottom, and the pointer's half decides
+/// whether the new window becomes the first (left/top) or second child.
+///
+/// Returns `(new_first, side_by_side)`.
+pub fn split_for_drop(rect: Rect, (px, py): (i32, i32)) -> (bool, bool) {
+    let side_by_side =
+        rect.w as f64 > rect.h as f64 * config::DWINDLE_SPLIT_WIDTH_MULTIPLIER;
+    let new_first = if side_by_side {
+        px < rect.x + (rect.w / 2) as i32
+    } else {
+        py < rect.y + (rect.h / 2) as i32
+    };
+    (new_first, side_by_side)
 }
 
 /// Adds `new` beside the whole tree, splitting along the long side of `area`.
@@ -534,6 +800,56 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_with_ratio_supports_custom_share() {
+        let screen = Rect { x: 0, y: 0, w: 1000, h: 500 };
+        let mut tree = Node::Leaf(1);
+        // A custom caller can still ask for a 30/70 split; dwindle drops use
+        // `insert()`, which keeps the default even share.
+        assert!(tree.insert_with_ratio(1, 2, true, true, 0.3));
+        let out = layout_all(&tree, screen);
+        assert_eq!(out[0], (2, Rect { x: 0, y: 0, w: 300, h: 500 }));
+        assert_eq!(out[1], (1, Rect { x: 300, y: 0, w: 700, h: 500 }));
+    }
+
+    #[test]
+    fn test_dwindle_split_uses_long_axis_and_cursor_half() {
+        let wide = Rect { x: 100, y: 200, w: 1920, h: 1080 };
+        assert_eq!(split_for_drop(wide, (300, 700)), (true, true));
+        assert_eq!(split_for_drop(wide, (1500, 700)), (false, true));
+
+        let tall = Rect { x: 100, y: 200, w: 960, h: 1080 };
+        assert_eq!(split_for_drop(tall, (500, 400)), (true, false));
+        assert_eq!(split_for_drop(tall, (500, 900)), (false, false));
+    }
+
+    #[test]
+    fn test_repeated_drop_at_same_point_keeps_same_split() {
+        let screen = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        let (a, b): (Window, Window) = (1, 2);
+        let mut tree = Node::Leaf(a);
+        assert!(tree.insert(a, b, false, true));
+        let expected = vec![
+            (a, Rect { x: 0, y: 0, w: 960, h: 1080 }),
+            (b, Rect { x: 960, y: 0, w: 960, h: 1080 }),
+        ];
+
+        for _ in 0..3 {
+            // Hyprland removes the dragged window before re-tiling, so B is
+            // full-screen when the target split is chosen.
+            tree = tree.remove(a).unwrap();
+            let leaves = layout_all(&tree, screen);
+            assert_eq!(leaves, vec![(b, screen)]);
+
+            let (target, rect) = leaves[0];
+            let (new_first, side_by_side) = split_for_drop(rect, (200, 500));
+            assert!(new_first);
+            assert!(side_by_side);
+            assert!(tree.insert(target, a, new_first, side_by_side));
+            assert_eq!(layout_all(&tree, screen), expected);
+        }
+    }
+
+    #[test]
     fn test_inset_outer_gaps() {
         let screen = Rect { x: 100, y: 50, w: 1000, h: 500 };
         let gaps = Gaps { oh: 14, ov: 20, ih: 0, iv: 0 };
@@ -635,6 +951,70 @@ mod tests {
     }
 
     #[test]
+    fn test_resize_center_keeps_non_adjacent_window_size() {
+        // Tree: Split(Split(W1, W2), W3) — W2 is the rightmost leaf of the
+        // first subtree, so its right edge is the root boundary.
+        // Layout: W1=[0,250], W2=[250,500], W3=[500,1000].
+        let screen = Rect { x: 0, y: 0, w: 1000, h: 500 };
+        let mut tree = Node::Leaf(1);
+        tree.insert(1, 2, false, true); // W1 | W2
+        tree = append(Some(tree), 3, screen); // (W1 | W2) | W3
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let gaps = Gaps::default();
+
+        let mut initial = Vec::new();
+        tree.layout(screen, &vis, &gaps, &mut initial);
+        assert_eq!(initial[0], (1, Rect { x: 0, y: 0, w: 250, h: 500 }));
+        assert_eq!(initial[1], (2, Rect { x: 250, y: 0, w: 250, h: 500 }));
+        assert_eq!(initial[2], (3, Rect { x: 500, y: 0, w: 500, h: 500 }));
+
+        // Resize W2's right edge by +100: only W2/W3 boundary should move.
+        // W1 must keep its 250px width; W2 grows to 350; W3 shrinks to 400.
+        resize_tiled(&mut tree, screen, &vis, &gaps, 2, (false, true, false, false), (100, 0));
+        let mut out = Vec::new();
+        tree.layout(screen, &vis, &gaps, &mut out);
+        assert_eq!(out[0], (1, Rect { x: 0, y: 0, w: 250, h: 500 }));
+        assert_eq!(out[1], (2, Rect { x: 250, y: 0, w: 350, h: 500 }));
+        assert_eq!(out[2], (3, Rect { x: 600, y: 0, w: 400, h: 500 }));
+
+        // Resize W3's left edge back by -100: W1 keeps 250, W2 shrinks to 250,
+        // W3 grows back to 500.
+        resize_tiled(&mut tree, screen, &vis, &gaps, 3, (true, false, false, false), (-100, 0));
+        out.clear();
+        tree.layout(screen, &vis, &gaps, &mut out);
+        assert_eq!(out[0], (1, Rect { x: 0, y: 0, w: 250, h: 500 }));
+        assert_eq!(out[1], (2, Rect { x: 250, y: 0, w: 250, h: 500 }));
+        assert_eq!(out[2], (3, Rect { x: 500, y: 0, w: 500, h: 500 }));
+    }
+
+    #[test]
+    fn test_resize_middle_boundary_four_windows() {
+        // Tree: (W1|W2)|(W3|W4). Resizing W2/W3 boundary must change only W2
+        // and W3; W1 and W4 keep their exact pixel sizes.
+        let screen = Rect { x: 0, y: 0, w: 1000, h: 500 };
+        let mut left = Node::Leaf(1);
+        left.insert(1, 2, false, true);
+        let mut right = Node::Leaf(3);
+        right.insert(3, 4, false, true);
+        let mut tree = Node::Split {
+            side_by_side: true,
+            ratio: 0.5,
+            first: Box::new(left),
+            second: Box::new(right),
+        };
+        let vis: HashSet<Window> = [1, 2, 3, 4].into_iter().collect();
+        let gaps = Gaps::default();
+
+        resize_tiled(&mut tree, screen, &vis, &gaps, 2, (false, true, false, false), (100, 0));
+        let mut out = Vec::new();
+        tree.layout(screen, &vis, &gaps, &mut out);
+        assert_eq!(out[0], (1, Rect { x: 0, y: 0, w: 250, h: 500 }));
+        assert_eq!(out[1], (2, Rect { x: 250, y: 0, w: 350, h: 500 }));
+        assert_eq!(out[2], (3, Rect { x: 600, y: 0, w: 150, h: 500 }));
+        assert_eq!(out[3], (4, Rect { x: 750, y: 0, w: 250, h: 500 }));
+    }
+
+    #[test]
     fn test_resize_tiled_screen_edge_is_a_no_op() {
         let screen = Rect { x: 0, y: 0, w: 1000, h: 500 };
         let mut tree = Node::Leaf(1);
@@ -670,5 +1050,242 @@ mod tests {
             resize_rect(r, left, (400, 0)),
             Rect { x: 299, y: 0, w: 1, h: 300 }
         );
+    }
+
+    fn pair(a: Node, b: Node, side_by_side: bool) -> Node {
+        Node::Split {
+            side_by_side,
+            ratio: 0.5,
+            first: Box::new(a),
+            second: Box::new(b),
+        }
+    }
+
+    fn leaf_pair(a: Window, b: Window, side_by_side: bool) -> Node {
+        pair(Node::Leaf(a), Node::Leaf(b), side_by_side)
+    }
+
+    /// The balanced grid from the bug report: columns grouped in row pairs,
+    /// row pairs grouped in halves.
+    fn balanced_grid() -> Node {
+        pair(
+            pair(
+                pair(leaf_pair(1, 5, false), leaf_pair(2, 6, false), true),
+                pair(leaf_pair(9, 13, false), leaf_pair(10, 14, false), true),
+                false,
+            ),
+            pair(
+                pair(leaf_pair(3, 7, false), leaf_pair(4, 8, false), true),
+                pair(leaf_pair(11, 15, false), leaf_pair(12, 16, false), true),
+                false,
+            ),
+            true,
+        )
+    }
+
+    /// A dwindle comb: four vertical columns, each an H-comb of four rows.
+    fn comb_grid() -> Node {
+        let column = |rows: [Window; 4]| -> Node {
+            let mut n = Node::Leaf(rows[3]);
+            for &w in rows[..3].iter().rev() {
+                n = pair(Node::Leaf(w), n, false);
+            }
+            n
+        };
+        let mut n = column([4, 8, 12, 16]);
+        for rows in [[3, 7, 11, 15], [2, 6, 10, 14], [1, 5, 9, 13]] {
+            n = pair(column(rows), n, true);
+        }
+        n
+    }
+
+    fn layout_vis(node: &Node, rect: Rect, vis: &HashSet<Window>, gaps: &Gaps) -> Vec<(Window, Rect)> {
+        let mut out = Vec::new();
+        node.layout(rect, vis, gaps, &mut out);
+        out
+    }
+
+    fn rect_of(out: &[(Window, Rect)], win: Window) -> Rect {
+        out.iter().find(|(w, _)| *w == win).map(|(_, r)| *r).unwrap()
+    }
+
+    #[test]
+    fn test_resize_grid_anchors_focused_corner() {
+        let screen = Rect { x: 0, y: 0, w: 800, h: 800 };
+        let vis: HashSet<Window> = (1..=16).collect();
+        let gaps = Gaps::default();
+
+        // W6 bottom-right: its top-left corner stays where it was. The old
+        // code moved it to (220,220) and changed W2's height and W5's width.
+        let mut t = balanced_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 6, (false, true, false, true), (40, 40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        assert_eq!((rect_of(&out, 6).x, rect_of(&out, 6).y), (200, 200));
+        assert_eq!((rect_of(&out, 2).y, rect_of(&out, 2).h), (0, 200));
+        assert_eq!((rect_of(&out, 5).x, rect_of(&out, 5).w), (0, 200));
+
+        // W10 top-right: its bottom-left corner stays put.
+        let mut t = balanced_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 10, (false, true, true, false), (40, -40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        let r10 = rect_of(&out, 10);
+        assert_eq!((r10.x, r10.y + r10.h as i32), (200, 600));
+        assert_eq!((rect_of(&out, 9).w, rect_of(&out, 13).w), (200, 200));
+
+        // W7 bottom-left: its top-right corner stays put.
+        let mut t = balanced_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 7, (true, false, false, true), (-40, 40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        let r7 = rect_of(&out, 7);
+        assert_eq!((r7.x + r7.w as i32, r7.y), (600, 200));
+
+        // W11 top-left: its bottom-right corner stays put.
+        let mut t = balanced_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 11, (true, false, true, false), (-40, -40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        let r11 = rect_of(&out, 11);
+        assert_eq!((r11.x + r11.w as i32, r11.y + r11.h as i32), (600, 600));
+    }
+
+    #[test]
+    fn test_resize_comb_grid_keeps_unrelated_windows_fixed() {
+        let screen = Rect { x: 0, y: 0, w: 800, h: 800 };
+        let vis: HashSet<Window> = (1..=16).collect();
+        let gaps = Gaps::default();
+
+        let before = {
+            let t = comb_grid();
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+
+        // A column comb shares fewer boundaries than the balanced grid: W1
+        // and W5 are completely untouched by a W6 resize.
+        let mut t = comb_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 6, (false, true, false, true), (40, 40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        assert_eq!(rect_of(&out, 1), rect_of(&before, 1));
+        assert_eq!(rect_of(&out, 5), rect_of(&before, 5));
+        assert_eq!((rect_of(&out, 2).y, rect_of(&out, 2).h), (0, 400));
+        assert_eq!((rect_of(&out, 6).x, rect_of(&out, 6).y), (400, 400));
+
+        // W10's top-right drag leaves the whole first column (W9, W13) alone.
+        let mut t = comb_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 10, (false, true, true, false), (40, -40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        assert_eq!(rect_of(&out, 9), rect_of(&before, 9));
+        assert_eq!(rect_of(&out, 13), rect_of(&before, 13));
+
+        // W7's bottom-left drag leaves the fourth column (W8, W12, W16) alone.
+        let mut t = comb_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 7, (true, false, false, true), (-40, 40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        assert_eq!(rect_of(&out, 8), rect_of(&before, 8));
+        assert_eq!(rect_of(&out, 12), rect_of(&before, 12));
+        assert_eq!(rect_of(&out, 16), rect_of(&before, 16));
+
+        // W11's top-left drag leaves the first column (W1, W5, W9, W13) alone.
+        let mut t = comb_grid();
+        let out = {
+            resize_tiled(&mut t, screen, &vis, &gaps, 11, (true, false, true, false), (-40, -40));
+            layout_vis(&t, screen, &vis, &gaps)
+        };
+        assert_eq!(rect_of(&out, 1), rect_of(&before, 1));
+        assert_eq!(rect_of(&out, 5), rect_of(&before, 5));
+        assert_eq!(rect_of(&out, 9), rect_of(&before, 9));
+        assert_eq!(rect_of(&out, 13), rect_of(&before, 13));
+    }
+
+    #[test]
+    fn test_resize_spawned_window_inside_grid_corner() {
+        let screen = Rect { x: 0, y: 0, w: 800, h: 800 };
+        let vis: HashSet<Window> = (1..=17).collect();
+        let gaps = Gaps::default();
+
+        // Spawn W17 in the top half of W6: W6's 200x200 box splits into
+        // W17 (top, 100px) and W6 (bottom, 100px).
+        let mut t = balanced_grid();
+        assert!(t.insert(6, 17, true, false));
+        let before = layout_vis(&t, screen, &vis, &gaps);
+        assert_eq!(rect_of(&before, 17), Rect { x: 200, y: 200, w: 200, h: 100 });
+
+        // Drag W17's bottom edge down 40px. Only the W17/W6 split should move:
+        // W17 grows to 140, W6 shrinks to 60. Every unrelated window stays put.
+        resize_tiled(&mut t, screen, &vis, &gaps, 17, (false, false, false, true), (0, 40));
+        let after = layout_vis(&t, screen, &vis, &gaps);
+        assert_eq!(rect_of(&after, 17), Rect { x: 200, y: 200, w: 200, h: 140 });
+        assert_eq!(rect_of(&after, 6), Rect { x: 200, y: 340, w: 200, h: 60 });
+        for w in [1, 2, 5, 9, 10, 13, 14] {
+            assert_eq!(rect_of(&after, w), rect_of(&before, w), "W{w} moved");
+        }
+    }
+
+    #[test]
+    fn test_resize_spawned_window_anchors_far_edge_on_every_side() {
+        let screen = Rect { x: 0, y: 0, w: 800, h: 800 };
+        let vis: HashSet<Window> = (1..=17).collect();
+        let gaps = Gaps::default();
+
+        // A spawned window is a split nested inside the host leaf. Its far
+        // edge must stay anchored through that extra split, not just the host
+        // column's split. The old single-inner compensation moved the window
+        // as well as resizing it (e.g. W17 y 300 -> 305 on a bottom drag).
+        let drags = [
+            ((false, true, false, false), (20, 0)),  // right edge
+            ((true, false, false, false), (-20, 0)), // left edge
+            ((false, false, false, true), (0, 20)),  // bottom edge
+            ((false, false, true, false), (0, -20)), // top edge
+        ];
+        for host in [6, 7, 10, 11] {
+            for new_first in [true, false] {
+                for (edges, delta) in drags {
+                    let mut t = balanced_grid();
+                    assert!(t.insert(host, 17, new_first, false));
+                    let before = rect_of(&layout_vis(&t, screen, &vis, &gaps), 17);
+                    resize_tiled(&mut t, screen, &vis, &gaps, 17, edges, delta);
+                    let after = rect_of(&layout_vis(&t, screen, &vis, &gaps), 17);
+                    assert_eq!(
+                        after,
+                        resize_rect(before, edges, delta),
+                        "host={host} new_first={new_first} edges={edges:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resize_grid_keeps_geometry_consistent_with_gaps() {
+        let screen = Rect { x: 10, y: 20, w: 800, h: 800 };
+        let vis: HashSet<Window> = (1..=16).collect();
+        let gaps = Gaps { oh: 8, ov: 12, ih: 6, iv: 4 };
+        let area = inset(screen, &gaps);
+        let mut t = balanced_grid();
+        resize_tiled(&mut t, area, &vis, &gaps, 6, (false, true, false, true), (37, 29));
+        let out = layout_vis(&t, area, &vis, &gaps);
+        assert_eq!(out.len(), 16);
+        for (_, r) in &out {
+            assert!(r.w > 0 && r.h > 0);
+            assert!(r.x >= screen.x + gaps.ov && r.y >= screen.y + gaps.oh);
+        }
+        // The focused window keeps its top-left corner; nothing jumps across
+        // the inner gaps.
+        let before = layout_vis(&balanced_grid(), area, &vis, &gaps);
+        let r6 = rect_of(&out, 6);
+        let b6 = rect_of(&before, 6);
+        assert_eq!((r6.x, r6.y), (b6.x, b6.y));
     }
 }

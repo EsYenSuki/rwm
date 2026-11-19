@@ -1,9 +1,8 @@
 mod bar;
 mod config;
+mod drw;
 mod keys;
 mod mpris;
-mod render;
-mod soft;
 mod sound;
 mod status;
 mod text;
@@ -14,8 +13,7 @@ use std::env;
 use std::error::Error;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
+use std::time::Instant;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::randr;
@@ -46,7 +44,8 @@ fn monitor_rects(conn: &RustConnection, root: Window, screen: Rect) -> Result<Ve
 }
 
 fn main() -> Result {
-    // The render thread and the window manager each use Xlib displays.
+    // One Xlib display serves cursors, fonts and all drawing. x11rb handles
+    // window management on its own connection, as in AnDWM's single `dpy`.
     unsafe {
         x11::xlib::XInitThreads();
     }
@@ -72,19 +71,19 @@ fn main() -> Result {
         wm::spawn(&cmd)?;
     }
 
-    let mut dirty = true;
     loop {
         while let Some(event) = wm.conn.poll_for_event()? {
             wm.handle(event)?;
-            dirty = true;
         }
         if wm.restart {
             let exe = env::current_exe()?;
             let err = Command::new(exe).args(env::args().skip(1)).exec();
             return Err(err.into());
         }
-        wm.refresh(dirty)?;
-        dirty = false;
-        thread::sleep(Duration::from_millis(20));
+        wm.refresh()?;
+        // All animated bar values advance on the single deadline refresh()
+        // just computed. Block on the X connection until then or an event.
+        let timeout = wm.next_tick().saturating_duration_since(Instant::now());
+        wm.wait_event(timeout)?;
     }
 }

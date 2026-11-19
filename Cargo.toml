@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fontdue = "0.9.5"
-glow = "0.18.0"
 libc = "0.2.191"
 pipewire = "0.10.1"
-x11 = { version = "2.21.0", features = ["xlib", "glx", "xcursor"] }
+x11 = { version = "2.21.0", features = ["xlib", "xft", "xrender", "xcursor"] }
 x11rb = { version = "0.14.0", features = ["randr", "xkb"] }
+zbus = "5.19"

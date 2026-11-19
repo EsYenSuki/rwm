@@ -21,6 +21,14 @@ pub const BORDERPX: i32 = 2;
 /// Width of the band along each window edge where hovering shows a resize
 /// cursor and a plain left click starts a resize.
 pub const RESIZE_EDGE_PX: i32 = 2;
+
+/// Hyprland `dwindle:split_width_multiplier`: a tile splits left/right when its
+/// width is greater than its height times this value. The default is 1.0.
+pub const DWINDLE_SPLIT_WIDTH_MULTIPLIER: f64 = 1.0;
+/// First child's share of a new dwindle split. Hyprland's default
+/// `dwindle:default_split_ratio` is 1.0, which makes the first child
+/// `box.w / 2 * 1.0`, i.e. half the box.
+pub const DWINDLE_DEFAULT_SPLIT_SHARE: f64 = 0.5;
 /// config.def.h `colors[SchemeNorm][ColBorder]`: border of unfocused windows.
 pub const COL_NORM_BORDER: u32 = 0x27372d;
 /// config.def.h `colors[SchemeSel][ColBorder]`: border of the focused window.
@@ -30,5 +38,11 @@ pub const COL_SEL_BORDER: u32 = 0x94E2D5;
 pub const CLOCK_ANIMATE: bool = true;
 /// dwm.c `CLOCK_ANIM_EXTRA`: most px the clock bar grows past its text width.
 pub const CLOCK_ANIM_EXTRA: i32 = 280;
+/// Peaks below this are treated as silence, so monitor noise cannot make the
+/// clock bar animate while nothing is playing.
+pub const CLOCK_PEAK_EPSILON: f32 = 0.02;
+/// Clock animation widths are quantized to this many pixels. Fewer, larger
+/// resizes mean fewer damaged regions for the compositor to repaint.
+pub const CLOCK_ANIM_STEP: i32 = 4;
 /// dwm.c `PW_MONITOR_SINK`: capture system output (true) or the microphone (false).
 pub const PW_MONITOR_SINK: bool = true;
