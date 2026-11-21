@@ -4,6 +4,25 @@
 pub const FLOATBAR: bool = true;
 /// config.def.h `topbar`.
 pub const TOPBAR: bool = true;
+/// Attempt a 32-bit ARGB visual (with an XRender alpha mask) for the center
+/// clock bar window, as dwm does for its finder popup. Set to `false` to force
+/// the default root visual everywhere; the same fallback is used automatically
+/// when the server has no ARGB visual or rejects its creation.
+pub const FINDER_ARGB: bool = true;
+/// config.h `finder_width`: popup width in pixels.
+pub const FINDER_WIDTH: i32 = 300;
+/// config.h `finder_rows`: maximum number of visible application rows.
+pub const FINDER_ROWS: usize = 10;
+/// dwm.c `FINDER_MARKER_WIDTH`: width of the separate white selection marker.
+pub const FINDER_MARKER_WIDTH: i32 = 270;
+/// config.h `finder_app_dirs`: scanned in this order, non-recursively.
+pub const FINDER_APP_DIRS: &[&str] = &[
+    "~/.local/share/applications",
+    "/usr/local/share/applications",
+    "/usr/share/applications",
+    "~/.local/share/flatpak/exports/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+];
 /// config.def.h `smartgaps`: no outer gap when a monitor shows one window.
 pub const SMARTGAPS: bool = false;
 

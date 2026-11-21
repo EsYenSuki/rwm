@@ -11,10 +11,10 @@ use std::thread;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
+use spa::param::ParamType;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::param::format::{MediaSubtype, MediaType};
 use spa::param::format_utils;
-use spa::param::ParamType;
 use spa::pod::serialize::PodSerializer;
 use spa::pod::{Object, Pod, Value};
 use spa::utils::SpaTypes;
@@ -103,7 +103,9 @@ fn run(peak: Peak) -> Result<(), Box<dyn Error>> {
             let count = (size / mem::size_of::<f32>()).min(samples.len() / mem::size_of::<f32>());
 
             let mut max = 0.0f32;
-            for bytes in samples[..count * mem::size_of::<f32>()].chunks_exact(mem::size_of::<f32>()) {
+            for bytes in
+                samples[..count * mem::size_of::<f32>()].chunks_exact(mem::size_of::<f32>())
+            {
                 let sample = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                 max = max.max(sample.abs());
             }

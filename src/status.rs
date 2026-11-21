@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -88,40 +88,185 @@ impl Status {
 
         if let Some(playing) = &self.playing {
             let runs = vec![
-                StatusRun { text: String::new(), fg: SAV, bg: DIM, scroll: false },
-                StatusRun { text: " ".into(), fg: SAV, bg: DIM, scroll: false },
-                StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
-                StatusRun { text: " 󰎆".into(), fg: DIM, bg: PLAY_BG, scroll: false },
-                StatusRun { text: format!(" {playing}"), fg: DIM, bg: PLAY_BG, scroll: true },
-                StatusRun { text: " ".into(), fg: mem_fg, bg: DIM, scroll: false },
-                StatusRun { text: format!(" {}", self.mem_icon), fg: mem_fg, bg: WIFI_BG, scroll: false },
-                StatusRun { text: " ".into(), fg: mem_fg, bg: WIFI_BG, scroll: false },
-                StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
-                StatusRun { text: format!(" {}", self.wifi_icon), fg: DIM, bg: WIFI_BG, scroll: false },
-                StatusRun { text: " ".into(), fg: DIM, bg: WIFI_BG, scroll: false },
-                StatusRun { text: format!(" {}", self.battery_icon), fg: BAT, bg: DIM, scroll: false },
-                StatusRun { text: " ".into(), fg: BAT, bg: DIM, scroll: false },
+                StatusRun {
+                    text: String::new(),
+                    fg: SAV,
+                    bg: DIM,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: SAV,
+                    bg: DIM,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: DIM,
+                    bg: DIM,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " 󰎆".into(),
+                    fg: DIM,
+                    bg: PLAY_BG,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: format!(" {playing}"),
+                    fg: DIM,
+                    bg: PLAY_BG,
+                    scroll: true,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: mem_fg,
+                    bg: DIM,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: format!(" {}", self.mem_icon),
+                    fg: mem_fg,
+                    bg: WIFI_BG,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: mem_fg,
+                    bg: WIFI_BG,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: DIM,
+                    bg: DIM,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: format!(" {}", self.wifi_icon),
+                    fg: DIM,
+                    bg: WIFI_BG,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: DIM,
+                    bg: WIFI_BG,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: format!(" {}", self.battery_icon),
+                    fg: BAT,
+                    bg: DIM,
+                    scroll: false,
+                },
+                StatusRun {
+                    text: " ".into(),
+                    fg: BAT,
+                    bg: DIM,
+                    scroll: false,
+                },
             ];
             return runs;
         }
 
         vec![
-            StatusRun { text: "  ".into(), fg: SAV, bg: DIM, scroll: false },
-            StatusRun { text: self.battery_icon.into(), fg: BAT, bg: DIM, scroll: false },
-            StatusRun { text: format!(" {}%", self.battery_percent), fg: BAT, bg: DIM, scroll: false },
-            StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
-            StatusRun { text: " ".into(), fg: DIM, bg: CPU_BG, scroll: false },
-            StatusRun { text: " ".into(), fg: VAL, bg: CPU_BG, scroll: false },
-            StatusRun { text: format!(" {:>4.1}% ", self.cpu_percent), fg: VAL, bg: VAL_BG, scroll: false },
-            StatusRun { text: " ".into(), fg: mem_fg, bg: DIM, scroll: false },
-            StatusRun { text: format!(" {}", self.mem_icon), fg: mem_fg, bg: CPU_BG, scroll: false },
-            StatusRun { text: " ".into(), fg: VAL, bg: CPU_BG, scroll: false },
-            StatusRun { text: format!(" {} ", self.mem_text), fg: VAL, bg: VAL_BG, scroll: false },
-            StatusRun { text: " ".into(), fg: DIM, bg: DIM, scroll: false },
-            StatusRun { text: format!(" {}", self.wifi_icon), fg: DIM, bg: WIFI_BG, scroll: false },
-            StatusRun { text: " ".into(), fg: VAL, bg: WIFI_BG, scroll: false },
-            StatusRun { text: format!(" {} ", self.wifi_text), fg: VAL, bg: VAL_BG, scroll: false },
-            StatusRun { text: " ".into(), fg: NORM, bg: DIM, scroll: false },
+            StatusRun {
+                text: "  ".into(),
+                fg: SAV,
+                bg: DIM,
+                scroll: false,
+            },
+            StatusRun {
+                text: self.battery_icon.into(),
+                fg: BAT,
+                bg: DIM,
+                scroll: false,
+            },
+            StatusRun {
+                text: format!(" {}%", self.battery_percent),
+                fg: BAT,
+                bg: DIM,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: DIM,
+                bg: DIM,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: DIM,
+                bg: CPU_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: VAL,
+                bg: CPU_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: format!(" {:>4.1}% ", self.cpu_percent),
+                fg: VAL,
+                bg: VAL_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: mem_fg,
+                bg: DIM,
+                scroll: false,
+            },
+            StatusRun {
+                text: format!(" {}", self.mem_icon),
+                fg: mem_fg,
+                bg: CPU_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: VAL,
+                bg: CPU_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: format!(" {} ", self.mem_text),
+                fg: VAL,
+                bg: VAL_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: DIM,
+                bg: DIM,
+                scroll: false,
+            },
+            StatusRun {
+                text: format!(" {}", self.wifi_icon),
+                fg: DIM,
+                bg: WIFI_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: VAL,
+                bg: WIFI_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: format!(" {} ", self.wifi_text),
+                fg: VAL,
+                bg: VAL_BG,
+                scroll: false,
+            },
+            StatusRun {
+                text: " ".into(),
+                fg: NORM,
+                bg: DIM,
+                scroll: false,
+            },
         ]
     }
 }
@@ -161,7 +306,11 @@ pub fn parse_status(text: &str) -> Vec<StatusToken> {
             }
             if !current_text.is_empty() {
                 let text = std::mem::take(&mut current_text);
-                tokens.push(if scrolling { StatusToken::ScrollText(text) } else { StatusToken::Text(text) });
+                tokens.push(if scrolling {
+                    StatusToken::ScrollText(text)
+                } else {
+                    StatusToken::Text(text)
+                });
             }
             let mut code = String::new();
             for c in chars.by_ref() {
@@ -215,7 +364,11 @@ pub fn parse_status(text: &str) -> Vec<StatusToken> {
     }
 
     if !current_text.is_empty() {
-        tokens.push(if scrolling { StatusToken::ScrollText(current_text) } else { StatusToken::Text(current_text) });
+        tokens.push(if scrolling {
+            StatusToken::ScrollText(current_text)
+        } else {
+            StatusToken::Text(current_text)
+        });
     }
 
     tokens
@@ -238,7 +391,10 @@ pub fn start_wifi_monitor() -> (Arc<AtomicBool>, bool) {
     let Ok(names) = dbus.list_names() else {
         return (dirty, false);
     };
-    if !names.iter().any(|name| name.as_str() == "org.freedesktop.NetworkManager") {
+    if !names
+        .iter()
+        .any(|name| name.as_str() == "org.freedesktop.NetworkManager")
+    {
         return (dirty, false);
     }
     let rules = [
@@ -464,9 +620,17 @@ impl StatusSampler {
         let mut available = 0u64;
         for line in content.lines() {
             if line.starts_with("MemTotal:") {
-                total = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                total = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             } else if line.starts_with("MemAvailable:") {
-                available = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                available = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             }
         }
         let used = total.saturating_sub(available);
@@ -559,7 +723,14 @@ impl StatusSampler {
 
         // 3. Try nmcli active connections
         if let Ok(output) = Command::new("nmcli")
-            .args(["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+            .args([
+                "-t",
+                "-f",
+                "NAME,TYPE,DEVICE",
+                "connection",
+                "show",
+                "--active",
+            ])
             .output()
             && output.status.success()
         {
@@ -720,8 +891,7 @@ impl StatusSampler {
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                (entry.path().join("wireless").exists() || name.starts_with("wl"))
-                    .then_some(name)
+                (entry.path().join("wireless").exists() || name.starts_with("wl")).then_some(name)
             })
             .collect()
     }
@@ -747,7 +917,10 @@ mod tests {
     fn test_parse_mpris_scroll_markers() {
         let tokens = parse_status("before^m^scrolling title^M^after");
         assert_eq!(tokens[0], StatusToken::Text("before".to_string()));
-        assert_eq!(tokens[1], StatusToken::ScrollText("scrolling title".to_string()));
+        assert_eq!(
+            tokens[1],
+            StatusToken::ScrollText("scrolling title".to_string())
+        );
         assert_eq!(tokens[2], StatusToken::Text("after".to_string()));
     }
 
@@ -765,7 +938,10 @@ mod tests {
         assert_eq!(status.playing.as_deref(), Some("[EXAMPLE BAND]  A Song"));
         assert_eq!(status.custom, None);
         let runs = status.runs();
-        assert!(runs.iter().any(|run| run.text == " 󰎆" && run.bg == 0xb8e9b4));
+        assert!(
+            runs.iter()
+                .any(|run| run.text == " 󰎆" && run.bg == 0xb8e9b4)
+        );
     }
 
     #[test]
@@ -792,14 +968,23 @@ mod tests {
             service: "org.mpris.MediaPlayer2.test".into(),
             ..crate::mpris::Snapshot::default()
         };
-        let paused = crate::mpris::Snapshot { playing: false, ..playing.clone() };
+        let paused = crate::mpris::Snapshot {
+            playing: false,
+            ..playing.clone()
+        };
         let mut sampler = StatusSampler::new();
         assert!(sampler.sample_with_mpris(Some(&playing)).playing.is_some());
         let status = sampler.sample_with_mpris(Some(&paused));
         assert!(status.playing.is_none());
         let runs = status.runs();
-        assert!(runs.iter().any(|run| run.text == " " && run.bg == 0xa6e3a1));
-        assert!(runs.iter().any(|run| run.fg == 0x96cdfb && run.text.contains('%')));
+        assert!(
+            runs.iter()
+                .any(|run| run.text == " " && run.bg == 0xa6e3a1)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.fg == 0x96cdfb && run.text.contains('%'))
+        );
     }
 
     #[test]
@@ -832,8 +1017,8 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "  ", "󰁹", " 85%", " ", " ", " ", " 12.3% ",
-                " ", " 󰾆", " ", " 3.2Gi ", " ", " 󰤨", " ", " MyWiFi ", " ",
+                "  ", "󰁹", " 85%", " ", " ", " ", " 12.3% ", " ", " 󰾆", " ", " 3.2Gi ", " ", " 󰤨",
+                " ", " MyWiFi ", " ",
             ]
         );
         assert_eq!(runs[4].bg, 0xa6e3a1);

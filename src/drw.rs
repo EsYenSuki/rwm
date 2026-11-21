@@ -15,7 +15,7 @@ use x11::xlib::{self, Display, Drawable, GC, Pixmap, Visual, XImage, XRectangle,
 use x11::xrender::{self, Picture, XLinearGradient, XPointFixed, XRenderColor};
 
 use crate::bar::{
-    BORDERPX, CLOCKPAD, CLRBORDER, HORIZPADBAR, KBLAYOUTPAD, LAYOUT_SYMBOL, LAUNCHERS,
+    BORDERPX, CLOCKPAD, CLRBORDER, HORIZPADBAR, KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL,
     MPRIS_CONTROL_W, MPRIS_SCROLL_PAD, MPRIS_WIDTH, Metrics, Scheme, TAG_LABEL, TAGS, ULINEPAD,
     ULINESTROKE, VERTPADBAR, col, mpris_slider_span, scheme_layout, scheme_norm, scheme_tag,
     scheme_title,
@@ -72,6 +72,14 @@ pub struct Drw {
 }
 
 impl Drw {
+    pub fn dpy(&self) -> *mut Display {
+        self.dpy
+    }
+
+    pub fn screen(&self) -> c_int {
+        self.screen
+    }
+
     pub fn new(dpy: *mut Display, screen: c_int, root: Drawable) -> Result<Drw> {
         unsafe {
             let visual = xlib::XDefaultVisual(dpy, screen);
@@ -245,19 +253,22 @@ impl Drw {
                         }
                     }
                 }
-                Op::Text { font, x, baseline, ref text } => {
-                    unsafe {
-                        XftDrawStringUtf8(
-                            self.xft_draw,
-                            &fg,
-                            m.xft(font),
-                            x,
-                            baseline,
-                            text.as_ptr(),
-                            text.len() as c_int,
-                        );
-                    }
-                }
+                Op::Text {
+                    font,
+                    x,
+                    baseline,
+                    ref text,
+                } => unsafe {
+                    XftDrawStringUtf8(
+                        self.xft_draw,
+                        &fg,
+                        m.xft(font),
+                        x,
+                        baseline,
+                        text.as_ptr(),
+                        text.len() as c_int,
+                    );
+                },
             }
         }
     }
@@ -380,7 +391,10 @@ impl Drw {
         let stops = [fixed(0.0), fixed(0.25), fixed(1.0)];
         let linear = XLinearGradient {
             p1: XPointFixed { x: 0, y: 0 },
-            p2: XPointFixed { x: 0, y: fixed(h as f64) },
+            p2: XPointFixed {
+                x: 0,
+                y: fixed(h as f64),
+            },
         };
         unsafe {
             let overlay = xrender::XRenderCreateLinearGradient(
@@ -420,6 +434,199 @@ impl Drw {
         }
     }
 
+    /// dwm's `drw_map_alpha` with `fade == 0`. `XCopyArea` requires the source
+    /// and destination to have the same depth, so the 32-bit ARGB center window
+    /// is painted with `XRenderComposite` from the same offscreen picture
+    /// `map()` uses. This is the minimal bridge until the full GL/fade path
+    /// replaces it; it keeps the ordinary clock bar visible on an ARGB window.
+    pub fn map_argb(&self, win: Drawable, visual: *mut Visual, w: u32, h: u32) {
+        self.map_picture(self.picture, win, visual, 0, 0, w, h, 0);
+    }
+
+    /// Solid rectangle in the offscreen drawable, used to lay out the Finder
+    /// background before its faded picture is composited into the frame.
+    pub fn fill_rect(&self, x: i32, y: i32, w: u32, h: u32, rgb: [f32; 4]) {
+        let pixel = ((rgb[0].clamp(0.0, 1.0) * 255.0).round() as u32) << 16
+            | ((rgb[1].clamp(0.0, 1.0) * 255.0).round() as u32) << 8
+            | ((rgb[2].clamp(0.0, 1.0) * 255.0).round() as u32)
+            | 0xff00_0000;
+        unsafe {
+            xlib::XSetForeground(self.dpy, self.gc, pixel as u64);
+            xlib::XFillRectangle(self.dpy, self.drawable, self.gc, x, y, w, h);
+        }
+    }
+
+    /// Composite an ARGB32 source picture (the GL readback surface) onto an
+    /// ARGB window. `fade == 3` applies dwm's accelerating 12-stop vertical
+    /// opacity ramp from `drw_map_alpha`; `fade == 0` is a plain `PictOpSrc`
+    /// copy. This is the bridge between the OpenGL finder and the ARGB clock
+    /// bar window.
+    pub fn map_picture(
+        &self,
+        src: xrender::Picture,
+        win: Drawable,
+        visual: *mut Visual,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        fade: u8,
+    ) {
+        unsafe {
+            let format = xrender::XRenderFindVisualFormat(self.dpy, visual);
+            if format.is_null() || src == 0 || w == 0 || h == 0 {
+                return;
+            }
+            let dest = xrender::XRenderCreatePicture(self.dpy, win, format, 0, ptr::null());
+            if dest == 0 {
+                return;
+            }
+            let clear = xrender::XRenderColor {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 0,
+            };
+            xrender::XRenderFillRectangle(self.dpy, xrender::PictOpSrc, dest, &clear, x, y, w, h);
+            let mask = if fade == 0 {
+                0
+            } else {
+                Self::fade_mask(self.dpy, fade, h)
+            };
+            if mask != 0 {
+                xrender::XRenderComposite(
+                    self.dpy,
+                    xrender::PictOpOver,
+                    src,
+                    mask,
+                    dest,
+                    x,
+                    y,
+                    0,
+                    0,
+                    x,
+                    y,
+                    w,
+                    h,
+                );
+                xrender::XRenderFreePicture(self.dpy, mask);
+            } else {
+                xrender::XRenderComposite(
+                    self.dpy,
+                    xrender::PictOpSrc,
+                    src,
+                    0,
+                    dest,
+                    x,
+                    y,
+                    0,
+                    0,
+                    x,
+                    y,
+                    w,
+                    h,
+                );
+            }
+            xrender::XRenderFreePicture(self.dpy, dest);
+            xlib::XFlush(self.dpy);
+        }
+    }
+
+    /// The offscreen picture that `map()` copies into a bar window. The finder
+    /// composes it into its frame pixmap to obtain the same background colour
+    /// and vertical opacity ramp as dwm's `drw_map_alpha`.
+    pub fn picture(&self) -> xrender::Picture {
+        self.picture
+    }
+
+    /// `XRenderComposite(PictOpOver, src, None, dst)` for an ARGB32 source and
+    /// an ARGB32 destination. Used to layer the transparent GL finder overlay
+    /// over the already-faded background frame without clearing it.
+    pub fn blend_picture(
+        &self,
+        src: xrender::Picture,
+        dst: Drawable,
+        visual: *mut Visual,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    ) {
+        unsafe {
+            let format = xrender::XRenderFindVisualFormat(self.dpy, visual);
+            if format.is_null() || src == 0 || w == 0 || h == 0 {
+                return;
+            }
+            let dest = xrender::XRenderCreatePicture(self.dpy, dst, format, 0, ptr::null());
+            if dest == 0 {
+                return;
+            }
+            xrender::XRenderComposite(
+                self.dpy,
+                xrender::PictOpOver,
+                src,
+                0,
+                dest,
+                0,
+                0,
+                0,
+                0,
+                x,
+                y,
+                w,
+                h,
+            );
+            xrender::XRenderFreePicture(self.dpy, dest);
+        }
+    }
+
+    fn fade_mask(dpy: *mut Display, fade: u8, h: u32) -> xrender::Picture {
+        const ALPHAS: [u16; 12] = [
+            0xffff, 0xffff, 0xfd70, 0xf851, 0xed70, 0xdeb8, 0xca3d, 0xb0a3, 0x91ff, 0x6df4, 0x451e,
+            0x0000,
+        ];
+        unsafe {
+            let mut stops = [0i32; 12];
+            let mut colors = [xrender::XRenderColor {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 0,
+            }; 12];
+            let count = if fade == 3 { 12 } else { 2 };
+            if fade == 3 {
+                // dwm's fade=3 override: the first two stops are both at zero,
+                // then every tenth of the popup height. XDoubleToFixed truncates.
+                const STOPS: [i32; 12] = [
+                    0, 0, 6553, 13107, 19660, 26214, 32768, 39321, 45875, 52428, 58982, 65536,
+                ];
+                stops.copy_from_slice(&STOPS);
+                for (i, color) in colors.iter_mut().enumerate() {
+                    color.alpha = ALPHAS[i];
+                }
+            } else {
+                stops[0] = 0;
+                stops[1] = 65536;
+                colors[0].alpha = 0;
+                colors[1].alpha = 0xffff;
+            }
+            let linear = xrender::XLinearGradient {
+                p1: xrender::XPointFixed { x: 0, y: 0 },
+                p2: xrender::XPointFixed {
+                    x: 0,
+                    y: (h as i64 * 65536) as i32,
+                },
+            };
+            xrender::XRenderCreateLinearGradient(
+                dpy,
+                &linear,
+                stops.as_ptr(),
+                colors.as_ptr(),
+                count as i32,
+            )
+        }
+    }
+
     /// Tags row of dwm's `drawbar()`.
     pub fn tags(&mut self, m: &Metrics, w: i32, occ: u32, selected: u32) {
         let bh = self.h as i32;
@@ -429,10 +636,20 @@ impl Drw {
         let mut x = BORDERPX;
         for i in 0..TAGS {
             let tw = m.textw(TAG_LABEL);
-            let scheme = if occ & 1 << i != 0 { scheme_tag(i) } else { scheme_norm() };
+            let scheme = if occ & 1 << i != 0 {
+                scheme_tag(i)
+            } else {
+                scheme_norm()
+            };
             self.text(m, x, BORDERPX, tw, bh_n, lrpad / 2, TAG_LABEL, scheme);
             if selected & 1 << i != 0 {
-                self.rect(x + ULINEPAD, bh_n - ULINESTROKE, tw - ULINEPAD * 2, ULINESTROKE, scheme.fg);
+                self.rect(
+                    x + ULINEPAD,
+                    bh_n - ULINESTROKE,
+                    tw - ULINEPAD * 2,
+                    ULINESTROKE,
+                    scheme.fg,
+                );
             }
             x += tw;
         }
@@ -454,7 +671,11 @@ impl Drw {
         if let Some(name) = name {
             let tw = w - x;
             if tw > 0 {
-                let scheme = if focused { scheme_title() } else { scheme_norm() };
+                let scheme = if focused {
+                    scheme_title()
+                } else {
+                    scheme_norm()
+                };
                 self.text(m, x, 0, tw, bh, lrpad / 2, name, scheme);
             }
         }
@@ -464,10 +685,23 @@ impl Drw {
     pub fn kb(&mut self, m: &Metrics, w: i32, text: &str, focused: bool) {
         let bh = self.h as i32;
         let bh_n = bh - BORDERPX * 2;
-        let scheme = if focused { scheme_title() } else { scheme_norm() };
+        let scheme = if focused {
+            scheme_title()
+        } else {
+            scheme_norm()
+        };
         self.rect(0, 0, w, bh, col(CLRBORDER));
         self.rect(0, BORDERPX, w, bh_n, scheme.bg);
-        self.text(m, 0, BORDERPX + VERTPADBAR / 2, w, bh - VERTPADBAR, KBLAYOUTPAD, text, scheme);
+        self.text(
+            m,
+            0,
+            BORDERPX + VERTPADBAR / 2,
+            w,
+            bh - VERTPADBAR,
+            KBLAYOUTPAD,
+            text,
+            scheme,
+        );
     }
 
     /// Status2d bar for a custom root-window string. The built-in cells use
@@ -494,7 +728,15 @@ impl Drw {
         self.rect(0, 0, w, bh, col(CLRBORDER));
         self.rect(0, BORDERPX, w, sbh, norm.bg);
         let y = BORDERPX + VERTPADBAR / 2;
-        self.paint_runs(m, &status.runs(), y, sbh - VERTPADBAR, scroll, progress, false);
+        self.paint_runs(
+            m,
+            &status.runs(),
+            y,
+            sbh - VERTPADBAR,
+            scroll,
+            progress,
+            false,
+        );
     }
 
     /// Shared run painter. `expanded` leaves the bar's default background
@@ -540,10 +782,23 @@ impl Drw {
         let bh_n = bh - BORDERPX * 2;
         let tcw = m.text_width(clock) + 2 * CLOCKPAD;
         let x = if w > tcw { (w - tcw) / 2 } else { 0 };
-        let scheme = if focused { scheme_title() } else { scheme_norm() };
+        let scheme = if focused {
+            scheme_title()
+        } else {
+            scheme_norm()
+        };
         self.rect(0, 0, w, bh, col(CLRBORDER));
         self.rect(0, BORDERPX, w, bh_n, scheme.bg);
-        self.text(m, x, BORDERPX + VERTPADBAR / 2, tcw, bh - VERTPADBAR, CLOCKPAD, clock, scheme);
+        self.text(
+            m,
+            x,
+            BORDERPX + VERTPADBAR / 2,
+            tcw,
+            bh - VERTPADBAR,
+            CLOCKPAD,
+            clock,
+            scheme,
+        );
     }
 
     /// The two-row MPRIS panel: cover art, gradient, controls, volume slider,
@@ -582,7 +837,8 @@ impl Drw {
         self.text_transparent(m, next_x, control_y, 28, control_h, 0, "", fg);
 
         let track_y = bh + bh / 2 - 2;
-        let fill_w = (slider_w as f32 * crate::mpris::volume_position(player.volume)).round() as i32;
+        let fill_w =
+            (slider_w as f32 * crate::mpris::volume_position(player.volume)).round() as i32;
         let knob_w = crate::bar::mpris_knob(w, bh, player.volume, marker_hovered).2;
         let mut empty = col(0xA6DA95);
         empty[3] = 0.55;
@@ -601,7 +857,15 @@ impl Drw {
         );
 
         let y = BORDERPX + VERTPADBAR / 2;
-        self.paint_runs(m, &status.runs(), y, bh - VERTPADBAR, scroll, player.progress, true);
+        self.paint_runs(
+            m,
+            &status.runs(),
+            y,
+            bh - VERTPADBAR,
+            scroll,
+            player.progress,
+            true,
+        );
     }
 
     /// Shared status token painter for the right bar and the MPRIS panel.
@@ -634,7 +898,13 @@ impl Drw {
                 StatusToken::Text(s) => {
                     if !s.is_empty() {
                         let tw = m.text_width(&s);
-                        let cell_bg = if has_bg { bg } else if expanded { [0.0; 4] } else { norm.bg };
+                        let cell_bg = if has_bg {
+                            bg
+                        } else if expanded {
+                            [0.0; 4]
+                        } else {
+                            norm.bg
+                        };
                         if cell_bg == [0.0; 4] {
                             self.text_transparent(m, x, y, tw, content_h, 0, &s, fg);
                         } else {
@@ -674,7 +944,8 @@ impl Drw {
     ) -> Option<Picture> {
         if let Some(cached) = &self.artwork
             && std::sync::Arc::ptr_eq(&cached.art, art)
-            && cached.w == w && cached.h == h
+            && cached.w == w
+            && cached.h == h
         {
             return Some(cached.picture);
         }

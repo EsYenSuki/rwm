@@ -6,8 +6,8 @@ use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 
 use x11::xft::{
-    FcCharSet, FcPattern, XftCharExists, XftFont, XftFontMatch, XftFontOpenName, XftFontOpenPattern,
-    XftTextExtentsUtf8,
+    FcCharSet, FcPattern, XftCharExists, XftFont, XftFontMatch, XftFontOpenName,
+    XftFontOpenPattern, XftTextExtentsUtf8,
 };
 use x11::xlib::Display;
 use x11::xrender::XGlyphInfo;
@@ -48,7 +48,12 @@ pub enum Op {
     /// `XFillRectangle` with the scheme background.
     Fill { x: i32, y: i32, w: u32, h: u32 },
     /// `XftDrawStringUtf8` with the scheme foreground, using fontset entry `font`.
-    Text { font: usize, x: i32, baseline: i32, text: String },
+    Text {
+        font: usize,
+        x: i32,
+        baseline: i32,
+        text: String,
+    },
 }
 
 /// dwm's `Fnt`: an Xft font plus the pattern used for fontconfig fallback.
@@ -75,7 +80,13 @@ impl Drop for Fnt {
 impl Fnt {
     unsafe fn from_xft(dpy: *mut Display, xft: *mut XftFont, pattern: *mut FcPattern) -> Fnt {
         let (ascent, descent) = unsafe { ((*xft).ascent, (*xft).descent) };
-        Fnt { dpy, xft, pattern, h: ascent + descent, ascent }
+        Fnt {
+            dpy,
+            xft,
+            pattern,
+            h: ascent + descent,
+            ascent,
+        }
     }
 }
 
@@ -138,7 +149,16 @@ impl Fontset {
 
     /// dwm's `drw_text` with a background fill and a text layer: appends the
     /// steps to draw into `ops` and returns the same value `drw_text` returns.
-    pub fn text(&mut self, x: i32, y: i32, w: u32, h: u32, lpad: u32, text: &str, ops: &mut Vec<Op>) -> i32 {
+    pub fn text(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        lpad: u32,
+        text: &str,
+        ops: &mut Vec<Op>,
+    ) -> i32 {
         self.walk(x, y, w, h, lpad, text, true, ops)
     }
 

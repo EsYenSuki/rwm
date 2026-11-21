@@ -4,8 +4,8 @@ use std::error::Error;
 use std::ffi::c_int;
 use std::ptr;
 
-use x11::xft::XftFont;
 use x11::xcursor::XcursorLibraryLoadCursor;
+use x11::xft::XftFont;
 use x11::xlib;
 
 use crate::text::{Fontset, Op};
@@ -130,9 +130,15 @@ impl Metrics {
     /// The steps of dwm's `drw_text` for the fontset.
     pub fn text_ops(&self, x: i32, y: i32, w: i32, h: i32, lpad: i32, text: &str) -> Vec<Op> {
         let mut ops = Vec::new();
-        self.fontset
-            .borrow_mut()
-            .text(x, y, w.max(0) as u32, h.max(0) as u32, lpad.max(0) as u32, text, &mut ops);
+        self.fontset.borrow_mut().text(
+            x,
+            y,
+            w.max(0) as u32,
+            h.max(0) as u32,
+            lpad.max(0) as u32,
+            text,
+            &mut ops,
+        );
         ops
     }
 
@@ -196,26 +202,43 @@ pub struct Scheme {
 }
 
 pub fn scheme_norm() -> Scheme {
-    Scheme { fg: col(0x585767), bg: col(0x1E1D2D) }
+    Scheme {
+        fg: col(0x585767),
+        bg: col(0x1E1D2D),
+    }
 }
 
 pub fn scheme_title() -> Scheme {
-    Scheme { fg: col(0xf8f8f2), bg: col(0x1E1D2D) }
+    Scheme {
+        fg: col(0xf8f8f2),
+        bg: col(0x1E1D2D),
+    }
 }
 
 pub fn scheme_layout() -> Scheme {
-    Scheme { fg: col(0xABE9B3), bg: col(0x1E1D2D) }
+    Scheme {
+        fg: col(0xABE9B3),
+        bg: col(0x1E1D2D),
+    }
 }
 
 pub fn scheme_tag(i: usize) -> Scheme {
     let fg = [0x94E2D5, 0xF28FAD, 0xF8BD96, 0xABE9B3, 0xd5aeea][i];
-    Scheme { fg: col(fg), bg: col(0x1E1D2D) }
+    Scheme {
+        fg: col(fg),
+        bg: col(0x1E1D2D),
+    }
 }
 
 pub const CLRBORDER: u32 = 0x1E1D2D;
 /// Background of the bar windows. Area uncovered by a resize shows this color
 /// instead of black until the next frame is drawn.
 pub const BAR_BACKGROUND_PIXEL: u32 = 0xFF00_0000 | CLRBORDER;
+/// Fully transparent background of the ARGB center clock window, matching
+/// dwm.c 17875's `cwa.background_pixel = 0`. Transparency is only meaningful
+/// when the window uses the 32-bit ARGB visual; otherwise the opaque
+/// `BAR_BACKGROUND_PIXEL` is used instead.
+pub const BAR_TRANSPARENT_PIXEL: u32 = 0;
 pub const TAG_LABEL: &str = "\u{f192}";
 pub const LAYOUT_SYMBOL: &str = "[]=";
 /// config.h `launchers`: the Arch logo, U+F303.

@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+gl = "0.14"
+freetype-sys = "0.20.1"
+image = "0.25.10"
 libc = "0.2.191"
 pipewire = "0.10.1"
-x11 = { version = "2.21.0", features = ["xlib", "xft", "xrender", "xcursor"] }
+resvg = "0.45.1"
+x11 = { version = "2.21.0", features = ["xlib", "xft", "xrender", "xcursor", "glx"] }
 x11rb = { version = "0.14.0", features = ["randr", "xkb"] }
 zbus = "5.19"

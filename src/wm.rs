@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::os::fd::AsRawFd;
@@ -8,27 +8,33 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use x11::keysym::XK_Escape;
+use x11::xlib;
+use x11::xrender;
 use x11rb::connection::Connection;
 use x11rb::properties::WmSizeHints;
-use x11rb::protocol::xproto::{
-    AtomEnum, ButtonIndex, ChangeWindowAttributesAux, ClientMessageEvent, ColormapAlloc,
-    ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux, ConnectionExt, CreateWindowAux,
-    EventMask, Gravity, GrabMode, GrabStatus, InputFocus, KeyPressEvent, ModMask, PropMode,
-    StackMode, Window, WindowClass, CONFIGURE_NOTIFY_EVENT,
-};
-use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::Event;
+use x11rb::protocol::randr;
+use x11rb::protocol::xkb::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::{
+    AtomEnum, ButtonIndex, ButtonPressEvent, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux,
+    ClientMessageEvent, ColormapAlloc, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
+    ConnectionExt, CreateWindowAux, EnterNotifyEvent, EventMask, GrabMode, GrabStatus, Gravity,
+    InputFocus, KeyPressEvent, LeaveNotifyEvent, ModMask, MotionNotifyEvent, PropMode, StackMode,
+    Window, WindowClass,
+};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::bar::{
-    BAR_BACKGROUND_PIXEL, BARGAP, CLOCKPAD, CursorLoader, HORIZPADBAR, KBLAYOUTPAD, LAUNCHERS,
-    LAYOUT_SYMBOL, Metrics, TAG_LABEL, TAGS,
+    BAR_BACKGROUND_PIXEL, BAR_TRANSPARENT_PIXEL, BARGAP, CLOCKPAD, CursorLoader, HORIZPADBAR,
+    KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL, Metrics, TAG_LABEL, TAGS,
 };
-use crate::drw::Drw;
 use crate::config::{self, BORDERPX, FLOATBAR, TOPBAR};
-use crate::keys::{self, Action, GapScope, Key, MOD_4, TAGMASK, TAG_COUNT};
+use crate::drw::Drw;
+use crate::finder::Finder;
+use crate::keys::{self, Action, GapScope, Key, MOD_4, TAG_COUNT, TAGMASK};
 use crate::tree::{self, Gaps, Node, Rect};
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -41,18 +47,17 @@ const CLEAN_MASK: u16 = 0xFD & !MOD2_MASK;
 const DRAG_FRAME: Duration = Duration::from_millis(16);
 /// The one cadence for every animated bar value. Clock peaks and scrolling
 /// titles advance on this same grid, so redraws never come from two timers
-/// with different phases.
+/// with different phases. This is dwm's `1000 / DRAW_FPS` = 50 fps.
 const BAR_TICK: Duration = Duration::from_millis(20);
+/// `poll()` has millisecond resolution, so accept a wakeup up to 1 ms early.
+/// Otherwise a 19 ms return skips to the next 20 ms slot and halves the rate.
+const TICK_GRACE: Duration = Duration::from_millis(1);
 /// Slow fallback for wakeups that only background threads can cause (PipeWire
 /// peaks and MPRIS snapshots). Used when no bar animation is active.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 /// Scrolling title moves one pixel every two bar ticks (40 ms). A separate
 /// 33 ms timer used to fire between ticks and produced uneven redraw gaps.
 const SCROLL_TICKS: u32 = 2;
-/// Peak sampling stays on `BAR_TICK`, but the clock window is only resized at
-/// this rate. Each resize damages the compositor's frame, so limiting it cuts
-/// the GPU work without making the animation noticeably choppy.
-const CLOCK_RESIZE_TICK: Duration = Duration::from_millis(40);
 /// Don't repaint the MPRIS panel until the interpolated progress bar would
 /// move by about a pixel. This replaces the old once-per-second Position poll.
 const PROGRESS_EPSILON: f32 = 0.005;
@@ -189,6 +194,16 @@ pub struct Monitor {
     pub barcenterwin: Window,
     pub barrightwin: Window,
     pub mpris_markerwin: Window,
+    pub finder_markerwin: Window,
+    /// Per-monitor bar colormap, freed at shutdown.
+    colormap: u32,
+    /// dwm's cached finder-marker stacking and last configured position.
+    finder_marker_stacked: Cell<bool>,
+    finder_marker_pos: Cell<Option<(i32, i32)>>,
+    /// Cached result of the last `stack_finder()` call. Restacking the popup and
+    /// marker while the pointer is over the marker generates crossing events,
+    /// which used to feed back into another restack and make both flicker.
+    finder_stacked: Cell<bool>,
 }
 
 /// dwm's `barwidths()` output.
@@ -198,6 +213,16 @@ struct BarWidths {
     cw: i32,
     kw: i32,
     rw: i32,
+}
+
+/// Who owns the shared center window. The WM_CLASS differs for each kind,
+/// and Finder takes precedence over an already-open notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CenterKind {
+    Dwm,
+    Notification,
+    History,
+    Finder,
 }
 
 struct Atoms {
@@ -229,6 +254,17 @@ pub struct Wm {
     clock_drawn: RefCell<HashMap<Window, (i32, i32, i32, String, bool)>>,
     visual_id: u32,
     depth: u8,
+    /// dwm's `finder_argb_visual`/`finder_argb_depth`/`finder_argb_colormap`:
+    /// the 32-bit alpha visual used only by each monitor's center clock window.
+    /// A zero `finder_argb_visual` means no ARGB visual is available (or ARGB
+    /// creation failed), so the center window uses the root visual like the
+    /// rest of the bar.
+    finder_argb_visual: u32,
+    finder_argb_depth: u8,
+    finder_argb_colormap: u32,
+    /// Same visual as `finder_argb_visual`, as the Xlib pointer needed to make
+    /// an XRender picture for the 32-bit window.
+    finder_argb_visual_ptr: *mut xlib::Visual,
     clock: String,
     /// Shared PipeWire peak for the animated clock width. It is sampled in the
     /// main loop instead of a separate fixed-cadence thread, so there is no
@@ -236,8 +272,6 @@ pub struct Wm {
     clock_peak: Option<crate::sound::Peak>,
     /// Last time the peak was sampled, on the shared `BAR_TICK` grid.
     clock_anim_last: Instant,
-    /// Last time the clock window was actually resized.
-    clock_resize_last: Instant,
     /// dwm's `clockbar_dynw` minus `clockbar_cw`: px the clock bar grows past
     /// its text width on the selected monitor.
     clock_extra: i32,
@@ -290,6 +324,28 @@ pub struct Wm {
     /// dwm's `enablegaps`, toggled by `ToggleGaps`.
     gaps_enabled: bool,
     resize_cursors: ResizeCursors,
+    /// Modal application launcher, including its GL/presentation resources.
+    finder: Finder,
+    /// Freedesktop notifications and AnDWM's hover history, drawn through the
+    /// same center ARGB window as Finder.
+    notification: crate::notification::NotificationManager,
+    /// Fullscreen state of the selected monitor, tracked so entering fullscreen
+    /// clears the popup exactly once like dwm's `updatefullscreenstatus`.
+    notification_fullscreen: bool,
+    /// Last center-window owner observed by `refresh`. Pointer events can close
+    /// history before `refresh` starts, so this remembers that a repaint of the
+    /// normal clock is needed even when the manager already reports inactive.
+    notification_center_active_last: bool,
+    /// Set when the center window was remapped under a live notification, so a
+    /// cached GL frame is not treated as already presented on the new window.
+    notification_force: Cell<bool>,
+    /// Last WM_CLASS written to each center window.
+    center_kind: RefCell<Vec<CenterKind>>,
+    /// Whether this WM currently owns the modal keyboard and root pointer grabs.
+    finder_grabbed: bool,
+    /// X input focus captured before Finder opened. Finder keeps focus on its
+    /// popup while active, then restores this window when it closes.
+    finder_saved_focus: Option<Window>,
     /// Keeps the Xlib connection that owns the themed cursor ids alive.
     _cursor_loader: CursorLoader,
     pub restart: bool,
@@ -323,6 +379,64 @@ fn bar_visual(conn: &RustConnection, root: Window) -> Result<(u32, u8)> {
     Ok((screen.root_visual, screen.root_depth))
 }
 
+/// dwm.c 17075-17097: find a 32-bit TrueColor visual whose XRender format has
+/// an alpha mask, and create a colormap for it. Returns `(visual_id, depth,
+/// colormap, visual)` or `None` when the server has no suitable ARGB visual, in
+/// which case the center clock window falls back to the root visual and depth.
+/// The `Visual` pointer stays valid for the lifetime of the Xlib display and is
+/// needed to build the XRender picture used to paint the window.
+fn bar_visual_argb(
+    dpy: *mut xlib::Display,
+    root: Window,
+    screen: i32,
+) -> Option<(u32, u8, u32, *mut xlib::Visual)> {
+    unsafe {
+        let mut template: xlib::XVisualInfo = std::mem::zeroed();
+        template.screen = screen;
+        template.depth = 32;
+        template.class = xlib::TrueColor;
+        let mut nvisuals = 0;
+        let visuals = xlib::XGetVisualInfo(
+            dpy,
+            xlib::VisualScreenMask | xlib::VisualDepthMask | xlib::VisualClassMask,
+            &mut template,
+            &mut nvisuals,
+        );
+        if visuals.is_null() {
+            return None;
+        }
+        let mut found = None;
+        for i in 0..nvisuals as usize {
+            let info = &*visuals.add(i);
+            let format = xrender::XRenderFindVisualFormat(dpy, info.visual);
+            if format.is_null()
+                || (*format).type_ != xrender::PictTypeDirect
+                || (*format).direct.alphaMask == 0
+            {
+                continue;
+            }
+            let colormap =
+                xlib::XCreateColormap(dpy, root as xlib::Window, info.visual, xlib::AllocNone);
+            if colormap == 0 {
+                continue;
+            }
+            found = Some((
+                info.visualid as u32,
+                info.depth as u8,
+                colormap as u32,
+                info.visual,
+            ));
+            break;
+        }
+        xlib::XFree(visuals.cast());
+        // x11rb creates the ARGB window on a *different* connection. Xlib
+        // buffers XCreateColormap, so flush it before that connection can use
+        // the id, otherwise the server answers CreateWindow with BadColor.
+        xlib::XFlush(dpy);
+        found
+    }
+}
+
 fn now_clock() -> String {
     unsafe {
         let t = libc::time(std::ptr::null_mut());
@@ -346,14 +460,14 @@ impl Wm {
                 EventMask::SUBSTRUCTURE_REDIRECT
                     | EventMask::SUBSTRUCTURE_NOTIFY
                     | EventMask::KEY_PRESS
-                    | EventMask::PROPERTY_CHANGE,
+                    | EventMask::PROPERTY_CHANGE
+                    | EventMask::POINTER_MOTION,
             ),
         )?
         .check()?;
 
-        let intern = |name: &[u8]| -> Result<u32> {
-            Ok(conn.intern_atom(false, name)?.reply()?.atom)
-        };
+        let intern =
+            |name: &[u8]| -> Result<u32> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
         let atoms = Atoms {
             wm_protocols: intern(b"WM_PROTOCOLS")?,
             wm_delete: intern(b"WM_DELETE_WINDOW")?,
@@ -395,6 +509,11 @@ impl Wm {
                 barcenterwin: 0,
                 barrightwin: 0,
                 mpris_markerwin: 0,
+                finder_markerwin: 0,
+                colormap: 0,
+                finder_marker_stacked: Cell::new(false),
+                finder_marker_pos: Cell::new(None),
+                finder_stacked: Cell::new(false),
             });
         }
 
@@ -408,6 +527,13 @@ impl Wm {
 
         let mpris_rx = crate::mpris::start_monitor();
         let mpris = crate::mpris::Snapshot::default();
+        let notification_handle = match crate::notification::start_service() {
+            Ok(handle) => handle,
+            Err(err) => {
+                eprintln!("rwm: notification service unavailable: {err}");
+                None
+            }
+        };
         let mut status = crate::status::StatusSampler::new();
         let bar_status = status.sample_with_mpris(Some(&mpris));
         let cursor_loader = CursorLoader::open()?;
@@ -420,6 +546,15 @@ impl Wm {
         // same way C dwm shares a single `Display *dpy` for all drawing.
         let dpy = cursor_loader.display();
         let screen = cursor_loader.screen();
+        // Discover the ARGB visual on the Xlib display, like dwm's setup block.
+        // It is used only by the center clock window; everything else keeps
+        // the root visual selected by `bar_visual` above.
+        let (finder_argb_visual, finder_argb_depth, finder_argb_colormap, finder_argb_visual_ptr) =
+            if config::FINDER_ARGB {
+                bar_visual_argb(dpy, root, screen).unwrap_or((0, 0, 0, std::ptr::null_mut()))
+            } else {
+                (0, 0, 0, std::ptr::null_mut())
+            };
         let metrics = Metrics::new(dpy, screen)?;
         let drw = Drw::new(dpy, screen, root as x11::xlib::Window)?;
         let clock_peak = if config::CLOCK_ANIMATE {
@@ -443,10 +578,13 @@ impl Wm {
             clock_drawn: RefCell::new(HashMap::new()),
             visual_id,
             depth,
+            finder_argb_visual,
+            finder_argb_depth,
+            finder_argb_colormap,
+            finder_argb_visual_ptr,
             clock: now_clock(),
             clock_peak,
             clock_anim_last: Instant::now() - BAR_TICK,
-            clock_resize_last: Instant::now(),
             clock_extra: 0,
             bar_status,
             kbstr: "us".to_string(),
@@ -473,9 +611,25 @@ impl Wm {
             xkb_event_base: 0,
             gaps_enabled: true,
             resize_cursors,
+            finder: Finder::new(),
+            notification: crate::notification::NotificationManager::new(notification_handle),
+            notification_fullscreen: false,
+            notification_center_active_last: false,
+            notification_force: Cell::new(false),
+            center_kind: RefCell::new(vec![CenterKind::Dwm; monitor_count]),
+            finder_grabbed: false,
+            finder_saved_focus: None,
             _cursor_loader: cursor_loader,
             restart: false,
         };
+        // Initialize the notification GL state before the first D-Bus event.
+        // Popup geometry comes from measured GL text, so a lazy init would size
+        // the first notification to the 1px placeholder and never grow it.
+        if !finder_argb_visual_ptr.is_null() {
+            if let Err(err) = wm.notification.prepare(dpy, screen, finder_argb_visual_ptr) {
+                eprintln!("rwm: notification GL unavailable: {err}");
+            }
+        }
         wm.conn.change_property32(
             PropMode::REPLACE,
             root,
@@ -488,8 +642,21 @@ impl Wm {
         wm.arrange()?;
         wm.grab_keys(max_keycode)?;
         wm.init_xkb();
+        wm.init_randr();
         wm.conn.flush()?;
         Ok(wm)
+    }
+
+    /// Listen for RandR screen and monitor changes so monitor geometry can be
+    /// reinitialized when resolution or layout changes (e.g. via xrandr).
+    fn init_randr(&self) {
+        let _ = randr::select_input(
+            &self.conn,
+            self.root,
+            randr::NotifyMask::SCREEN_CHANGE
+                | randr::NotifyMask::CRTC_CHANGE
+                | randr::NotifyMask::OUTPUT_CHANGE,
+        );
     }
 
     /// dwm's setup block: select Xkb StateNotify and read the layout once.
@@ -610,7 +777,8 @@ impl Wm {
     }
 
     fn grab_buttons(&self, win: Window) -> Result {
-        self.conn.ungrab_button(ButtonIndex::ANY, win, ModMask::ANY)?;
+        self.conn
+            .ungrab_button(ButtonIndex::ANY, win, ModMask::ANY)?;
         for button in [ButtonIndex::M1, ButtonIndex::M3] {
             for extra in [0, LOCK_MASK, MOD2_MASK, LOCK_MASK | MOD2_MASK] {
                 self.conn.grab_button(
@@ -720,7 +888,12 @@ impl Wm {
     /// The monitor's area below the bar, set by `update_bar_pos`.
     fn work(&self, mi: usize) -> Rect {
         let m = &self.monitors[mi];
-        Rect { x: m.wx, y: m.wy, w: m.ww as u32, h: m.wh as u32 }
+        Rect {
+            x: m.wx,
+            y: m.wy,
+            w: m.ww as u32,
+            h: m.wh as u32,
+        }
     }
 
     /// The visible tiled windows on `mi` in stack order.
@@ -741,7 +914,10 @@ impl Wm {
         {
             return Some(c.geom);
         }
-        self.layout_mon(mi).into_iter().find(|(w, _)| *w == win).map(|(_, r)| r)
+        self.layout_mon(mi)
+            .into_iter()
+            .find(|(w, _)| *w == win)
+            .map(|(_, r)| r)
     }
 
     /// dwm's `getgaps()`: the gaps in use for the current window count.
@@ -774,7 +950,11 @@ impl Wm {
         if m.showbar {
             if FLOATBAR {
                 m.wh -= m.gaps.oh + bh;
-                m.by = if TOPBAR { m.wy + m.gaps.oh } else { m.wy + m.wh };
+                m.by = if TOPBAR {
+                    m.wy + m.gaps.oh
+                } else {
+                    m.wy + m.wh
+                };
             } else {
                 m.wh -= bh;
                 m.by = if TOPBAR { m.wy } else { m.wy + m.wh };
@@ -787,61 +967,130 @@ impl Wm {
         }
     }
 
-    /// dwm's `updatebars()`: creates the five bar windows of each monitor.
+    /// Creates the bar windows and markers for every monitor.
     fn update_bars(&mut self) -> Result {
+        for mi in 0..self.monitors.len() {
+            self.create_monitor_ui(mi)?;
+        }
+        Ok(())
+    }
+
+    /// Creates the bar windows and markers for a single monitor.
+    fn create_monitor_ui(&mut self, mi: usize) -> Result {
         let bh = self.bar_h() as u16;
-        let root_colormap = self.conn.get_window_attributes(self.root)?.reply()?.colormap;
+        let root_colormap = self
+            .conn
+            .get_window_attributes(self.root)?
+            .reply()?
+            .colormap;
         let marker_pixel = self
             .conn
             .alloc_color(root_colormap, 0xB8B8, 0xE9E9, 0xB4B4)?
             .reply()?
             .pixel;
-        for mi in 0..self.monitors.len() {
-            let r = self.monitors[mi].rect;
-            let cmap = self.conn.generate_id()?;
-            self.conn
-                .create_colormap(ColormapAlloc::NONE, cmap, self.root, self.visual_id)?;
-            let mut wins = [0 as Window; 5];
-            for win in wins.iter_mut() {
-                *win = self.conn.generate_id()?;
-                self.conn
-                    .create_window(
-                        self.depth,
-                        *win,
-                        self.root,
-                        r.x as i16,
-                        r.y as i16,
-                        1,
-                        bh,
-                        0,
-                        WindowClass::INPUT_OUTPUT,
-                        self.visual_id,
-                        &CreateWindowAux::new()
-                            .background_pixel(BAR_BACKGROUND_PIXEL)
-                            .border_pixel(0)
-                            .bit_gravity(Gravity::NORTH_WEST)
-                            .colormap(cmap)
-                            .override_redirect(1)
-                            .event_mask(
-                                EventMask::EXPOSURE
-                                    | EventMask::ENTER_WINDOW
-                                    | EventMask::LEAVE_WINDOW
-                                    | EventMask::BUTTON_PRESS
-                                    | EventMask::BUTTON_RELEASE
-                                    | EventMask::POINTER_MOTION,
-                            ),
-                    )?
-                    .check()?;
-                self.conn.map_window(*win)?;
-                self.bar_mapped.borrow_mut().insert(*win);
-            }
-            let m = &mut self.monitors[mi];
-            [m.barwin, m.bartitlewin, m.barkbwin, m.barcenterwin, m.barrightwin] = wins;
+        let bar_events = EventMask::EXPOSURE
+            | EventMask::ENTER_WINDOW
+            | EventMask::LEAVE_WINDOW
+            | EventMask::BUTTON_PRESS
+            | EventMask::BUTTON_RELEASE
+            | EventMask::POINTER_MOTION;
 
-            m.mpris_markerwin = self.conn.generate_id()?;
-            self.conn.create_window(
+        let r = self.monitors[mi].rect;
+        let cmap = self.conn.generate_id()?;
+        self.conn
+            .create_colormap(ColormapAlloc::NONE, cmap, self.root, self.visual_id)?;
+
+        let mut wins = [0 as Window; 4];
+        for win in wins.iter_mut() {
+            *win = self.conn.generate_id()?;
+            self.conn
+                .create_window(
+                    self.depth,
+                    *win,
+                    self.root,
+                    r.x as i16,
+                    r.y as i16,
+                    1,
+                    bh,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    self.visual_id,
+                    &CreateWindowAux::new()
+                        .background_pixel(BAR_BACKGROUND_PIXEL)
+                        .border_pixel(0)
+                        .bit_gravity(Gravity::NORTH_WEST)
+                        .colormap(cmap)
+                        .override_redirect(1)
+                        .event_mask(bar_events),
+                )?
+                .check()?;
+            self.conn.map_window(*win)?;
+            self.bar_mapped.borrow_mut().insert(*win);
+        }
+
+        let center = self.conn.generate_id()?;
+        let argb_ok = self.finder_argb_visual != 0
+            && self
+                .conn
+                .create_window(
+                    self.finder_argb_depth,
+                    center,
+                    self.root,
+                    r.x as i16,
+                    r.y as i16,
+                    1,
+                    bh,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    self.finder_argb_visual,
+                    &CreateWindowAux::new()
+                        .background_pixel(BAR_TRANSPARENT_PIXEL)
+                        .border_pixel(0)
+                        .bit_gravity(Gravity::NORTH_WEST)
+                        .colormap(self.finder_argb_colormap)
+                        .override_redirect(1)
+                        .event_mask(bar_events),
+                )?
+                .check()
+                .is_ok();
+        if !argb_ok {
+            self.finder_argb_visual = 0;
+            self.finder_argb_depth = 0;
+            if self.finder_argb_colormap != 0 {
+                let _ = self.conn.free_colormap(self.finder_argb_colormap);
+            }
+            self.finder_argb_colormap = 0;
+            self.finder_argb_visual_ptr = std::ptr::null_mut();
+            self.conn
+                .create_window(
+                    self.depth,
+                    center,
+                    self.root,
+                    r.x as i16,
+                    r.y as i16,
+                    1,
+                    bh,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    self.visual_id,
+                    &CreateWindowAux::new()
+                        .background_pixel(BAR_BACKGROUND_PIXEL)
+                        .border_pixel(0)
+                        .bit_gravity(Gravity::NORTH_WEST)
+                        .colormap(cmap)
+                        .override_redirect(1)
+                        .event_mask(bar_events),
+                )?
+                .check()?;
+        }
+        self.conn.map_window(center)?;
+        self.bar_mapped.borrow_mut().insert(center);
+
+        let mpris_markerwin = self.conn.generate_id()?;
+        self.conn
+            .create_window(
                 0,
-                m.mpris_markerwin,
+                mpris_markerwin,
                 self.root,
                 0,
                 0,
@@ -863,26 +1112,119 @@ impl Wm {
                     ),
             )?
             .check()?;
-            self.conn
-                .change_property8(
-                    PropMode::REPLACE,
-                    m.mpris_markerwin,
-                    AtomEnum::WM_NAME,
-                    AtomEnum::STRING,
-                    b"dwm-mpris-volume-marker",
-                )?
-                .check()?;
-            self.conn
-                .change_property8(
-                    PropMode::REPLACE,
-                    m.mpris_markerwin,
-                    AtomEnum::WM_CLASS,
-                    AtomEnum::STRING,
-                    b"dwm-mpris-volume-marker\0dwm-mpris-volume-marker\0",
-                )?
-                .check()?;
-        }
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                mpris_markerwin,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                b"dwm-mpris-volume-marker",
+            )?
+            .check()?;
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                mpris_markerwin,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                b"dwm-mpris-volume-marker\0dwm-mpris-volume-marker\0",
+            )?
+            .check()?;
+
+        let finder_markerwin = self.conn.generate_id()?;
+        let white = unsafe { xlib::XWhitePixel(self.drw.dpy(), self.drw.screen()) };
+        self.conn
+            .create_window(
+                0,
+                finder_markerwin,
+                self.root,
+                0,
+                0,
+                crate::config::FINDER_MARKER_WIDTH as u16,
+                38,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .background_pixel(white as u32)
+                    .border_pixel(0)
+                    .override_redirect(1),
+            )?
+            .check()?;
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                finder_markerwin,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                b"dwm-finder-marker\0",
+            )?
+            .check()?;
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                finder_markerwin,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                b"dwm-finder-marker\0dwm-finder-marker\0",
+            )?
+            .check()?;
+
+        let m = &mut self.monitors[mi];
+        m.barwin = wins[0];
+        m.bartitlewin = wins[1];
+        m.barkbwin = wins[2];
+        m.barrightwin = wins[3];
+        m.barcenterwin = center;
+        m.colormap = cmap;
+        m.mpris_markerwin = mpris_markerwin;
+        m.finder_markerwin = finder_markerwin;
+        m.finder_marker_stacked.set(false);
+        m.finder_marker_pos.set(None);
+        m.finder_stacked.set(false);
+        // A new window starts with the toolkit default class even when the
+        // cached kind from the previous monitor layout was not Dwm.
+        self.center_kind.borrow_mut()[mi] = CenterKind::Dwm;
+        self.set_bar_class(mi)?;
         Ok(())
+    }
+
+    /// Destroys the bar windows and markers for a single monitor.
+    fn destroy_monitor_ui(&mut self, mi: usize) {
+        let windows = {
+            let m = &self.monitors[mi];
+            [
+                m.barwin,
+                m.bartitlewin,
+                m.barcenterwin,
+                m.barkbwin,
+                m.barrightwin,
+                m.mpris_markerwin,
+                m.finder_markerwin,
+            ]
+        };
+        for win in windows.into_iter().filter(|w| *w != 0) {
+            let _ = self.conn.unmap_window(win);
+            let _ = self.conn.destroy_window(win);
+            self.bar_mapped.borrow_mut().remove(&win);
+            self.bar_drawn.borrow_mut().remove(&win);
+            self.clock_drawn.borrow_mut().remove(&win);
+            self.force_windows.borrow_mut().remove(&win);
+            self.geom_cache.borrow_mut().remove(&win);
+        }
+        let cmap = self.monitors[mi].colormap;
+        if cmap != 0 {
+            let _ = self.conn.free_colormap(cmap);
+        }
+        let m = &mut self.monitors[mi];
+        m.barwin = 0;
+        m.bartitlewin = 0;
+        m.barcenterwin = 0;
+        m.barkbwin = 0;
+        m.barrightwin = 0;
+        m.mpris_markerwin = 0;
+        m.finder_markerwin = 0;
+        m.colormap = 0;
     }
 
     fn tagsbarwidth(&self) -> i32 {
@@ -900,6 +1242,33 @@ impl Wm {
         w.min(budget)
     }
 
+    /// rwm has no `Client::isfullscreen` flag, so use the same geometry test as
+    /// `finder_open()`: a selected client covering its monitor is fullscreen.
+    fn monitor_fullscreen(&self, mi: usize) -> bool {
+        let m = &self.monitors[mi];
+        m.sel.is_some_and(|w| {
+            self.clients
+                .iter()
+                .find(|c| c.win == w)
+                .is_some_and(|c| c.geom.w >= m.rect.w && c.geom.h >= m.rect.h)
+        })
+    }
+
+    /// Owner of a monitor's center window, with Finder overriding notification.
+    fn center_kind(&self, mi: usize) -> CenterKind {
+        if mi == self.selmon && self.finder.is_active() {
+            CenterKind::Finder
+        } else if mi == self.selmon && self.notification.is_center_active() {
+            match self.notification.center_class() {
+                crate::notification::CenterClass::History => CenterKind::History,
+                crate::notification::CenterClass::Notification => CenterKind::Notification,
+                crate::notification::CenterClass::Dwm => CenterKind::Dwm,
+            }
+        } else {
+            CenterKind::Dwm
+        }
+    }
+
     /// dwm's `barwidths()`. The systray is not ported, so its width is 0.
     fn barwidths(&self, mi: usize) -> BarWidths {
         let m = &self.monitors[mi];
@@ -913,23 +1282,46 @@ impl Wm {
         if self.mpris_hovered && mi == self.selmon && self.mpris.present {
             rw = rw.max(320 + HORIZPADBAR);
         }
-        let cw = self.metrics.text_width(&self.clock) + 2 * CLOCKPAD;
+        // dwm's `barwidths()` reserves `finder_popup_width()` for the selected
+        // center window while Finder is open, so the popup never overlaps the
+        // title or status sections.
+        let cw = if mi == self.selmon && self.finder.is_active() {
+            self.finder.popup_width() as i32
+        } else if mi == self.selmon && self.notification.is_center_active() {
+            self.notification.popup_size(self.bar_h()).0 as i32
+        } else {
+            self.metrics.text_width(&self.clock) + 2 * CLOCKPAD
+        };
         let kw = self.metrics.text_width(&self.kbstr) + 2 * KBLAYOUTPAD;
         let tw = self.tagsbarwidth();
         let used = tw + rw + cw + kw + 4 * BARGAP;
         let avail = if barw > used { barw - used } else { 0 };
-        let budget = if avail > BORDERPX { avail - BORDERPX } else { 0 };
+        let budget = if avail > BORDERPX {
+            avail - BORDERPX
+        } else {
+            0
+        };
         let mut tlw = BORDERPX + self.bartitlewidth(mi, budget);
         if tlw > avail {
             tlw = avail;
         }
-        BarWidths { tw, tlw, cw, kw, rw }
+        BarWidths {
+            tw,
+            tlw,
+            cw,
+            kw,
+            rw,
+        }
     }
 
     /// Width of the center clock window: dwm's `dcw`. Only the selected monitor
     /// grows, and the layout keeps the fixed `cw`.
     fn clock_window_width(&self, mi: usize, cw: i32) -> i32 {
-        if mi == self.selmon {
+        if mi == self.selmon && (self.finder.is_active() || self.notification.is_center_active()) {
+            // The popup geometry is already the full center width; the audio
+            // peak animation is suppressed while an overlay owns this window.
+            cw
+        } else if mi == self.selmon {
             cw + self.clock_extra
         } else {
             cw
@@ -977,6 +1369,19 @@ impl Wm {
         } else {
             self.conn.unmap_window(win)?;
             mapped.remove(&win);
+        }
+        // Mapping another bar section can raise it over the popup. Do not
+        // invalidate for the popup or its own marker: that would restack them
+        // again while the pointer is hovering the marker.
+        let center_owned = (self.finder.is_active()
+            && self
+                .monitors
+                .iter()
+                .any(|m| m.barcenterwin == win || m.finder_markerwin == win))
+            || (self.notification.is_center_active()
+                && self.monitors.iter().any(|m| m.barcenterwin == win));
+        if !center_owned {
+            self.invalidate_finder_stacking();
         }
         Ok(())
     }
@@ -1040,7 +1445,8 @@ impl Wm {
             border_width: BORDERPX as u16,
             override_redirect: false,
         };
-        self.conn.send_event(false, win, EventMask::STRUCTURE_NOTIFY, event)?;
+        self.conn
+            .send_event(false, win, EventMask::STRUCTURE_NOTIFY, event)?;
         Ok(())
     }
 
@@ -1075,10 +1481,17 @@ impl Wm {
         let m = &self.monitors[mi];
         let bh = self.bar_h();
         if !m.showbar {
-            for win in [m.barwin, m.bartitlewin, m.barcenterwin, m.barkbwin, m.barrightwin] {
+            for win in [
+                m.barwin,
+                m.bartitlewin,
+                m.barcenterwin,
+                m.barkbwin,
+                m.barrightwin,
+            ] {
                 self.place_cached(win, m.wx, m.by, 1, bh)?;
             }
             self.set_mapped(m.mpris_markerwin, false)?;
+            self.unmap_finder_marker(mi)?;
             self.center_shown.borrow_mut()[mi] = false;
             return Ok(());
         }
@@ -1097,7 +1510,31 @@ impl Wm {
         self.place_cached(m.bartitlewin, titlex, m.by, b.tlw, bh)?;
         self.set_mapped(m.bartitlewin, true)?;
 
-        let show_clock = self.clock_place(mi).is_some();
+        let finder_center = mi == self.selmon && self.finder.is_active();
+        let notification_center =
+            mi == self.selmon && !finder_center && self.notification.is_center_active();
+        let mut show_clock = if finder_center {
+            if let Some((cx, cy, cw, ch)) = self.finder_place(mi) {
+                self.place_cached(m.barcenterwin, cx, cy, cw as i32, ch as i32)?;
+            }
+            true
+        } else if notification_center {
+            if let Some((cx, _width)) = self.clock_place(mi) {
+                let (nw, nh) = self.notification.popup_size(bh);
+                self.place_cached(m.barcenterwin, cx, m.by, nw as i32, nh as i32)?;
+            }
+            self.clock_place(mi).is_some()
+        } else {
+            if let Some((cx, width)) = self.clock_place(mi) {
+                self.place_cached(m.barcenterwin, cx, m.by, width, bh)?;
+            }
+            self.clock_place(mi).is_some()
+        };
+        // dwm unmaps the center window over fullscreen content, even if a
+        // notification is pending. The queue is cleared when fullscreen starts.
+        if self.monitor_fullscreen(mi) {
+            show_clock = false;
+        }
         self.set_mapped(m.barcenterwin, show_clock)?;
         let was_shown = self.center_shown.borrow()[mi];
         if was_shown != show_clock {
@@ -1106,6 +1543,9 @@ impl Wm {
             // text and size match the last draw.
             if show_clock {
                 self.force_windows.borrow_mut().insert(m.barcenterwin);
+                if notification_center {
+                    self.notification_force.set(true);
+                }
             }
         }
 
@@ -1123,20 +1563,107 @@ impl Wm {
     /// client windows. On hover the panel grows to two rows and can overlap a
     /// floating client, so while expanded it must sit on top of every window;
     /// otherwise the extra row is hidden and its controls cannot be clicked.
-    /// With no sibling, `ABOVE`/`BELOW` are exactly the requests XRaiseWindow
-    /// and XLowerWindow send: top and bottom of the root's stacking order.
+    ///
+    /// Both windows select `EnterWindow`/`LeaveWindow`, so the order of the two
+    /// configure requests matters. Raising the panel with a bare `ABOVE` first
+    /// briefly puts it over the marker; X then reports a LeaveNotify on the
+    /// marker and an EnterNotify on the panel, the hover flags flip, the next
+    /// frame restacks again, and the marker flickers. Raise the marker first,
+    /// then slide the panel in directly beneath it with a sibling-relative
+    /// `BELOW`. When the order is already correct both requests are no-ops, so
+    /// no crossing events are synthesized.
     fn stack_mpris_bar(&self, mi: usize, above: bool) -> Result {
         let m = &self.monitors[mi];
-        let aux = ConfigureWindowAux::new()
-            .stack_mode(if above { StackMode::ABOVE } else { StackMode::BELOW });
         if above {
-            // Raise the panel first so the marker ends up on top of it.
-            self.conn.configure_window(m.barrightwin, &aux)?;
-            self.conn.configure_window(m.mpris_markerwin, &aux)?;
+            self.conn.configure_window(
+                m.mpris_markerwin,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.configure_window(
+                m.barrightwin,
+                &ConfigureWindowAux::new()
+                    .sibling(m.mpris_markerwin)
+                    .stack_mode(StackMode::BELOW),
+            )?;
         } else {
-            // Unwind in the opposite order when the panel collapses.
+            // Unwind when the panel collapses. With no sibling these are the
+            // XRaiseWindow/XLowerWindow requests: top and bottom of the stack.
+            let aux = ConfigureWindowAux::new().stack_mode(StackMode::BELOW);
             self.conn.configure_window(m.mpris_markerwin, &aux)?;
             self.conn.configure_window(m.barrightwin, &aux)?;
+        }
+        Ok(())
+    }
+
+    /// Keep the ARGB clock-bar window and its white marker above every other
+    /// root child while Finder is open. The popup is an override-redirect
+    /// extension of the clock bar, so it must follow the same top layer as the
+    /// floating clients that the layout raises with `StackMode::ABOVE`.
+    /// Something else was just raised above the Finder popup. On the next bar
+    /// refresh `stack_finder()` must put it back on top.
+    fn invalidate_finder_stacking(&self) {
+        if self.finder.is_active() || self.notification.is_center_active() {
+            for m in &self.monitors {
+                m.finder_stacked.set(false);
+            }
+        }
+    }
+
+    fn stack_finder(&self, mi: usize, above: bool) -> Result {
+        let m = &self.monitors[mi];
+        if m.finder_stacked.get() == above {
+            return Ok(());
+        }
+        let aux = ConfigureWindowAux::new().stack_mode(if above {
+            StackMode::ABOVE
+        } else {
+            StackMode::BELOW
+        });
+        if above {
+            self.conn.configure_window(m.barcenterwin, &aux)?;
+            if m.finder_markerwin != 0 {
+                self.conn.configure_window(m.finder_markerwin, &aux)?;
+            }
+        } else {
+            if m.finder_markerwin != 0 {
+                self.conn.configure_window(m.finder_markerwin, &aux)?;
+            }
+            self.conn.configure_window(m.barcenterwin, &aux)?;
+        }
+        m.finder_stacked.set(above);
+        Ok(())
+    }
+
+    /// dwm's `notification_update_wm_class`. Finder overrides a notification,
+    /// and the history gets its own instance name while sharing `notify`.
+    fn set_bar_class(&self, mi: usize) -> Result {
+        let kind = self.center_kind(mi);
+        if self.center_kind.borrow()[mi] == kind {
+            return Ok(());
+        }
+        let class: &[u8] = match kind {
+            CenterKind::Finder => b"finder\0finder\0",
+            CenterKind::Notification => b"notification\0notify\0",
+            CenterKind::History => b"notification-history\0notify\0",
+            CenterKind::Dwm => b"dwm\0dwm\0",
+        };
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                self.monitors[mi].barcenterwin,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                class,
+            )?
+            .check()?;
+        self.center_kind.borrow_mut()[mi] = kind;
+        Ok(())
+    }
+
+    /// Refreshes the center WM_CLASS after Finder or notification state changed.
+    fn sync_center_class(&self) -> Result {
+        for mi in 0..self.monitors.len() {
+            self.set_bar_class(mi)?;
         }
         Ok(())
     }
@@ -1158,6 +1685,158 @@ impl Wm {
             .unwrap_or(0)
     }
 
+    fn screen_rect(&self) -> Result<Rect> {
+        let geom = self.conn.get_geometry(self.root)?.reply()?;
+        Ok(Rect {
+            x: 0,
+            y: 0,
+            w: geom.width as u32,
+            h: geom.height as u32,
+        })
+    }
+
+    fn query_monitor_rects(&self) -> Result<Vec<Rect>> {
+        let screen = self.screen_rect()?;
+        let reply = randr::get_monitors(&self.conn, self.root, true)?.reply()?;
+        let mut rects: Vec<Rect> = reply
+            .monitors
+            .iter()
+            .map(|m| Rect {
+                x: m.x as i32,
+                y: m.y as i32,
+                w: m.width as u32,
+                h: m.height as u32,
+            })
+            .collect();
+        if rects.is_empty() {
+            rects.push(screen);
+        }
+        Ok(rects)
+    }
+
+    fn new_monitor(rect: Rect) -> Monitor {
+        Monitor {
+            wx: rect.x,
+            wy: rect.y,
+            ww: rect.w as i32,
+            wh: rect.h as i32,
+            by: 0,
+            rect,
+            tree: None,
+            gaps: Gaps {
+                oh: config::GAPPOH,
+                ov: config::GAPPOV,
+                ih: config::GAPPIH,
+                iv: config::GAPPIV,
+            },
+            tagset: [1, 1],
+            seltags: 0,
+            curtag: 1,
+            prevtag: 1,
+            showbar: true,
+            showbars: [true; TAGS + 1],
+            sel: None,
+            barwin: 0,
+            bartitlewin: 0,
+            barkbwin: 0,
+            barcenterwin: 0,
+            barrightwin: 0,
+            mpris_markerwin: 0,
+            finder_markerwin: 0,
+            colormap: 0,
+            finder_marker_stacked: Cell::new(false),
+            finder_marker_pos: Cell::new(None),
+            finder_stacked: Cell::new(false),
+        }
+    }
+
+    /// Reinitializes monitor geometry and bar placement after resolution or
+    /// monitor layout changes (e.g. xrandr), similar to dwm's updategeom().
+    fn updategeom(&mut self) -> Result {
+        let new_rects = self.query_monitor_rects()?;
+        let same = new_rects.len() == self.monitors.len()
+            && new_rects
+                .iter()
+                .zip(&self.monitors)
+                .all(|(r, m)| *r == m.rect);
+        if same {
+            return Ok(());
+        }
+
+        if self.finder.is_active() {
+            let _ = self.finder_close();
+        }
+
+        while self.monitors.len() > new_rects.len() {
+            let old = self.monitors.len() - 1;
+            let target = 0usize.min(self.monitors.len().saturating_sub(2));
+            let moved: Vec<Window> = self
+                .clients
+                .iter()
+                .filter(|c| c.mon == old)
+                .map(|c| c.win)
+                .collect();
+            for win in moved {
+                if let Some(ci) = self.clients.iter().position(|c| c.win == win) {
+                    self.monitors[old].tree =
+                        self.monitors[old].tree.take().and_then(|t| t.remove(win));
+                    if self.monitors[old].sel == Some(win) {
+                        self.monitors[old].sel = None;
+                    }
+                    let area = self.tile_area(target);
+                    let tags = self.tags_of(target);
+                    let t = &mut self.monitors[target];
+                    t.tree = Some(tree::append(t.tree.take(), win, area));
+                    self.clients[ci].mon = target;
+                    self.clients[ci].tags = tags;
+                    if t.sel.is_none() {
+                        t.sel = Some(win);
+                    }
+                }
+            }
+            self.destroy_monitor_ui(old);
+            self.monitors.pop();
+            self.mpris_bar_raised.borrow_mut().pop();
+            self.center_shown.borrow_mut().pop();
+            self.center_kind.borrow_mut().pop();
+        }
+
+        while self.monitors.len() < new_rects.len() {
+            let rect = new_rects[self.monitors.len()];
+            self.monitors.push(Self::new_monitor(rect));
+            self.mpris_bar_raised.borrow_mut().push(false);
+            self.center_shown.borrow_mut().push(false);
+            self.center_kind.borrow_mut().push(CenterKind::Dwm);
+            let mi = self.monitors.len() - 1;
+            self.create_monitor_ui(mi)?;
+        }
+
+        for (mi, rect) in new_rects.into_iter().enumerate() {
+            let m = &mut self.monitors[mi];
+            m.rect = rect;
+            m.wx = rect.x;
+            m.wy = rect.y;
+            m.ww = rect.w as i32;
+            m.wh = rect.h as i32;
+        }
+
+        // Clamp and follow the pointer to a valid monitor after reconfiguration.
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        self.selmon = self
+            .monitor_at(pointer.root_x as i32, pointer.root_y as i32)
+            .min(self.monitors.len().saturating_sub(1));
+        for mi in 0..self.monitors.len() {
+            self.ensure_sel(mi);
+        }
+
+        // Force a full bar redraw/reposition after geometry changes.
+        self.bar_drawn.borrow_mut().clear();
+        self.clock_drawn.borrow_mut().clear();
+        self.geom_cache.borrow_mut().clear();
+        self.bar_dirty = true;
+        self.arrange()
+    }
+
     /// Picks the first visible client on `mi` when the selection is hidden.
     fn ensure_sel(&mut self, mi: usize) {
         let keep = self.monitors[mi].sel.is_some_and(|w| {
@@ -1170,6 +1849,28 @@ impl Wm {
         }
     }
 
+    /// Selects the monitor currently under the pointer, as requested for
+    /// workspace-changing keybinds in multi-monitor setups.
+    fn sync_selmon_to_pointer(&mut self) -> Result {
+        let p = self.conn.query_pointer(self.root)?.reply()?;
+        self.activate_monitor_at(p.root_x as i32, p.root_y as i32)
+    }
+
+    /// Makes `mi` the selected monitor and focuses its selected client. This is
+    /// used when the pointer crosses to another monitor so a window focused on
+    /// the previous monitor no longer stays focused.
+    fn activate_monitor_at(&mut self, x: i32, y: i32) -> Result {
+        let mi = self.monitor_at(x, y);
+        if mi == self.selmon {
+            return Ok(());
+        }
+        self.selmon = mi;
+        self.ensure_sel(mi);
+        self.focus()?;
+        self.bar_dirty = true;
+        Ok(())
+    }
+
     /// dwm's `focus()`: gives the selected window of the selected monitor the
     /// focus border colour and every other window the normal one.
     fn focus(&self) -> Result {
@@ -1180,8 +1881,17 @@ impl Wm {
             } else {
                 config::COL_NORM_BORDER
             };
-            self.conn
-                .change_window_attributes(c.win, &ChangeWindowAttributesAux::new().border_pixel(pixel))?;
+            self.conn.change_window_attributes(
+                c.win,
+                &ChangeWindowAttributesAux::new().border_pixel(pixel),
+            )?;
+        }
+        // Finder owns keyboard focus while it is modal. Layout and mapping work
+        // may still update the selection and border colours, but must not hand
+        // X input focus to a client behind the popup.
+        if self.finder.is_active() {
+            self.conn.flush()?;
+            return Ok(());
         }
         let target = sel.unwrap_or(self.root);
         self.conn
@@ -1224,7 +1934,11 @@ impl Wm {
         // A tiled client being moved is visible, but its leaf is hidden from
         // layout_mon() so its siblings take the whole workspace. Keep its
         // zones at the last dragged position without reconfiguring the client.
-        for c in self.clients.iter().filter(|c| c.dragging && self.is_visible(c)) {
+        for c in self
+            .clients
+            .iter()
+            .filter(|c| c.dragging && self.is_visible(c))
+        {
             boxes.push((c.win, c.geom, false));
         }
         let shown: HashSet<Window> = self
@@ -1251,7 +1965,8 @@ impl Wm {
                     let zones = self.clients[idx].edge_wins;
                     // Floating clients are restacked above on every layout, so
                     // their zones need to follow even when the box is unchanged.
-                    let restack = *changed || self.clients[idx].floating || self.clients[idx].dragging;
+                    let restack =
+                        *changed || self.clients[idx].floating || self.clients[idx].dragging;
                     self.place_edge_zones(zones, win, *r, restack)?;
                 }
                 None => {
@@ -1263,19 +1978,14 @@ impl Wm {
                 }
             }
         }
+        self.invalidate_finder_stacking();
         self.conn.flush()?;
         Ok(())
     }
 
     /// Puts the hover zones of `win` over its outer box `r`, each directly above
     /// the window so that other windows still stack over it correctly.
-    fn place_edge_zones(
-        &self,
-        zones: [Window; 8],
-        win: Window,
-        r: Rect,
-        restack: bool,
-    ) -> Result {
+    fn place_edge_zones(&self, zones: [Window; 8], win: Window, r: Rect, restack: bool) -> Result {
         let rects = tree::edge_zones(r, config::RESIZE_EDGE_PX);
         let mut mapped = self.mapped_zones.borrow_mut();
         for (zone, z) in zones.iter().zip(rects) {
@@ -1323,7 +2033,10 @@ impl Wm {
             .collect();
         let area = self.tile_area(mi);
         for win in visible {
-            let has_leaf = self.monitors[mi].tree.as_ref().is_some_and(|t| t.has_leaf(win));
+            let has_leaf = self.monitors[mi]
+                .tree
+                .as_ref()
+                .is_some_and(|t| t.has_leaf(win));
             if !has_leaf {
                 let tree = &mut self.monitors[mi].tree;
                 *tree = Some(tree::append(tree.take(), win, area));
@@ -1368,7 +2081,12 @@ impl Wm {
         }
 
         let tags = self.tags_of(mi);
-        let geom = Rect { x: 0, y: 0, w: 0, h: 0 };
+        let geom = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
         let mut edge_wins = [NONE; 8];
         for (i, slot) in edge_wins.iter_mut().enumerate() {
             let zone = self.conn.generate_id()?;
@@ -1407,7 +2125,8 @@ impl Wm {
         self.monitors[mi].sel = Some(win);
         self.conn.change_window_attributes(
             win,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::ENTER_WINDOW | EventMask::PROPERTY_CHANGE),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::ENTER_WINDOW | EventMask::PROPERTY_CHANGE),
         )?;
         self.grab_buttons(win)?;
         self.arrange()
@@ -1439,7 +2158,14 @@ impl Wm {
         }
         let utf8 = self
             .conn
-            .get_property(false, win, self.atoms.net_wm_name, self.atoms.utf8_string, 0, 256)
+            .get_property(
+                false,
+                win,
+                self.atoms.net_wm_name,
+                self.atoms.utf8_string,
+                0,
+                256,
+            )
             .ok()
             .and_then(|c| c.reply().ok());
         let name = if let Some(r) = utf8.filter(|r| !r.value.is_empty()) {
@@ -1480,26 +2206,24 @@ impl Wm {
         ((raw / step) * step).clamp(0, config::CLOCK_ANIM_EXTRA)
     }
 
-    /// Samples the PipeWire peak on the shared `BAR_TICK` grid. Returns true
-    /// when the quantized width changed.
+    /// Samples the PipeWire peak on the shared `BAR_TICK` grid. The main loop
+    /// now always provides that cadence while clock animation is enabled; this
+    /// returns true when the quantized width changed.
     pub fn update_clock_anim(&mut self) -> bool {
         if self.clock_peak.is_none() {
             return false;
         }
         let now = Instant::now();
-        if now.duration_since(self.clock_anim_last) < BAR_TICK {
+        if now.duration_since(self.clock_anim_last) + TICK_GRACE < BAR_TICK {
             return false;
         }
         self.clock_anim_last = now;
 
         let extra = self.pending_clock_extra();
-        if extra == self.clock_extra
-            || now.duration_since(self.clock_resize_last) < CLOCK_RESIZE_TICK
-        {
+        if extra == self.clock_extra {
             return false;
         }
         self.clock_extra = extra;
-        self.clock_resize_last = now;
         true
     }
 
@@ -1582,17 +2306,58 @@ impl Wm {
         self.metrics.text_width(&self.mpris_scroll_text) + 16 > 240
     }
 
+    /// Picks the earliest deadline for the next bar tick. Keeping this pure
+    /// makes the 50 fps clock guarantee testable without a live `Wm`.
+    fn bar_next_tick(
+        now: Instant,
+        status_next: Instant,
+        clock_animate: bool,
+        finder_active: bool,
+        scroll_active: bool,
+        scroll_next: Instant,
+        finder_next: Option<Instant>,
+    ) -> Instant {
+        let mut next = status_next;
+        // dwm's run(): always clamp the poll timeout to 1000 / DRAW_FPS while
+        // the clock visualizer is enabled. Sampling only when the last sample
+        // already differs from the drawn width misses peaks that arrive just
+        // after the deadline was computed, which left idle animation at 1 fps.
+        if clock_animate && !finder_active {
+            next = next.min(now + BAR_TICK);
+        }
+        if scroll_active {
+            next = next.min(scroll_next);
+        }
+        if let Some(finder_next) = finder_next {
+            next = next.min(finder_next);
+        }
+        next.min(now + IDLE_POLL)
+    }
+
     /// Deadline for the next bar tick. The main loop blocks on the X connection
     /// until this instant or an event, making this the only wakeup source.
     pub fn next_tick(&self) -> Instant {
-        let mut next = self.status.next_sample();
-        if self.pending_clock_extra() != self.clock_extra {
-            next = next.min(self.clock_resize_last + CLOCK_RESIZE_TICK);
+        let now = Instant::now();
+        let finder_active = self.finder.is_active();
+        let finder_next = finder_active.then(|| {
+            // dwm's run(): 0 ms while a frame is pending, 10 ms for ease/scroll,
+            // 30 ms for the slower fades, 500 ms for the caret.
+            self.finder.next_tick(now)
+        });
+        let next = Self::bar_next_tick(
+            now,
+            self.status.next_sample(),
+            config::CLOCK_ANIMATE,
+            finder_active,
+            self.scroll_active(),
+            self.mpris_scroll_next,
+            finder_next,
+        );
+        if self.notification.is_active() {
+            next.min(self.notification.next_tick(now))
+        } else {
+            next
         }
-        if self.scroll_active() {
-            next = next.min(self.mpris_scroll_next);
-        }
-        next.min(Instant::now() + IDLE_POLL)
     }
 
     /// Recomputes and updates the positions and widths of all bar windows.
@@ -1600,6 +2365,331 @@ impl Wm {
         for mi in 0..self.monitors.len() {
             self.resize_bar_win(mi)?;
         }
+        Ok(())
+    }
+
+    /// dwm's `finder_popup_*` geometry: center the popup on the clock window
+    /// and let it grow downward into a tall ARGB window.
+    fn finder_place(&self, mi: usize) -> Option<(i32, i32, u32, u32)> {
+        let m = &self.monitors[mi];
+        let (x, width) = self.clock_place(mi)?;
+        let (w, h) = self.finder.popup_size(self.bar_h() as u32);
+        // `barwidths()` reserved exactly `w`, and `clock_window_width()` keeps
+        // it unanimated, so the center window's own geometry is the popup.
+        debug_assert_eq!(width, w as i32);
+        Some((x, m.by, w, h))
+    }
+
+    fn pointer_root(&self) -> Result<(i32, i32)> {
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        Ok((pointer.root_x as i32, pointer.root_y as i32))
+    }
+
+    fn finder_pointer_monitor(&self) -> Result<usize> {
+        let (x, y) = self.pointer_root()?;
+        Ok(self.monitor_at(x, y))
+    }
+
+    /// dwm's `finder_focus_pointer()`: after an outside click, focus the client
+    /// at the click position and move selection to its monitor. The button event
+    /// carries root coordinates, so this does not depend on `query_pointer()`
+    /// still reporting the clicked window immediately after the grab is released.
+    fn finder_focus_pointer(&mut self, x: i32, y: i32) -> Result {
+        let mi = self.monitor_at(x, y);
+        let found = self.clients.iter().find_map(|c| {
+            self.geometry(c.mon, c.win)
+                .is_some_and(|r| r.contains(x, y))
+                .then_some((c.win, c.mon))
+        });
+        if let Some((win, mon)) = found {
+            self.selmon = mon;
+            self.monitors[mon].sel = Some(win);
+            self.focus()?;
+        } else {
+            self.selmon = mi;
+            self.conn
+                .set_input_focus(InputFocus::PARENT, self.root, CURRENT_TIME)?;
+            self.conn.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finder_pointer_inside(&self, x: i32, y: i32) -> bool {
+        self.finder_place(self.selmon)
+            .is_some_and(|(px, py, w, h)| {
+                x >= px && x < px + w as i32 && y >= py && y < py + h as i32
+            })
+    }
+
+    fn unmap_finder_marker(&self, mi: usize) -> Result {
+        let m = &self.monitors[mi];
+        self.set_mapped(m.finder_markerwin, false)?;
+        m.finder_marker_stacked.set(false);
+        m.finder_marker_pos.set(None);
+        Ok(())
+    }
+
+    /// dwm's `finder_marker()`, using the popup geometry already computed for
+    /// `resizebarwin()` instead of an XTranslateCoordinates round trip.
+    fn finder_marker(&self) -> Result {
+        for mi in 0..self.monitors.len() {
+            let row = if self.finder.is_active() && mi == self.selmon {
+                self.finder.marker_row()
+            } else {
+                0
+            };
+            if row <= 0 || !self.monitors[mi].showbar {
+                self.unmap_finder_marker(mi)?;
+                continue;
+            }
+            let Some((x, y, w, _)) = self.finder_place(mi) else {
+                self.unmap_finder_marker(mi)?;
+                continue;
+            };
+            let m = &self.monitors[mi];
+            let mx = x + (w as i32 - crate::config::FINDER_MARKER_WIDTH) / 2;
+            let my = y + row * self.bar_h();
+            if m.finder_marker_pos.get() != Some((mx, my)) {
+                self.conn.configure_window(
+                    m.finder_markerwin,
+                    &ConfigureWindowAux::new()
+                        .x(mx)
+                        .y(my)
+                        .width(crate::config::FINDER_MARKER_WIDTH as u32)
+                        .height(38),
+                )?;
+                m.finder_marker_pos.set(Some((mx, my)));
+            }
+            self.set_mapped(m.finder_markerwin, true)?;
+            if !m.finder_marker_stacked.get() {
+                self.conn.configure_window(
+                    m.finder_markerwin,
+                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                )?;
+                m.finder_marker_stacked.set(true);
+            }
+        }
+        Ok(())
+    }
+
+    /// Remembers which window had X input focus before Finder took over. Any
+    /// real window is worth restoring, including one that survived a WM restart
+    /// and is not in `clients` yet; root, PointerRoot, None and Finder's own
+    /// popup/marker keep the existing root fallback.
+    fn remember_finder_focus(&mut self) -> Result {
+        if self.finder_saved_focus.is_some() {
+            return Ok(());
+        }
+        let focused = self.conn.get_input_focus()?.reply()?.focus;
+        let finder_window = self
+            .monitors
+            .iter()
+            .any(|m| m.barcenterwin == focused || m.finder_markerwin == focused);
+        let real_window = focused != u32::from(InputFocus::NONE)
+            && focused != u32::from(InputFocus::POINTER_ROOT)
+            && focused != self.root
+            && !finder_window;
+        self.finder_saved_focus = real_window.then_some(focused);
+        Ok(())
+    }
+
+    /// Gives X input focus back to the window that had it before Finder. If it
+    /// was destroyed while Finder was open, fall back to root like the old close
+    /// path did.
+    fn restore_finder_focus(&mut self) -> Result {
+        let saved = self.finder_saved_focus.take();
+        let alive = match saved {
+            Some(win) => match self.conn.get_window_attributes(win) {
+                Ok(cookie) => cookie.reply().is_ok(),
+                Err(_) => false,
+            },
+            None => false,
+        };
+        let win = if alive { saved.unwrap() } else { self.root };
+        self.conn
+            .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn finder_open(&mut self) -> Result {
+        // dwm's drawfinder_frame() simply returns without the 32-bit visual;
+        // keep the ordinary clock and skip the modal path in that case. An
+        // already-active Finder with no grabs is the asynchronous OCR result
+        // path: install the grabs without resetting the recognized query.
+        if (self.finder.is_active() && self.finder_grabbed)
+            || self.finder_argb_visual == 0
+            || self.finder_argb_visual_ptr.is_null()
+        {
+            return Ok(());
+        }
+        self.selmon = self.finder_pointer_monitor()?;
+        let mon = &self.monitors[self.selmon];
+        let fullscreen = mon.sel.is_some_and(|w| {
+            self.clients
+                .iter()
+                .find(|c| c.win == w)
+                .is_some_and(|c| c.geom.w >= mon.rect.w && c.geom.h >= mon.rect.h)
+        });
+        if fullscreen {
+            return Ok(());
+        }
+        self.remember_finder_focus()?;
+        self.finder.open();
+        self.set_bar_class(self.selmon)?;
+        self.stack_finder(self.selmon, true)?;
+        let win = self.monitors[self.selmon].barcenterwin;
+        let _ = self
+            .conn
+            .grab_keyboard(true, win, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)?
+            .reply();
+        let status = self
+            .conn
+            .grab_pointer(
+                true,
+                self.root,
+                EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                NONE,
+                NONE,
+                CURRENT_TIME,
+            )?
+            .reply()?
+            .status;
+        if status != GrabStatus::SUCCESS {
+            let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
+            return self.finder_close();
+        }
+        self.finder_grabbed = true;
+        self.conn
+            .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        self.conn.flush()?;
+        self.bar_dirty = true;
+        Ok(())
+    }
+
+    /// Tears down the modal state. Unlike `Finder::close()`, this is also safe
+    /// to call after `Finder` closed itself on Escape, Return or an outside
+    /// click, which is why there is no `is_active()` early return here.
+    fn finder_close(&mut self) -> Result {
+        self.finder.close();
+        // Resizing the center window back from Finder to a clock/noti-
+        // fication generates an EnterNotify at the old pointer position.
+        // dwm suppresses that synthetic crossing for one grace period.
+        let (rx, ry) = self.pointer_root().unwrap_or((0, 0));
+        self.notification.arm_hover_grace(rx, ry);
+        if self.finder_grabbed {
+            self.finder_grabbed = false;
+            let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
+            let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        }
+        self.restore_finder_focus()?;
+        for mi in 0..self.monitors.len() {
+            self.set_bar_class(mi)?;
+            self.stack_finder(mi, false)?;
+            let win = self.monitors[mi].barcenterwin;
+            self.geom_cache.borrow_mut().remove(&win);
+            self.clock_drawn.borrow_mut().remove(&win);
+            self.force_windows.borrow_mut().insert(win);
+            self.unmap_finder_marker(mi)?;
+        }
+        self.bar_dirty = true;
+        Ok(())
+    }
+
+    fn finder_toggle(&mut self) -> Result {
+        if self.finder.is_active() {
+            self.finder_close()
+        } else {
+            self.finder_open()
+        }
+    }
+
+    fn finder_draw(&mut self) -> Result {
+        if !self.finder.is_active() {
+            for mi in 0..self.monitors.len() {
+                self.unmap_finder_marker(mi)?;
+            }
+            return Ok(());
+        }
+        if self.finder_argb_visual == 0 || self.finder_argb_visual_ptr.is_null() {
+            return self.finder_close();
+        }
+        let mi = self.selmon;
+        let Some((x, y, _w, _h)) = self.finder_place(mi) else {
+            return Ok(());
+        };
+        let win = self.monitors[mi].barcenterwin;
+        let screen = self.drw.screen();
+        let visual = self.finder_argb_visual_ptr;
+        let bh = self.bar_h();
+        let clock = self.clock.clone();
+        let (fw, fh) = self.finder.popup_size(bh as u32);
+        // MPRIS scrolling can repaint the bars dozens of times a second without
+        // changing the popup. Skipping here keeps those refreshes from touching
+        // the cached GL frame or even copying its XRender pixmap.
+        if !self.finder.needs_draw(fw, fh, x, y, bh, &clock) {
+            return Ok(());
+        }
+        if self
+            .finder
+            .draw(&mut self.drw, screen, visual, win as u64, x, y, bh, &clock)
+            .is_err()
+        {
+            // A failed GL/presentation init must not kill the WM loop. Drop the
+            // modal state and let the next refresh draw the normal clock.
+            return self.finder_close();
+        }
+        self.geom_cache.borrow_mut().remove(&win);
+        self.conn.flush()?;
+        self.finder_marker()?;
+        Ok(())
+    }
+
+    /// Draws the notification popup or hover history into the center ARGB
+    /// window. The frame cache is shared with Finder's presentation path, so a
+    /// repaint of the clock or status bar does not swap pixels needlessly.
+    fn notification_draw(&mut self) -> Result {
+        let force = self.notification_force.take();
+        if !self.notification.is_center_active() || self.finder.is_active() {
+            return Ok(());
+        }
+        if force {
+            self.notification.invalidate_frame();
+        }
+        if self.finder_argb_visual == 0 || self.finder_argb_visual_ptr.is_null() {
+            return Ok(());
+        }
+        let mi = self.selmon;
+        if self.monitor_fullscreen(mi) {
+            return Ok(());
+        }
+        let Some((x, _width)) = self.clock_place(mi) else {
+            return Ok(());
+        };
+        let win = self.monitors[mi].barcenterwin;
+        let y = self.monitors[mi].by;
+        let bh = self.bar_h();
+        let (w, h) = self.notification.popup_size(bh);
+        if !self.notification.needs_draw(w, h, x, y, bh) {
+            return Ok(());
+        }
+        let screen = self.drw.screen();
+        let visual = self.finder_argb_visual_ptr;
+        if self
+            .notification
+            .draw(&mut self.drw, screen, visual, win as u64, x, y, bh)
+            .is_err()
+        {
+            // A failed GL init must not kill the WM loop. Archive the queue and
+            // let the next refresh restore the normal clock.
+            self.notification.clear_for_fullscreen(bh);
+            self.bar_dirty = true;
+            return Ok(());
+        }
+        self.geom_cache.borrow_mut().remove(&win);
+        self.conn.flush()?;
         Ok(())
     }
 
@@ -1626,7 +2716,17 @@ impl Wm {
         self.conn.flush()?;
         self.drw.resize(dw, dh);
         self.drw.clock(&self.metrics, dw as i32, &text, focused);
-        self.drw.map(win as x11::xlib::Window, dw, dh);
+        if self.finder_argb_visual != 0 && !self.finder_argb_visual_ptr.is_null() {
+            // XCopyArea would raise BadMatch against the 32-bit ARGB window.
+            self.drw.map_argb(
+                win as x11::xlib::Window,
+                self.finder_argb_visual_ptr,
+                dw,
+                dh,
+            );
+        } else {
+            self.drw.map(win as x11::xlib::Window, dw, dh);
+        }
         self.clock_drawn.borrow_mut().insert(win, key);
         Ok(())
     }
@@ -1653,14 +2753,22 @@ impl Wm {
             let title = m.sel.map(|w| self.client_name(w));
             let focused = mi == self.selmon;
             let b = self.barwidths(mi);
-            let (barwin, titlewin, kbwin, rightwin, marker_win) =
-                (m.barwin, m.bartitlewin, m.barkbwin, m.barrightwin, m.mpris_markerwin);
+            let (barwin, titlewin, kbwin, rightwin, marker_win) = (
+                m.barwin,
+                m.bartitlewin,
+                m.barkbwin,
+                m.barrightwin,
+                m.mpris_markerwin,
+            );
             let selected = self.tags_of(mi);
             let kbstr = self.kbstr.clone();
             let status = self.bar_status.clone();
             let player = self.mpris.clone();
-            let (scroll, progress, marker_hovered) =
-                (self.mpris_scroll_px, self.mpris.current_progress(), self.mpris_marker_hovered);
+            let (scroll, progress, marker_hovered) = (
+                self.mpris_scroll_px,
+                self.mpris.current_progress(),
+                self.mpris_marker_hovered,
+            );
 
             let tw = b.tw.max(1) as u32;
             let tag_key = format!("tags:{tw}:{occupied}:{selected}");
@@ -1675,7 +2783,8 @@ impl Wm {
             let title_key = format!("title:{tlw}:{title:?}:{focused}");
             if self.section_changed(titlewin, &title_key) {
                 self.drw.resize(tlw, bh as u32);
-                self.drw.title(&self.metrics, tlw as i32, title.as_deref(), focused);
+                self.drw
+                    .title(&self.metrics, tlw as i32, title.as_deref(), focused);
                 self.drw.map(titlewin as x11::xlib::Window, tlw, bh as u32);
                 self.bar_drawn.borrow_mut().insert(titlewin, title_key);
             }
@@ -1728,19 +2837,28 @@ impl Wm {
                 self.set_mapped(marker_win, false)?;
                 let rw = b.rw.max(1) as u32;
                 let progress_key = progress.map(|p| (p * 10_000.0) as u32);
-                let right_key = format!("status:{rw}:{bh}:{}:{scroll}:{progress_key:?}", status.key());
+                let right_key = format!(
+                    "status:{rw}:{bh}:{}:{scroll}:{progress_key:?}",
+                    status.key()
+                );
                 if self.section_changed(rightwin, &right_key) {
                     self.drw.resize(rw, bh as u32);
                     if let Some(custom) = &status.custom {
-                        self.drw.status(&self.metrics, rw as i32, custom, scroll, progress);
+                        self.drw
+                            .status(&self.metrics, rw as i32, custom, scroll, progress);
                     } else {
-                        self.drw.status_runs(&self.metrics, rw as i32, &status, scroll, progress);
+                        self.drw
+                            .status_runs(&self.metrics, rw as i32, &status, scroll, progress);
                     }
                     self.drw.map(rightwin as x11::xlib::Window, rw, bh as u32);
                     self.bar_drawn.borrow_mut().insert(rightwin, right_key);
                 }
             }
-            self.draw_clock(mi)?;
+            if !(mi == self.selmon
+                && (self.finder.is_active() || self.notification.is_center_active()))
+            {
+                self.draw_clock(mi)?;
+            }
         }
         self.conn.flush()?;
         self.force_windows.borrow_mut().clear();
@@ -1751,7 +2869,58 @@ impl Wm {
     /// redraws the bars only when their contents or layout changed. Window
     /// motion and client configure events do not get here.
     pub fn refresh(&mut self) -> Result {
-        let mut bars = std::mem::take(&mut self.bar_dirty);
+        let finder_dirty = self.finder.tick()?;
+        // OCR finishes on a worker thread while Finder is closed. When its
+        // result opens the popup, install the modal grabs here just like a
+        // Super+A press would.
+        if self.finder.is_active() && !self.finder_grabbed {
+            self.finder_open()?;
+        }
+        let finder_active = self.finder.is_active();
+        self.notification.set_finder_active(finder_active);
+        let mut bars = std::mem::take(&mut self.bar_dirty) || finder_dirty;
+        let notification_was_active = self.notification_center_active_last;
+        let notification_had_focus = self.notification.has_input_focus();
+        let fullscreen = self.monitor_fullscreen(self.selmon);
+        if fullscreen != self.notification_fullscreen {
+            if fullscreen {
+                self.notification.clear_for_fullscreen(self.bar_h());
+                bars = true;
+            }
+            self.notification_fullscreen = fullscreen;
+        }
+        if self
+            .notification
+            .poll(fullscreen, self.bar_h(), Instant::now())?
+        {
+            bars = true;
+        }
+        self.sync_center_class()?;
+        let notification_active = self.notification.is_center_active();
+        let notification_has_focus = self.notification.has_input_focus();
+        if !finder_active && notification_had_focus != notification_has_focus {
+            let win = if notification_has_focus {
+                self.monitors[self.selmon].barcenterwin
+            } else {
+                self.root
+            };
+            self.conn
+                .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        }
+        if notification_was_active && !notification_active && !finder_active {
+            // A pointer event may have closed history before refresh ran, so
+            // the cached clock frame is stale even though the manager now says
+            // it is inactive. Force a real repaint, not just a geometry update.
+            bars = true;
+            for mi in 0..self.monitors.len() {
+                self.stack_finder(mi, false)?;
+                let win = self.monitors[mi].barcenterwin;
+                self.geom_cache.borrow_mut().remove(&win);
+                self.clock_drawn.borrow_mut().remove(&win);
+                self.force_windows.borrow_mut().insert(win);
+            }
+            self.conn.flush()?;
+        }
         if self.update_mpris() {
             bars = true;
         }
@@ -1760,7 +2929,11 @@ impl Wm {
             // resizes the other bar sections too.
             bars = true;
         }
-        let clock_anim = self.update_clock_anim();
+        // dwm freezes the animated clock width while Finder or a notification
+        // owns the center window, so its resize deadline never competes with
+        // the popup frames. Still sample the peak so it resumes in sync.
+        let clock_peak_changed = self.update_clock_anim();
+        let clock_anim = !finder_active && !notification_active && clock_peak_changed;
         if self.update_status() {
             bars = true;
         }
@@ -1782,15 +2955,35 @@ impl Wm {
         if bars {
             self.update_bars_geometry()?;
             self.draw_bars()?;
+            if finder_active {
+                self.finder_draw()?;
+                // Mapping the neighboring bar sections can put the center
+                // window back below them. dwm's final raise in resizebarwin()
+                // keeps the popup and its marker above every bar section.
+                if self.finder.is_active() {
+                    self.stack_finder(self.selmon, true)?;
+                    self.conn.flush()?;
+                }
+            } else if notification_active {
+                self.notification_draw()?;
+                if self.notification.is_center_active() {
+                    self.stack_finder(self.selmon, true)?;
+                    self.conn.flush()?;
+                }
+            }
         } else if clock_anim {
             // Only the center window's width changed: redraw just the clocks.
             for mi in 0..self.monitors.len() {
-                if self.monitors[mi].showbar {
+                if self.monitors[mi].showbar
+                    && !(mi == self.selmon
+                        && (self.finder.is_active() || self.notification.is_center_active()))
+                {
                     self.draw_clock(mi)?;
                 }
             }
             self.conn.flush()?;
         }
+        self.notification_center_active_last = self.notification.is_center_active();
         Ok(())
     }
 
@@ -1824,7 +3017,11 @@ impl Wm {
     fn pointer_over_mpris_bar(&self, mi: usize, x: i32, y: i32) -> bool {
         let m = &self.monitors[mi];
         let h = self.bar_h()
-            * if self.mpris_hovered && self.mpris.present && mi == self.selmon { 2 } else { 1 };
+            * if self.mpris_hovered && self.mpris.present && mi == self.selmon {
+                2
+            } else {
+                1
+            };
         x >= self.rightbar_x(mi)
             && x < self.rightbar_x(mi) + self.barwidths(mi).rw
             && y >= m.by
@@ -1874,7 +3071,212 @@ impl Wm {
         }
     }
 
+    /// dwm's `notification_clock_hit`: only the fixed clock-sized part of the
+    /// animated center window opens history while the clock is shown.
+    fn notification_clock_hit(&self, mi: usize, x: i32) -> bool {
+        if self.notification.is_center_active() {
+            return true;
+        }
+        let cw = self.barwidths(mi).cw;
+        let dcw = self.clock_window_width(mi, cw);
+        self.notification.clock_hit(x, cw, dcw)
+    }
+
+    /// Applies the small state changes caused by pointer events. The next
+    /// refresh does the geometry and pixel work, like dwm's drawbars/resize.
+    fn notification_pointer_state(&mut self, dirty: bool) -> Result {
+        if dirty {
+            self.bar_dirty = true;
+            self.sync_center_class()?;
+        }
+        Ok(())
+    }
+
+    fn notification_enter(&mut self, e: &EnterNotifyEvent) -> Result<bool> {
+        let Some(mi) = self.monitors.iter().position(|m| m.barcenterwin == e.event) else {
+            return Ok(false);
+        };
+        if mi != self.selmon {
+            return Ok(false);
+        }
+        if self.finder.is_active() || self.monitor_fullscreen(mi) {
+            return Ok(true);
+        }
+        if !self.notification_clock_hit(mi, e.event_x as i32) {
+            return Ok(true);
+        }
+        let dirty = self.notification.enter(
+            e.event_x as i32,
+            e.event_y as i32,
+            e.root_x as i32,
+            e.root_y as i32,
+            self.bar_h(),
+        );
+        self.notification_pointer_state(dirty)?;
+        Ok(true)
+    }
+
+    fn notification_leave(&mut self, e: &LeaveNotifyEvent) -> Result<bool> {
+        let Some(mi) = self.monitors.iter().position(|m| m.barcenterwin == e.event) else {
+            return Ok(false);
+        };
+        if mi != self.selmon {
+            return Ok(false);
+        }
+        if self.finder.is_active() {
+            return Ok(true);
+        }
+        let dirty = self.notification.leave(self.bar_h());
+        self.notification_pointer_state(dirty)?;
+        Ok(true)
+    }
+
+    fn notification_motion(&mut self, e: &MotionNotifyEvent) -> Result<bool> {
+        let Some(mi) = self.monitors.iter().position(|m| m.barcenterwin == e.event) else {
+            return Ok(false);
+        };
+        if mi != self.selmon {
+            return Ok(false);
+        }
+        if self.finder.is_active() || self.monitor_fullscreen(mi) {
+            return Ok(true);
+        }
+        if !self.notification_clock_hit(mi, e.event_x as i32) {
+            return Ok(true);
+        }
+        let dirty = self.notification.motion(
+            e.event_x as i32,
+            e.event_y as i32,
+            e.root_x as i32,
+            e.root_y as i32,
+            self.bar_h(),
+        );
+        self.notification_pointer_state(dirty)?;
+        Ok(true)
+    }
+
+    fn notification_button(&mut self, e: &ButtonPressEvent) -> Result<bool> {
+        let Some(mi) = self.monitors.iter().position(|m| m.barcenterwin == e.event) else {
+            return Ok(false);
+        };
+        if mi != self.selmon {
+            return Ok(false);
+        }
+        if self.finder.is_active() || self.monitor_fullscreen(mi) {
+            return Ok(true);
+        }
+        // Without an active popup, clicks on the clock remain ordinary root
+        // bindings, exactly as in dwm's buttonpress().
+        if !self.notification.is_center_active() {
+            return Ok(false);
+        }
+        let had_focus = self.notification.has_input_focus();
+        self.notification
+            .button(e.detail, e.event_x as i32, e.event_y as i32, self.bar_h());
+        let has_focus = self.notification.has_input_focus();
+        if had_focus != has_focus {
+            let win = if has_focus {
+                self.monitors[mi].barcenterwin
+            } else {
+                self.root
+            };
+            self.conn
+                .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        }
+        self.bar_dirty = true;
+        self.sync_center_class()?;
+        Ok(true)
+    }
+
+    /// Returns true when a notification input row or the open history consumed
+    /// this key. Ordinary WM bindings must not run in that case.
+    fn notification_keypress(&mut self, e: &KeyPressEvent) -> Result<bool> {
+        let Some(&sym) = self.keysyms.get((e.detail - self.min_keycode) as usize) else {
+            return Ok(false);
+        };
+        let state = u16::from(e.state) & CLEAN_MASK;
+        let had_focus = self.notification.has_input_focus();
+        let consumed = if had_focus {
+            let text = Finder::key_char(sym, state)
+                .map(String::from)
+                .unwrap_or_default();
+            self.notification.keypress(sym, &text, self.bar_h())
+        } else if self.notification.is_history_active() && sym == XK_Escape {
+            self.notification.escape(self.bar_h())
+        } else {
+            false
+        };
+        if !consumed {
+            return Ok(false);
+        }
+        let has_focus = self.notification.has_input_focus();
+        if had_focus != has_focus {
+            let win = if has_focus {
+                self.monitors[self.selmon].barcenterwin
+            } else {
+                self.root
+            };
+            self.conn
+                .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        }
+        self.bar_dirty = true;
+        self.sync_center_class()?;
+        Ok(true)
+    }
+
     pub fn handle(&mut self, event: Event) -> Result {
+        // While the finder is modal it owns keyboard and button input before
+        // any of the ordinary WM bindings, as in dwm's buttonpress/keypress.
+        if self.finder.is_active() {
+            match &event {
+                Event::KeyPress(e) => {
+                    let sym = self
+                        .keysyms
+                        .get((e.detail - self.min_keycode) as usize)
+                        .copied();
+                    if let Some(sym) = sym {
+                        self.finder.keypress(sym, u16::from(e.state) & CLEAN_MASK);
+                    }
+                    if !self.finder.is_active() {
+                        // Escape and Return close Finder inside Finder itself.
+                        self.finder_close()?;
+                    } else {
+                        self.bar_dirty = true;
+                    }
+                    return Ok(());
+                }
+                Event::ButtonPress(e) => {
+                    let (rx, ry) = (e.root_x as i32, e.root_y as i32);
+                    if !self.finder_pointer_inside(rx, ry) {
+                        self.finder_close()?;
+                        self.finder_focus_pointer(rx, ry)?;
+                        return Ok(());
+                    }
+                    if let Some((_, popup_y, _, _)) = self.finder_place(self.selmon) {
+                        self.finder
+                            .buttonpress(e.detail, ry - popup_y, self.bar_h());
+                    }
+                    if !self.finder.is_active() {
+                        // A click on a result launches and closes Finder there.
+                        self.finder_close()?;
+                    } else {
+                        self.bar_dirty = true;
+                    }
+                    return Ok(());
+                }
+                Event::ButtonRelease(_) => return Ok(()),
+                Event::MotionNotify(e) => {
+                    let (rx, ry) = (e.root_x as i32, e.root_y as i32);
+                    if self.finder_pointer_inside(rx, ry)
+                        && let Some((_, popup_y, _, _)) = self.finder_place(self.selmon)
+                    {
+                        self.finder.motion(ry, popup_y, self.bar_h());
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match event {
             Event::MapRequest(e) => {
                 if !self.is_managed(e.window) {
@@ -1889,12 +3291,19 @@ impl Wm {
                 self.unmanage(e.window)?;
                 self.bar_dirty = true;
             }
+            Event::ConfigureNotify(e) if e.window == self.root => {
+                self.updategeom()?;
+            }
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+                self.updategeom()?;
+            }
             Event::ConfigureRequest(e) => {
-                if let Some((idx, mi, floating)) = self.clients.iter().enumerate().find_map(
-                    |(i, c)| {
-                        (c.win == e.window).then_some((i, c.mon, c.floating))
-                    },
-                ) {
+                if let Some((idx, mi, floating)) = self
+                    .clients
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, c)| (c.win == e.window).then_some((i, c.mon, c.floating)))
+                {
                     if floating {
                         // C's configurerequest(): accept geometry changes for a
                         // floating client, then place only that client.
@@ -1974,19 +3383,50 @@ impl Wm {
                 }
             }
             Event::EnterNotify(e) => {
-                self.bar_dirty = true;
-                if let Some(mi) = self.monitors.iter().position(|m| {
-                    m.barrightwin == e.event || m.mpris_markerwin == e.event
-                }) {
+                // The Finder popup and its marker are separate override-redirect
+                // windows. Crossing between them must not dirty the bars: that
+                // made the final `stack_finder()` restack them on every crossing,
+                // so the hover produced an endless enter/leave/flicker loop.
+                let finder_crossing = self.finder.is_active()
+                    && self
+                        .monitors
+                        .iter()
+                        .any(|m| m.barcenterwin == e.event || m.finder_markerwin == e.event);
+                if finder_crossing {
+                    return Ok(());
+                }
+                if self.notification_enter(&e)? {
+                    return Ok(());
+                }
+                // Moving the pointer to another monitor selects it and unfocuses
+                // the previously focused monitor's window.
+                if !self.finder.is_active() {
+                    self.activate_monitor_at(e.root_x as i32, e.root_y as i32)?;
+                }
+                if let Some(mi) = self
+                    .monitors
+                    .iter()
+                    .position(|m| m.barrightwin == e.event || m.mpris_markerwin == e.event)
+                {
                     if mi == self.selmon && self.mpris.present {
                         if self.monitors[mi].mpris_markerwin == e.event {
-                            self.mpris_marker_hovered = true;
-                            self.update_mpris_marker_class(mi)?;
-                        } else {
+                            if !self.mpris_marker_hovered {
+                                self.mpris_marker_hovered = true;
+                                self.bar_dirty = true;
+                                self.update_mpris_marker_class(mi)?;
+                            }
+                        } else if !self.mpris_hovered {
                             self.mpris_hovered = true;
+                            self.bar_dirty = true;
                             self.resize_bar_win(mi)?;
                         }
                     }
+                    return Ok(());
+                }
+                // While Finder is modal, a pointer crossing must not change the
+                // selected client or focus it. The popup keeps keyboard focus
+                // until Finder closes and restores the saved window.
+                if self.finder.is_active() {
                     return Ok(());
                 }
                 let found = self
@@ -1995,20 +3435,39 @@ impl Wm {
                     .find(|c| c.win == e.event && self.is_visible(c))
                     .map(|c| (c.win, c.mon));
                 if let Some((win, mon)) = found {
+                    let selection_changed =
+                        self.selmon != mon || self.monitors[mon].sel != Some(win);
                     self.selmon = mon;
                     self.monitors[mon].sel = Some(win);
                     self.focus()?;
+                    if selection_changed {
+                        self.bar_dirty = true;
+                    }
                 }
             }
             Event::LeaveNotify(e) => {
-                self.bar_dirty = true;
-                if let Some(mi) = self.monitors.iter().position(|m| {
-                    m.barrightwin == e.event || m.mpris_markerwin == e.event
-                }) {
+                let finder_crossing = self.finder.is_active()
+                    && self
+                        .monitors
+                        .iter()
+                        .any(|m| m.barcenterwin == e.event || m.finder_markerwin == e.event);
+                if finder_crossing {
+                    return Ok(());
+                }
+                if self.notification_leave(&e)? {
+                    return Ok(());
+                }
+                if let Some(mi) = self
+                    .monitors
+                    .iter()
+                    .position(|m| m.barrightwin == e.event || m.mpris_markerwin == e.event)
+                {
                     let root_x = e.root_x as i32;
                     let root_y = e.root_y as i32;
-                    if self.monitors[mi].mpris_markerwin == e.event {
+                    let mut dirty = false;
+                    if self.monitors[mi].mpris_markerwin == e.event && self.mpris_marker_hovered {
                         self.mpris_marker_hovered = false;
+                        dirty = true;
                         self.update_mpris_marker_class(mi)?;
                     }
                     let over_marker = self.mpris_marker_rect.is_some_and(|(x, y, w, h)| {
@@ -2017,15 +3476,23 @@ impl Wm {
                     if !self.pointer_over_mpris_bar(mi, root_x, root_y)
                         && !over_marker
                         && !self.mpris_volume_drag
+                        && (self.mpris_hovered || self.mpris_marker_hovered)
                     {
                         self.mpris_hovered = false;
                         self.mpris_marker_hovered = false;
+                        dirty = true;
                         self.resize_bar_win(mi)?;
+                    }
+                    if dirty {
+                        self.bar_dirty = true;
                     }
                     return Ok(());
                 }
             }
             Event::ButtonPress(e) => {
+                if self.notification_button(&e)? {
+                    return Ok(());
+                }
                 self.bar_dirty = true;
                 let state = u16::from(e.state) & CLEAN_MASK;
                 let at = (e.root_x as i32, e.root_y as i32);
@@ -2044,9 +3511,11 @@ impl Wm {
                         _ => {}
                     }
                 }
-                if let Some(mi) = self.monitors.iter().position(|m| {
-                    m.barrightwin == e.event || m.mpris_markerwin == e.event
-                }) {
+                if let Some(mi) = self
+                    .monitors
+                    .iter()
+                    .position(|m| m.barrightwin == e.event || m.mpris_markerwin == e.event)
+                {
                     if self.monitors[mi].mpris_markerwin == e.event {
                         self.mpris_marker_hovered = false;
                         let x = e.root_x as i32 - self.rightbar_x(mi);
@@ -2062,25 +3531,37 @@ impl Wm {
             }
             Event::ButtonRelease(e) => {
                 self.bar_dirty = true;
-                if self.monitors.iter().any(|m| {
-                    m.barrightwin == e.event || m.mpris_markerwin == e.event
-                }) {
+                if self
+                    .monitors
+                    .iter()
+                    .any(|m| m.barrightwin == e.event || m.mpris_markerwin == e.event)
+                {
                     self.mpris_volume_drag = false;
                     return Ok(());
                 }
             }
             Event::MotionNotify(e) => {
+                if self.notification_motion(&e)? {
+                    return Ok(());
+                }
                 if self.mpris_volume_drag {
-                    if let Some(mi) = self.monitors.iter().position(|m| {
-                        m.barrightwin == e.event || m.mpris_markerwin == e.event
-                    }) {
+                    if let Some(mi) = self
+                        .monitors
+                        .iter()
+                        .position(|m| m.barrightwin == e.event || m.mpris_markerwin == e.event)
+                    {
                         let x = e.root_x as i32 - self.rightbar_x(mi);
                         self.set_mpris_volume_from_x(mi, x);
                         self.bar_dirty = true;
                     }
+                } else {
+                    self.activate_monitor_at(e.root_x as i32, e.root_y as i32)?;
                 }
             }
             Event::KeyPress(e) => {
+                if self.notification_keypress(&e)? {
+                    return Ok(());
+                }
                 self.key_press(e)?;
                 self.bar_dirty = true;
             }
@@ -2128,11 +3609,22 @@ impl Wm {
                 // global force here makes every GL section swap during a drag.
                 if e.count == 0
                     && self.monitors.iter().any(|m| {
-                        [m.barwin, m.bartitlewin, m.barkbwin, m.barcenterwin, m.barrightwin]
-                            .contains(&e.window)
+                        [
+                            m.barwin,
+                            m.bartitlewin,
+                            m.barkbwin,
+                            m.barcenterwin,
+                            m.barrightwin,
+                        ]
+                        .contains(&e.window)
                     })
                 {
                     self.force_windows.borrow_mut().insert(e.window);
+                    if self.notification.is_center_active()
+                        && self.monitors[self.selmon].barcenterwin == e.window
+                    {
+                        self.notification_force.set(true);
+                    }
                     self.bar_dirty = true;
                 }
             }
@@ -2152,6 +3644,9 @@ impl Wm {
             .filter(|k| k.keysym == sym && k.mods == state)
             .map(|k| k.action)
             .collect();
+        if !actions.is_empty() {
+            self.sync_selmon_to_pointer()?;
+        }
         for action in actions {
             self.run(action)?;
         }
@@ -2180,6 +3675,21 @@ impl Wm {
             Action::ToggleGaps => self.togglegaps(),
             Action::DefaultGaps => self.defaultgaps(),
             Action::IncrGaps(scope, d) => self.incrgaps(scope, d),
+            Action::Finder => return self.finder_toggle(),
+            Action::FinderOcr => {
+                // Like dwm, OCR selects a region before Finder opens; the
+                // worker's result becomes the initial query. Pressing it while
+                // Finder is already modal is a no-op.
+                if self.finder.is_active() {
+                    return Ok(());
+                }
+                let dpy = self.drw.dpy();
+                if let Err(err) = self.finder.ocr(dpy) {
+                    self.finder.clear_ocr();
+                    return Err(err);
+                }
+                return Ok(());
+            }
             Action::Restart => {
                 self.restart = true;
                 Ok(())
@@ -2233,9 +3743,7 @@ impl Wm {
                 }
                 while let Some(event) = pending {
                     match event {
-                        Event::MotionNotify(e) => {
-                            latest = Some((e.root_x as i32, e.root_y as i32))
-                        }
+                        Event::MotionNotify(e) => latest = Some((e.root_x as i32, e.root_y as i32)),
                         Event::ButtonRelease(e) => {
                             let pos = (e.root_x as i32, e.root_y as i32);
                             on_motion(self, pos.0, pos.1)?;
@@ -2275,13 +3783,20 @@ impl Wm {
     /// Waits until the X connection has an event or `timeout` expires. The
     /// main loop uses this instead of an unconditional sleep, so an event is
     /// handled as soon as it arrives like C dwm's blocking `XNextEvent`.
+    /// Round up: truncating a just-under-20 ms deadline to 19 ms made the
+    /// 50 fps clock cadence slightly slower than dwm's integer `poll()` value.
     pub fn wait_event(&self, timeout: Duration) -> Result {
         let mut pfd = libc::pollfd {
             fd: self.conn.stream().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let nanos = timeout.as_nanos();
+        let mut ms = nanos / 1_000_000;
+        if !nanos.is_multiple_of(1_000_000) {
+            ms += 1;
+        }
+        let ms = ms.min(i32::MAX as u128) as i32;
         if unsafe { libc::poll(&mut pfd, 1, ms) } < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {
@@ -2316,6 +3831,7 @@ impl Wm {
         self.clients.insert(0, client);
         self.conn
             .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        self.invalidate_finder_stacking();
         self.place_floating(win)
     }
 
@@ -2343,7 +3859,12 @@ impl Wm {
     /// Geometry while dragging. The grab offset stays under the pointer and
     /// the window keeps its size, exactly like a floating drag.
     fn drag_geom((x, y): (i32, i32), (ox, oy): (i32, i32), current: Rect) -> Rect {
-        Rect { x: x - ox, y: y - oy, w: current.w, h: current.h }
+        Rect {
+            x: x - ox,
+            y: y - oy,
+            w: current.w,
+            h: current.h,
+        }
     }
 
     /// Nearest tile to a point. A drop can land in a gap or on the bar, where no
@@ -2407,10 +3928,8 @@ impl Wm {
             }
             // Raise once at drag start. apply_layout() only restacks the zones;
             // repeated stack requests per frame delay the client's redraw.
-            self.conn.configure_window(
-                win,
-                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-            )?;
+            self.conn
+                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
             self.apply_layout()?;
         }
         let (ox, oy) = (px - start.x, py - start.y);
@@ -2556,7 +4075,11 @@ impl Wm {
             }
             // A floated window keeps its leaf in the tree; tiled_order() hides
             // it while floating, so toggling back restores the old split.
-            if !self.monitors[mi].tree.as_ref().is_some_and(|t| t.has_leaf(sel)) {
+            if !self.monitors[mi]
+                .tree
+                .as_ref()
+                .is_some_and(|t| t.has_leaf(sel))
+            {
                 let area = self.tile_area(mi);
                 let tree = &mut self.monitors[mi].tree;
                 *tree = Some(tree::append(tree.take(), sel, area));
@@ -2674,7 +4197,11 @@ impl Wm {
         let (Some(idx), n) = (order.iter().position(|&w| w == sel), order.len()) else {
             return Ok(());
         };
-        let next = if d > 0 { (idx + 1) % n } else { (idx + n - 1) % n };
+        let next = if d > 0 {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
         let c = order[next];
         self.monitors[mi].sel = Some(c);
         self.focus()?;
@@ -2698,7 +4225,11 @@ impl Wm {
         if n < 2 {
             return Ok(());
         }
-        let target = if d > 0 { (idx + 1) % n } else { (idx + n - 1) % n };
+        let target = if d > 0 {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
         let c = order[target];
         let sel_pos = self.clients.iter().position(|x| x.win == sel);
         let c_pos = self.clients.iter().position(|x| x.win == c);
@@ -2750,7 +4281,10 @@ impl Wm {
             .get_property(false, win, self.atoms.wm_protocols, AtomEnum::ATOM, 0, 64)
             .ok()
             .and_then(|c| c.reply().ok())
-            .and_then(|r| r.value32().map(|mut it| it.any(|a| a == self.atoms.wm_delete)))
+            .and_then(|r| {
+                r.value32()
+                    .map(|mut it| it.any(|a| a == self.atoms.wm_delete))
+            })
             .unwrap_or(false)
     }
 
@@ -2859,7 +4393,12 @@ impl Wm {
     }
 
     fn defaultgaps(&mut self) -> Result {
-        self.setgaps(config::GAPPOH, config::GAPPOV, config::GAPPIH, config::GAPPIV)
+        self.setgaps(
+            config::GAPPOH,
+            config::GAPPOV,
+            config::GAPPIH,
+            config::GAPPIV,
+        )
     }
 
     fn incrgaps(&mut self, scope: GapScope, d: i32) -> Result {
@@ -2887,6 +4426,51 @@ impl Wm {
         }
         self.setgaps(oh, ov, ih, iv)
     }
+
+    /// dwm's `cleanup()`: release modal grabs, all bar windows and colormaps.
+    /// `main` calls this before `exec()` on restart, since an exec skips Drop.
+    pub fn shutdown(&mut self) {
+        if self.finder.is_active() {
+            self.finder.close();
+        }
+        if self.finder_grabbed {
+            self.finder_grabbed = false;
+            let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
+            let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        }
+        let _ = self
+            .conn
+            .set_input_focus(InputFocus::PARENT, self.root, CURRENT_TIME);
+        for m in &self.monitors {
+            let windows = [
+                m.barwin,
+                m.bartitlewin,
+                m.barcenterwin,
+                m.barkbwin,
+                m.barrightwin,
+                m.mpris_markerwin,
+                m.finder_markerwin,
+            ];
+            for win in windows.into_iter().filter(|w| *w != 0) {
+                let _ = self.conn.unmap_window(win);
+                let _ = self.conn.destroy_window(win);
+            }
+            if m.colormap != 0 {
+                let _ = self.conn.free_colormap(m.colormap);
+            }
+        }
+        if self.finder_argb_colormap != 0 {
+            let _ = self.conn.free_colormap(self.finder_argb_colormap);
+            self.finder_argb_colormap = 0;
+        }
+        let _ = self.conn.flush();
+    }
+}
+
+impl Drop for Wm {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 #[cfg(test)]
@@ -2898,8 +4482,31 @@ mod tests {
     }
 
     #[test]
+    fn clock_animation_uses_50fps_deadline_without_finder() {
+        let now = Instant::now();
+        let status_next = now + Duration::from_secs(1);
+
+        let animated = Wm::bar_next_tick(now, status_next, true, false, false, now, None);
+        assert_eq!(animated, now + BAR_TICK);
+        assert_eq!(BAR_TICK, Duration::from_millis(20));
+
+        let idle = Wm::bar_next_tick(now, status_next, false, false, false, now, None);
+        assert_eq!(idle, now + IDLE_POLL);
+
+        let finder_next = now + Duration::from_millis(10);
+        let finder = Wm::bar_next_tick(now, status_next, true, true, false, now, Some(finder_next));
+        assert_eq!(finder, finder_next);
+    }
+
+    #[test]
     fn size_hints_enforce_minimum() {
-        let hints = SizeHints { min_w: 200, min_h: 100, base_w: 200, base_h: 100, ..Default::default() };
+        let hints = SizeHints {
+            min_w: 200,
+            min_h: 100,
+            base_w: 200,
+            base_h: 100,
+            ..Default::default()
+        };
         let got = constrain_size(&hints, box_(110, 70), 2, 0);
         assert_eq!((got.w, got.h), (204, 104));
         assert_eq!((got.x, got.y), (10, 20));
@@ -2907,42 +4514,81 @@ mod tests {
 
     #[test]
     fn size_hints_apply_base_and_increment() {
-        let hints = SizeHints { base_w: 10, base_h: 20, inc_w: 10, inc_h: 10, ..Default::default() };
+        let hints = SizeHints {
+            base_w: 10,
+            base_h: 20,
+            inc_w: 10,
+            inc_h: 10,
+            ..Default::default()
+        };
         let got = constrain_size(&hints, box_(123, 133), 0, 0);
         assert_eq!((got.w, got.h), (120, 130));
     }
 
     #[test]
     fn size_hints_enforce_maximum() {
-        let hints = SizeHints { max_w: 300, max_h: 200, ..Default::default() };
+        let hints = SizeHints {
+            max_w: 300,
+            max_h: 200,
+            ..Default::default()
+        };
         let got = constrain_size(&hints, box_(500, 500), 0, 0);
         assert_eq!((got.w, got.h), (300, 200));
     }
 
     #[test]
     fn drag_geom_keeps_grab_offset_and_size_instead_of_centering_on_pointer() {
-        let start = Rect { x: 100, y: 200, w: 1000, h: 500 };
+        let start = Rect {
+            x: 100,
+            y: 200,
+            w: 1000,
+            h: 500,
+        };
         let (ox, oy) = (300, 120); // grabbed at (400, 320)
 
         // First motion without moving the pointer: no jump and no resize.
-        assert_eq!(
-            Wm::drag_geom((400, 320), (ox, oy), start),
-            start
-        );
+        assert_eq!(Wm::drag_geom((400, 320), (ox, oy), start), start);
         // Moving the pointer moves the top-left by the same amount, size intact.
         assert_eq!(
             Wm::drag_geom((700, 520), (ox, oy), start),
-            Rect { x: 400, y: 400, w: 1000, h: 500 }
+            Rect {
+                x: 400,
+                y: 400,
+                w: 1000,
+                h: 500
+            }
         );
     }
 
     #[test]
     fn nearest_tile_picks_closest_box_in_a_gap() {
         let leaves = [
-            (1, Rect { x: 0, y: 0, w: 400, h: 500 }),
-            (2, Rect { x: 420, y: 0, w: 400, h: 500 }),
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 400,
+                    h: 500,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 420,
+                    y: 0,
+                    w: 400,
+                    h: 500,
+                },
+            ),
         ];
-        assert_eq!(Wm::nearest_tile(&leaves, (410, 250)).map(|(w, _)| *w), Some(1));
-        assert_eq!(Wm::nearest_tile(&leaves, (425, 250)).map(|(w, _)| *w), Some(2));
+        assert_eq!(
+            Wm::nearest_tile(&leaves, (410, 250)).map(|(w, _)| *w),
+            Some(1)
+        );
+        assert_eq!(
+            Wm::nearest_tile(&leaves, (425, 250)).map(|(w, _)| *w),
+            Some(2)
+        );
     }
 }

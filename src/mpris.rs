@@ -96,13 +96,23 @@ impl Snapshot {
         if artist.ends_with(" - TOPIC") {
             artist.truncate(artist.len() - 8);
         }
-        format!("[{}]  {}", if artist.is_empty() { "UNKNOWN ARTIST" } else { &artist }, self.title)
+        format!(
+            "[{}]  {}",
+            if artist.is_empty() {
+                "UNKNOWN ARTIST"
+            } else {
+                &artist
+            },
+            self.title
+        )
     }
 }
 
 pub fn start_monitor() -> Receiver<Snapshot> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    let _ = thread::Builder::new().name("rwm-mpris".into()).spawn(move || monitor_loop(sender));
+    let _ = thread::Builder::new()
+        .name("rwm-mpris".into())
+        .spawn(move || monitor_loop(sender));
     receiver
 }
 
@@ -202,8 +212,12 @@ fn read_player(caller: &Connection) -> Snapshot {
         let art_url = dict_string(&metadata, "mpris:artUrl").unwrap_or_default();
         // MPRIS uses microseconds for both length and Position.
         let length = dict_number(&metadata, "mpris:length").unwrap_or(0.0) / 1_000_000.0;
-        let position = proxy.get_property::<i64>("Position").unwrap_or(0).max(0) as f64 / 1_000_000.0;
-        let volume = proxy.get_property::<f64>("Volume").unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+        let position =
+            proxy.get_property::<i64>("Position").unwrap_or(0).max(0) as f64 / 1_000_000.0;
+        let volume = proxy
+            .get_property::<f64>("Volume")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0) as f32;
         let progress = (length > 0.0).then(|| {
             let value = (position / length).min(1.0) as f32;
             if value >= 0.995 { 1.0 } else { value }
@@ -240,12 +254,17 @@ fn dict_string(fields: &HashMap<String, OwnedValue>, key: &str) -> Option<String
 fn dict_array_string(fields: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
     let value = fields.get(key)?;
     let array: &zbus::zvariant::Array = value.try_into().ok()?;
-    array.iter().find_map(|item| item.downcast_ref::<&str>().ok().map(str::to_owned))
+    array
+        .iter()
+        .find_map(|item| item.downcast_ref::<&str>().ok().map(str::to_owned))
 }
 
 fn dict_number(fields: &HashMap<String, OwnedValue>, key: &str) -> Option<f64> {
     let value = fields.get(key)?;
-    u64::try_from(value).ok().map(|number| number as f64).or_else(|| f64::try_from(value).ok())
+    u64::try_from(value)
+        .ok()
+        .map(|number| number as f64)
+        .or_else(|| f64::try_from(value).ok())
 }
 
 // The old busctl output parser is no longer used at runtime. Kept for the
@@ -310,7 +329,9 @@ fn busctl_tokens(text: &str) -> Vec<String> {
 #[cfg(test)]
 fn busctl_dict_string(fields: &[String], key: &str) -> Option<String> {
     let index = fields.iter().position(|field| field == key)?;
-    (fields.get(index + 1)? == "s").then(|| fields.get(index + 2).cloned()).flatten()
+    (fields.get(index + 1)? == "s")
+        .then(|| fields.get(index + 2).cloned())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -320,7 +341,9 @@ fn busctl_dict_array_string(fields: &[String], key: &str) -> Option<String> {
         return None;
     }
     let count = fields.get(index + 2)?.parse::<usize>().ok()?;
-    (count > 0).then(|| fields.get(index + 3).cloned()).flatten()
+    (count > 0)
+        .then(|| fields.get(index + 3).cloned())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -481,10 +504,22 @@ mod tests {
         let fields = busctl_tokens(
             r#"a{sv} 4 "xesam:title" s "A \"Quoted\" Song" "xesam:artist" as 1 "THE BAND" "mpris:length" x 240000000 "mpris:artUrl" s "file:///tmp/cover%20art.png""#,
         );
-        assert_eq!(busctl_dict_string(&fields, "xesam:title").as_deref(), Some("A \"Quoted\" Song"));
-        assert_eq!(busctl_dict_array_string(&fields, "xesam:artist").as_deref(), Some("THE BAND"));
-        assert_eq!(busctl_dict_number(&fields, "mpris:length"), Some(240000000.0));
-        assert_eq!(busctl_dict_string(&fields, "mpris:artUrl").as_deref(), Some("file:///tmp/cover%20art.png"));
+        assert_eq!(
+            busctl_dict_string(&fields, "xesam:title").as_deref(),
+            Some("A \"Quoted\" Song")
+        );
+        assert_eq!(
+            busctl_dict_array_string(&fields, "xesam:artist").as_deref(),
+            Some("THE BAND")
+        );
+        assert_eq!(
+            busctl_dict_number(&fields, "mpris:length"),
+            Some(240000000.0)
+        );
+        assert_eq!(
+            busctl_dict_string(&fields, "mpris:artUrl").as_deref(),
+            Some("file:///tmp/cover%20art.png")
+        );
     }
 
     #[test]

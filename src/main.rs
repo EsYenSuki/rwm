@@ -1,8 +1,13 @@
 mod bar;
 mod config;
 mod drw;
+mod finder;
+mod finder_math;
+mod finder_net;
+mod gl;
 mod keys;
 mod mpris;
+mod notification;
 mod sound;
 mod status;
 mod text;
@@ -62,7 +67,12 @@ fn main() -> Result {
         )
     };
 
-    let screen = Rect { x: 0, y: 0, w: width as u32, h: height as u32 };
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        w: width as u32,
+        h: height as u32,
+    };
     let rects = monitor_rects(&conn, root, screen)?;
     let mut wm = Wm::new(conn, root, rects, min_kc, max_kc)?;
 
@@ -76,6 +86,8 @@ fn main() -> Result {
             wm.handle(event)?;
         }
         if wm.restart {
+            // exec() does not run Drop, so release grabs and bar windows first.
+            wm.shutdown();
             let exe = env::current_exe()?;
             let err = Command::new(exe).args(env::args().skip(1)).exec();
             return Err(err.into());
