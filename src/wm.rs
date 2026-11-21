@@ -12,7 +12,7 @@ use x11::keysym::XK_Escape;
 use x11::xlib;
 use x11::xrender;
 use x11rb::connection::Connection;
-use x11rb::properties::WmSizeHints;
+use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
 use x11rb::protocol::Event;
 use x11rb::protocol::randr;
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
@@ -43,6 +43,12 @@ const LOCK_MASK: u16 = 1 << 1;
 const MOD2_MASK: u16 = 1 << 4;
 /// dwm's CLEANMASK: every modifier except CapsLock and NumLock (Mod2 here).
 const CLEAN_MASK: u16 = 0xFD & !MOD2_MASK;
+/// ICCCM `WM_STATE` values. The atom is interned in `Atoms` (it is not one of
+/// X11's predefined atoms); only these numbers are fixed by the spec.
+const WM_STATE_WITHDRAWN: u32 = 0;
+const WM_STATE_NORMAL: u32 = 1;
+const WM_STATE_ICONIC: u32 = 3;
+
 /// Pointer motion throttle during a drag, matching dwm's `1000 / 60`.
 const DRAG_FRAME: Duration = Duration::from_millis(16);
 /// The one cadence for every animated bar value. Clock peaks and scrolling
@@ -61,10 +67,16 @@ const SCROLL_TICKS: u32 = 2;
 /// Don't repaint the MPRIS panel until the interpolated progress bar would
 /// move by about a pixel. This replaces the old once-per-second Position poll.
 const PROGRESS_EPSILON: f32 = 0.005;
+/// Space left around a centered dialog so it does not touch the screen edges.
+const FLOAT_MARGIN: i32 = 20;
+/// Default outer size for a floating window that publishes no size hints.
+const DEFAULT_FLOAT_W: i32 = 600;
+const DEFAULT_FLOAT_H: i32 = 400;
 
-/// The parts of `WM_NORMAL_HINTS` dwm's `updatesizehints()` keeps. Zero means
-/// "not specified", as in the C version. Sizes are client sizes, without the
-/// border, because that is what `applysizehints()` operates on.
+/// The parts of `WM_NORMAL_HINTS` dwm's `updatesizehints()` keeps, plus the
+/// position/size a client asked for. Zero means "not specified", as in the C
+/// version. Sizes are client sizes, without the border, because that is what
+/// `constrain_size()` operates on.
 #[derive(Clone, Copy, Debug, Default)]
 struct SizeHints {
     min_w: i32,
@@ -77,6 +89,135 @@ struct SizeHints {
     inc_h: i32,
     min_aspect: f64,
     max_aspect: f64,
+    /// USPosition/PPosition: the requested position of the reference point
+    /// selected by `gravity`.
+    requested_pos: Option<(i32, i32)>,
+    /// True for USPosition (an explicit user choice), false for PPosition.
+    user_position: bool,
+    /// USSize/PSize: the requested client size.
+    requested_size: Option<(i32, i32)>,
+    gravity: Option<Gravity>,
+}
+
+/// Offset from a hint's reference point to the top-left of the window, as
+/// selected by `PWinGravity` (ICCCM 4.1.2.3). Most clients use NorthWest.
+fn gravity_offset(gravity: Option<Gravity>, w: i32, h: i32) -> (i32, i32) {
+    match gravity {
+        Some(g) if g == Gravity::NORTH => (w / 2, 0),
+        Some(g) if g == Gravity::NORTH_EAST => (w, 0),
+        Some(g) if g == Gravity::WEST => (0, h / 2),
+        Some(g) if g == Gravity::CENTER => (w / 2, h / 2),
+        Some(g) if g == Gravity::EAST => (w, h / 2),
+        Some(g) if g == Gravity::SOUTH_WEST => (0, h),
+        Some(g) if g == Gravity::SOUTH => (w / 2, h),
+        Some(g) if g == Gravity::SOUTH_EAST => (w, h),
+        _ => (0, 0),
+    }
+}
+
+/// Top-left corner that centers a `w`x`h` box in `area`, clamped so the whole
+/// box stays inside it.
+fn centered_in(area: Rect, w: i32, h: i32) -> (i32, i32) {
+    let max_x = (area.x + area.w as i32 - w).max(area.x);
+    let max_y = (area.y + area.h as i32 - h).max(area.y);
+    (
+        (area.x + (area.w as i32 - w) / 2).clamp(area.x, max_x),
+        (area.y + (area.h as i32 - h) / 2).clamp(area.y, max_y),
+    )
+}
+
+/// Pick one axis of the initial client size. A client may ask for a size, or
+/// merely publish its base size; fall back to a modest dialog size otherwise.
+fn hinted_axis(
+    requested: Option<i32>,
+    base: i32,
+    min: i32,
+    max: i32,
+    inc: i32,
+    fallback: i32,
+) -> i32 {
+    let mut v = requested.filter(|v| *v > 0).unwrap_or(base);
+    if v <= 0 {
+        v = fallback;
+    }
+    v = v.max(min).max(1);
+    if max > 0 {
+        v = v.min(max);
+    }
+    if inc > 0 {
+        let anchor = base.clamp(1, v);
+        v = anchor + ((v - anchor) / inc) * inc;
+        v = v.max(min).max(1);
+        if max > 0 {
+            v = v.min(max);
+        }
+    }
+    v
+}
+
+/// Initial outer geometry of a floating client. A client-requested position
+/// wins; otherwise a transient dialog centers on its parent and any other
+/// floating window centers on the monitor's work area (below the bar).
+fn floating_geometry(hints: &SizeHints, area: Rect, parent: Option<Rect>, border: i32) -> Rect {
+    let avail_w = (area.w as i32 - 2 * FLOAT_MARGIN).max(1);
+    let avail_h = (area.h as i32 - 2 * FLOAT_MARGIN).max(1);
+    let cw = hinted_axis(
+        hints.requested_size.map(|(w, _)| w),
+        hints.base_w,
+        hints.min_w,
+        hints.max_w,
+        hints.inc_w,
+        DEFAULT_FLOAT_W.min(avail_w),
+    );
+    let ch = hinted_axis(
+        hints.requested_size.map(|(_, h)| h),
+        hints.base_h,
+        hints.min_h,
+        hints.max_h,
+        hints.inc_h,
+        DEFAULT_FLOAT_H.min(avail_h),
+    );
+    let mut rect = constrain_size(
+        hints,
+        Rect {
+            x: 0,
+            y: 0,
+            w: (cw + 2 * border).max(1) as u32,
+            h: (ch + 2 * border).max(1) as u32,
+        },
+        border,
+        0,
+    );
+    rect.w = rect.w.min(avail_w.max(2 * border + 1) as u32);
+    rect.h = rect.h.min(avail_h.max(2 * border + 1) as u32);
+
+    // Toolkits routinely publish PPosition=(0,0) as a placeholder. Only an
+    // explicit user position (or a non-origin program position) overrides
+    // centering; otherwise that placeholder would pin pkexec dialogs to the
+    // top-left corner.
+    let explicit_pos = hints
+        .requested_pos
+        .filter(|(x, y)| hints.user_position || *x != 0 || *y != 0);
+    let (x, y) = if let Some((hx, hy)) = explicit_pos {
+        let (ox, oy) = gravity_offset(hints.gravity, rect.w as i32, rect.h as i32);
+        (hx - ox, hy - oy)
+    } else {
+        centered_in(parent.unwrap_or(area), rect.w as i32, rect.h as i32)
+    };
+    let max_x = (area.x + area.w as i32 - rect.w as i32).max(area.x);
+    let max_y = (area.y + area.h as i32 - rect.h as i32).max(area.y);
+    Rect {
+        x: x.clamp(area.x, max_x),
+        y: y.clamp(area.y, max_y),
+        w: rect.w,
+        h: rect.h,
+    }
+}
+
+/// The outer frame is the X border around a client. Fullscreen clients cover
+/// the whole monitor, so they get no frame at all.
+fn client_border(c: &Client) -> i32 {
+    if c.fullscreen { 0 } else { BORDERPX }
 }
 
 /// dwm's `applysizehints()`: clamp a floating client's outer box to the hints
@@ -127,6 +268,62 @@ fn constrain_size(hints: &SizeHints, rect: Rect, border: i32, min_bar_height: i3
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WinType {
+    Normal,
+    Dialog,
+    Utility,
+    Toolbar,
+    Menu,
+    DropdownMenu,
+    PopupMenu,
+    Tooltip,
+    Notification,
+    Splash,
+    Dock,
+    Desktop,
+    Combo,
+    Dnd,
+}
+
+/// ICCCM `WM_NORMAL_HINTS` with min == max on both axes leave the WM no legal
+/// resize: tiling such a window would only fight its hints. Zero means "not
+/// specified", so it is not a fixed size. This is deliberately app-agnostic:
+/// any client publishing the same hints gets the same treatment.
+fn has_fixed_size(hints: &SizeHints) -> bool {
+    config::FLOAT_FIXED_SIZE
+        && hints.min_w > 0
+        && hints.min_h > 0
+        && hints.max_w == hints.min_w
+        && hints.max_h == hints.min_h
+}
+
+/// Floating policy shared by map time and later property updates. EWMH
+/// dialog-like window types, transient/modal windows and fixed-size windows
+/// stay outside the tiling tree. Fixed size is the fallback for clients that
+/// never set `_NET_WM_WINDOW_TYPE`, as EWMH leaves the rest to the WM.
+fn wants_floating(
+    win_type: WinType,
+    transient_for: Option<Window>,
+    is_modal: bool,
+    hints: &SizeHints,
+) -> bool {
+    matches!(
+        win_type,
+        WinType::Dialog
+            | WinType::Utility
+            | WinType::Toolbar
+            | WinType::Menu
+            | WinType::DropdownMenu
+            | WinType::PopupMenu
+            | WinType::Tooltip
+            | WinType::Notification
+            | WinType::Splash
+    ) || transient_for.is_some()
+        || is_modal
+        || has_fixed_size(hints)
+}
+
 pub struct Client {
     pub win: Window,
     pub tags: u32,
@@ -138,11 +335,32 @@ pub struct Client {
     dragging: bool,
     /// The outer box of a floating window, like dwm's `x`, `y`, `w` and `h`.
     pub geom: Rect,
+    /// True while the WM still owns the floating geometry. Client or user
+    /// placement clears it so later property updates do not move the window.
+    auto_place: bool,
     /// dwm's `minw`, `basew`, `incw`, aspect and friends from `WM_NORMAL_HINTS`.
     hints: SizeHints,
     /// The input-only hover zones over the window's edges and corners, in the
     /// order of `tree::ZONE_EDGES`.
     pub edge_wins: [Window; 8],
+    pub transient_for: Option<Window>,
+    pub win_type: WinType,
+    pub is_modal: bool,
+    pub fullscreen: bool,
+    pub maximized_horz: bool,
+    pub maximized_vert: bool,
+    pub above: bool,
+    pub below: bool,
+    pub demands_attention: bool,
+    pub hidden: bool,
+    pub sticky: bool,
+    pub skip_taskbar: bool,
+    pub skip_pager: bool,
+    pub saved_geom: Option<Rect>,
+    pub saved_floating: bool,
+    pub take_focus: bool,
+    pub wants_input: bool,
+    pub urgent: bool,
 }
 
 /// Resize cursors from the user's cursor theme. `0` is `None`.
@@ -225,14 +443,61 @@ enum CenterKind {
     Finder,
 }
 
+#[derive(Clone)]
 struct Atoms {
     wm_protocols: u32,
     wm_delete: u32,
+    wm_take_focus: u32,
+    wm_state: u32,
+    wm_change_state: u32,
+    wm_transient_for: u32,
     net_wm_name: u32,
-    utf8_string: u32,
-    net_current_desktop: u32,
+    net_wm_window_type: u32,
+    net_wm_window_type_dialog: u32,
+    net_wm_window_type_utility: u32,
+    net_wm_window_type_toolbar: u32,
+    net_wm_window_type_menu: u32,
+    net_wm_window_type_dropdown_menu: u32,
+    net_wm_window_type_popup_menu: u32,
+    net_wm_window_type_tooltip: u32,
+    net_wm_window_type_notification: u32,
+    net_wm_window_type_splash: u32,
+    net_wm_window_type_dock: u32,
+    net_wm_window_type_desktop: u32,
+    net_wm_state: u32,
+    net_wm_state_fullscreen: u32,
+    net_wm_state_above: u32,
+    net_wm_state_below: u32,
+    net_wm_state_modal: u32,
+    net_wm_state_demands_attention: u32,
+    net_wm_state_hidden: u32,
+    net_wm_state_sticky: u32,
+    net_wm_state_skip_taskbar: u32,
+    net_wm_state_skip_pager: u32,
+    net_wm_state_maximized_vert: u32,
+    net_wm_state_maximized_horz: u32,
+    net_active_window: u32,
+    net_client_list: u32,
+    net_client_list_stacking: u32,
+    net_supported: u32,
+    net_supporting_wm_check: u32,
+    net_wm_desktop: u32,
+    net_wm_allowed_actions: u32,
+    net_wm_ping: u32,
+    net_close_window: u32,
+    net_move_resize_window: u32,
+    net_request_frame_extents: u32,
+    net_workarea: u32,
+    net_wm_strut: u32,
+    net_wm_strut_partial: u32,
+    net_showing_desktop: u32,
     net_number_of_desktops: u32,
+    net_current_desktop: u32,
+    net_desktop_names: u32,
+    utf8_string: u32,
+    motif_wm_hints: u32,
     no_animation: u32,
+    rwm_monitor: u32,
 }
 
 pub struct Wm {
@@ -241,10 +506,14 @@ pub struct Wm {
     pub monitors: Vec<Monitor>,
     /// Newest first, like dwm's client list. Its order is the focus and move order.
     pub clients: Vec<Client>,
+    /// Iconified clients in the order they were unmapped. `Deiconify` pops the
+    /// newest, so any number of windows can be hidden and restored one by one.
+    iconified_stack: Vec<Window>,
     pub selmon: usize,
     keys: Vec<Key>,
     keysyms: Vec<u32>,
     min_keycode: u8,
+    max_keycode: u8,
     atoms: Atoms,
     /// Text measuring for the layout, on the same Xlib display as `drw`.
     metrics: Metrics,
@@ -348,23 +617,46 @@ pub struct Wm {
     finder_saved_focus: Option<Window>,
     /// Keeps the Xlib connection that owns the themed cursor ids alive.
     _cursor_loader: CursorLoader,
+    /// EWMH's _NET_SUPPORTING_WM_CHECK window. It is an unmapped child of the
+    /// root, so the startup scan would adopt it as a client without this.
+    supporting_wm_check: Window,
     pub restart: bool,
 }
 
-pub fn spawn(cmd: &str) -> Result {
-    let mut child = Command::new("sh");
-    child.arg("-c").arg(cmd);
+/// Spawn `child` in its own session, like dwm's `fork(); setsid(); exec()`.
+///
+/// `Command::spawn()` forks already, but without `setsid()` the app remains in
+/// rwm's session and process group. Signals sent to that group (for example
+/// when rwm is killed from its terminal) take the app down with it. `pre_exec`
+/// runs in the forked child just before exec, where detaching is still safe.
+pub fn spawn_command(mut child: Command) -> Result {
     unsafe {
         child.pre_exec(|| {
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            if libc::setsid() == -1 {
+                // A spawn() child is never a process-group leader, but keep a
+                // process-group boundary even if setsid() fails somehow.
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
     let mut child = child.spawn()?;
+    // Reap the detached child without blocking the WM event loop.
     thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Each argument (and every `Spawn` keybinding) is a shell command run in a
+/// separate session so it outlives rwm.
+pub fn spawn(cmd: &str) -> Result {
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(cmd);
+    spawn_command(child)
 }
 
 /// Bar windows use the root visual and depth, like C dwm. `Drw` creates its
@@ -471,11 +763,57 @@ impl Wm {
         let atoms = Atoms {
             wm_protocols: intern(b"WM_PROTOCOLS")?,
             wm_delete: intern(b"WM_DELETE_WINDOW")?,
+            wm_take_focus: intern(b"WM_TAKE_FOCUS")?,
+            wm_state: intern(b"WM_STATE")?,
+            wm_change_state: intern(b"WM_CHANGE_STATE")?,
+            wm_transient_for: intern(b"WM_TRANSIENT_FOR")?,
             net_wm_name: intern(b"_NET_WM_NAME")?,
-            utf8_string: intern(b"UTF8_STRING")?,
-            net_current_desktop: intern(b"_NET_CURRENT_DESKTOP")?,
+            net_wm_window_type: intern(b"_NET_WM_WINDOW_TYPE")?,
+            net_wm_window_type_dialog: intern(b"_NET_WM_WINDOW_TYPE_DIALOG")?,
+            net_wm_window_type_utility: intern(b"_NET_WM_WINDOW_TYPE_UTILITY")?,
+            net_wm_window_type_toolbar: intern(b"_NET_WM_WINDOW_TYPE_TOOLBAR")?,
+            net_wm_window_type_menu: intern(b"_NET_WM_WINDOW_TYPE_MENU")?,
+            net_wm_window_type_dropdown_menu: intern(b"_NET_WM_WINDOW_TYPE_DROPDOWN_MENU")?,
+            net_wm_window_type_popup_menu: intern(b"_NET_WM_WINDOW_TYPE_POPUP_MENU")?,
+            net_wm_window_type_tooltip: intern(b"_NET_WM_WINDOW_TYPE_TOOLTIP")?,
+            net_wm_window_type_notification: intern(b"_NET_WM_WINDOW_TYPE_NOTIFICATION")?,
+            net_wm_window_type_splash: intern(b"_NET_WM_WINDOW_TYPE_SPLASH")?,
+            net_wm_window_type_dock: intern(b"_NET_WM_WINDOW_TYPE_DOCK")?,
+            net_wm_window_type_desktop: intern(b"_NET_WM_WINDOW_TYPE_DESKTOP")?,
+            net_wm_state: intern(b"_NET_WM_STATE")?,
+            net_wm_state_fullscreen: intern(b"_NET_WM_STATE_FULLSCREEN")?,
+            net_wm_state_above: intern(b"_NET_WM_STATE_ABOVE")?,
+            net_wm_state_below: intern(b"_NET_WM_STATE_BELOW")?,
+            net_wm_state_modal: intern(b"_NET_WM_STATE_MODAL")?,
+            net_wm_state_demands_attention: intern(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
+            net_wm_state_hidden: intern(b"_NET_WM_STATE_HIDDEN")?,
+            net_wm_state_sticky: intern(b"_NET_WM_STATE_STICKY")?,
+            net_wm_state_skip_taskbar: intern(b"_NET_WM_STATE_SKIP_TASKBAR")?,
+            net_wm_state_skip_pager: intern(b"_NET_WM_STATE_SKIP_PAGER")?,
+            net_wm_state_maximized_vert: intern(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
+            net_wm_state_maximized_horz: intern(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            net_active_window: intern(b"_NET_ACTIVE_WINDOW")?,
+            net_client_list: intern(b"_NET_CLIENT_LIST")?,
+            net_client_list_stacking: intern(b"_NET_CLIENT_LIST_STACKING")?,
+            net_supported: intern(b"_NET_SUPPORTED")?,
+            net_supporting_wm_check: intern(b"_NET_SUPPORTING_WM_CHECK")?,
+            net_wm_desktop: intern(b"_NET_WM_DESKTOP")?,
+            net_wm_allowed_actions: intern(b"_NET_WM_ALLOWED_ACTIONS")?,
+            net_wm_ping: intern(b"_NET_WM_PING")?,
+            net_close_window: intern(b"_NET_CLOSE_WINDOW")?,
+            net_move_resize_window: intern(b"_NET_MOVERESIZE_WINDOW")?,
+            net_request_frame_extents: intern(b"_NET_REQUEST_FRAME_EXTENTS")?,
+            net_workarea: intern(b"_NET_WORKAREA")?,
+            net_wm_strut: intern(b"_NET_WM_STRUT")?,
+            net_wm_strut_partial: intern(b"_NET_WM_STRUT_PARTIAL")?,
+            net_showing_desktop: intern(b"_NET_SHOWING_DESKTOP")?,
             net_number_of_desktops: intern(b"_NET_NUMBER_OF_DESKTOPS")?,
+            net_current_desktop: intern(b"_NET_CURRENT_DESKTOP")?,
+            net_desktop_names: intern(b"_NET_DESKTOP_NAMES")?,
+            utf8_string: intern(b"UTF8_STRING")?,
+            motif_wm_hints: intern(b"_MOTIF_WM_HINTS")?,
             no_animation: intern(b"_NO_ANIMATION")?,
+            rwm_monitor: intern(b"_RWM_MONITOR")?,
         };
 
         let (visual_id, depth) = bar_visual(&conn, root)?;
@@ -568,10 +906,12 @@ impl Wm {
             root,
             monitors,
             clients: Vec::new(),
+            iconified_stack: Vec::new(),
             selmon: 0,
             keys,
             keysyms,
             min_keycode,
+            max_keycode,
             atoms,
             metrics,
             drw,
@@ -620,6 +960,7 @@ impl Wm {
             finder_grabbed: false,
             finder_saved_focus: None,
             _cursor_loader: cursor_loader,
+            supporting_wm_check: NONE,
             restart: false,
         };
         // Initialize the notification GL state before the first D-Bus event.
@@ -643,6 +984,8 @@ impl Wm {
         wm.grab_keys(max_keycode)?;
         wm.init_xkb();
         wm.init_randr();
+        wm.setup_ewmh()?;
+        wm.scan_existing_windows()?;
         wm.conn.flush()?;
         Ok(wm)
     }
@@ -692,8 +1035,6 @@ impl Wm {
         self.update_kb();
     }
 
-    /// dwm's `getkblayout()`: pick the layout of the current XKB group out of
-    /// the `_XKB_RULES_NAMES` property.
     fn update_kb(&mut self) {
         let atom = self
             .conn
@@ -753,6 +1094,73 @@ impl Wm {
         }
     }
 
+    fn setup_ewmh(&mut self) -> Result {
+        // _NET_SUPPORTING_WM_CHECK
+        let check_win = self.conn.generate_id()?;
+        self.conn.create_window(
+            self.depth,
+            check_win,
+            self.root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual_id,
+            &CreateWindowAux::new(),
+        )?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            check_win,
+            self.atoms.net_supporting_wm_check,
+            AtomEnum::WINDOW,
+            &[check_win],
+        )?;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            check_win,
+            AtomEnum::WM_NAME,
+            self.atoms.utf8_string,
+            b"rwm",
+        )?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_supporting_wm_check,
+            AtomEnum::WINDOW,
+            &[check_win],
+        )?;
+        self.supporting_wm_check = check_win;
+        // _NET_SUPPORTED (advertise a subset we care about)
+        let supported = [
+            self.atoms.net_supported,
+            self.atoms.net_supporting_wm_check,
+            self.atoms.net_client_list,
+            self.atoms.net_client_list_stacking,
+            self.atoms.net_active_window,
+            self.atoms.net_wm_name,
+            self.atoms.net_wm_window_type,
+            self.atoms.net_wm_state,
+            self.atoms.net_wm_state_fullscreen,
+            self.atoms.net_wm_state_maximized_vert,
+            self.atoms.net_wm_state_maximized_horz,
+            self.atoms.net_wm_desktop,
+            self.atoms.net_current_desktop,
+            self.atoms.net_number_of_desktops,
+            self.atoms.net_workarea,
+            self.atoms.net_close_window,
+        ];
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_supported,
+            AtomEnum::ATOM,
+            &supported,
+        )?;
+        Ok(())
+    }
+
     fn grab_keys(&self, max_keycode: u8) -> Result {
         self.conn.ungrab_key(0u8, self.root, ModMask::ANY)?;
         for key in &self.keys {
@@ -772,6 +1180,102 @@ impl Wm {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn refresh_keysyms(&mut self) -> Result {
+        let count = (self.max_keycode - self.min_keycode + 1) as usize;
+        let map = self
+            .conn
+            .get_keyboard_mapping(self.min_keycode, count as u8)?
+            .reply()?;
+        let per = map.keysyms_per_keycode as usize;
+        self.keysyms = (0..count).map(|i| map.keysyms.get(i * per).copied().unwrap_or(0)).collect();
+        self.grab_keys(self.max_keycode)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Adopt existing top-level windows (startup scan).
+    ///
+    /// Map state must not be used as a filter here: the previous WM unmaps
+    /// windows on workspaces other than the one it was showing, so those
+    /// clients would never be registered and would stay unmapped forever even
+    /// after switching to their workspace. Adopt every non-override-redirect
+    /// child and keep the workspace recorded in `_NET_WM_DESKTOP` so hidden
+    /// clients stay hidden until their workspace is selected.
+    fn scan_existing_windows(&mut self) -> Result {
+        let reply = match self.conn.query_tree(self.root) {
+            Ok(c) => match c.reply() {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            },
+            Err(_) => return Ok(()),
+        };
+        // Collect our own windows to avoid managing them. The EWMH check window
+        // is not override-redirect and not mapped, so it needs an explicit entry.
+        let mut ours = std::collections::HashSet::new();
+        for m in &self.monitors {
+            ours.insert(m.barwin);
+            ours.insert(m.bartitlewin);
+            ours.insert(m.barcenterwin);
+            ours.insert(m.barkbwin);
+            ours.insert(m.barrightwin);
+            ours.insert(m.mpris_markerwin);
+            ours.insert(m.finder_markerwin);
+        }
+        ours.insert(self.supporting_wm_check);
+        // A previous WM that does not publish _NET_WM_DESKTOP (vanilla dwm is
+        // one) leaves hidden windows with no record of their workspace. Keep
+        // them off the workspace selected now instead of dumping them all
+        // there; the next tag is an arbitrary but stable landing place where
+        // they can be found and mapped later.
+        let pointer = self
+            .conn
+            .query_pointer(self.root)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let mi = pointer
+            .map(|p| self.monitor_at(p.root_x as i32, p.root_y as i32))
+            .unwrap_or(self.selmon);
+        let cur = self.tags_of(mi);
+        let offscreen_tags = if cur.count_ones() == 1 {
+            let next = (cur.trailing_zeros() as usize + 1) % TAG_COUNT as usize;
+            1u32 << next
+        } else {
+            1u32 << 1
+        };
+        for &win in &reply.children {
+            if ours.contains(&win) || self.is_managed(win) {
+                continue;
+            }
+            let attrs = match self.conn.get_window_attributes(win) {
+                Ok(c) => match c.reply() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            if attrs.override_redirect || attrs.class == WindowClass::INPUT_ONLY {
+                continue;
+            }
+            if self.should_ignore_window(win) {
+                let _ = self.conn.configure_window(
+                    win,
+                    &x11rb::protocol::xproto::ConfigureWindowAux::new().border_width(0),
+                );
+                continue;
+            }
+            let hidden = attrs.map_state != x11rb::protocol::xproto::MapState::VIEWABLE;
+            let tags = self
+                .read_net_wm_desktop(win)
+                .and_then(Self::desktop_to_tags)
+                .or_else(|| hidden.then_some(offscreen_tags));
+            let initial_mon = self
+                .read_rwm_monitor(win)
+                .and_then(|r| self.monitor_for_saved_rect(r));
+            let _ = self.manage_on(win, tags, initial_mon);
         }
         Ok(())
     }
@@ -828,8 +1332,11 @@ impl Wm {
         m.tagset[m.seltags]
     }
 
+    /// A client counts as visible only when its tags are selected and it is not
+    /// iconified. Iconified clients keep their tree leaf, client-list entry and
+    /// geometry, but take no tile, cannot be focused and stay unmapped.
     fn is_visible(&self, c: &Client) -> bool {
-        c.tags & self.tags_of(c.mon) != 0
+        c.tags & self.tags_of(c.mon) != 0 && !c.hidden
     }
 
     /// Visible windows on `mi` in stack order, like dwm's `ISVISIBLE` walk.
@@ -839,6 +1346,25 @@ impl Wm {
             .filter(|c| c.mon == mi && self.is_visible(c))
             .map(|c| c.win)
             .collect()
+    }
+
+    /// First visible fullscreen client on `mi`, if any. `apply_layout()` picks
+    /// the per-monitor owner with the same rule, so callers that need to mirror
+    /// its map decision (e.g. Alt+Tab) use this helper.
+    fn fullscreen_owner(&self, mi: usize) -> Option<(usize, Window)> {
+        self.clients
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.fullscreen && c.mon == mi && self.is_visible(c))
+            .map(|(idx, c)| (idx, c.win))
+    }
+
+    /// Whether `win` may be mapped while `fs_owner` owns its monitor. The
+    /// fullscreen client itself and floating windows (dialogs spawned after
+    /// fullscreen, overlays brought up with Alt+Tab) are allowed; tiled windows
+    /// stay hidden behind the fullscreen client.
+    fn map_allowed(win: Window, floating: bool, fs_owner: Option<Window>) -> bool {
+        fs_owner.is_none_or(|owner| owner == win || floating)
     }
 
     fn is_managed(&self, win: Window) -> bool {
@@ -882,7 +1408,234 @@ impl Wm {
             inc_h: inc_h.max(0),
             min_aspect,
             max_aspect,
+            requested_pos: parsed.position.map(|(_, x, y)| (x, y)),
+            user_position: matches!(
+                parsed.position,
+                Some((WmSizeHintsSpecification::UserSpecified, _, _))
+            ),
+            requested_size: parsed.size.map(|(_, w, h)| (w, h)),
+            gravity: parsed.win_gravity,
         })
+    }
+
+    fn read_wm_hints(&self, win: Window) -> (bool, bool) {
+        // returns (wants_input, urgent); defaults (true, false)
+        let Ok(cookie) = self.conn.get_property(false, win, AtomEnum::WM_HINTS, AtomEnum::ANY, 0, 9) else {
+            return (true, false);
+        };
+        let Ok(reply) = cookie.reply() else { return (true, false); };
+        let vals: Vec<u32> = reply.value32().map(|it| it.collect()).unwrap_or_default();
+        if vals.is_empty() { return (true, false); }
+        let flags = vals[0];
+        let input_hint = (flags & (1 << 0)) != 0;
+        let urgency_hint = (flags & (1 << 8)) != 0;
+        let wants_input = if input_hint && vals.len() >= 2 { vals[1] != 0 } else { true };
+        (wants_input, urgency_hint)
+    }
+
+    fn read_transient_for(&self, win: Window) -> Option<Window> {
+        self.conn
+            .get_property(false, win, self.atoms.wm_transient_for, AtomEnum::WINDOW, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut it| it.next()))
+    }
+
+    fn read_net_wm_state(&self, win: Window) -> Vec<u32> {
+        self.conn
+            .get_property(false, win, self.atoms.net_wm_state, AtomEnum::ATOM, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|it| it.collect()))
+            .unwrap_or_default()
+    }
+
+    fn read_net_wm_state_modal(&self, win: Window) -> bool {
+        self.read_net_wm_state(win)
+            .contains(&self.atoms.net_wm_state_modal)
+    }
+
+    /// Workspace the previous WM recorded for `win`, if any. Application-sent
+    /// `_NET_WM_DESKTOP` messages are ignored (see `client_message`), but at
+    /// startup this property is the only way to tell where a window that is
+    /// currently unmapped belongs.
+    fn read_net_wm_desktop(&self, win: Window) -> Option<u32> {
+        self.conn
+            .get_property(
+                false,
+                win,
+                self.atoms.net_wm_desktop,
+                AtomEnum::CARDINAL,
+                0,
+                1,
+            )
+            .ok()?
+            .reply()
+            .ok()?
+            .value32()?
+            .next()
+    }
+
+    /// Turn an EWMH desktop index into the tag bit rwm uses internally.
+    /// 0xFFFFFFFF means "all desktops", matching `set_client_desktop`.
+    fn desktop_to_tags(desk: u32) -> Option<u32> {
+        if desk == 0xFFFF_FFFF {
+            Some(TAGMASK)
+        } else if desk < TAG_COUNT {
+            Some(1u32 << desk)
+        } else {
+            None
+        }
+    }
+
+    fn read_rwm_monitor(&self, win: Window) -> Option<Rect> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                win,
+                self.atoms.rwm_monitor,
+                AtomEnum::CARDINAL,
+                0,
+                4,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        let mut vals = reply.value32()?;
+        let x = vals.next()? as i32;
+        let y = vals.next()? as i32;
+        let w = vals.next()?;
+        let h = vals.next()?;
+        Some(Rect { x, y, w, h })
+    }
+
+    fn monitor_for_saved_rect(&self, rect: Rect) -> Option<usize> {
+        if let Some((i, _)) = self.monitors.iter().enumerate().find(|(_, m)| m.rect == rect) {
+            return Some(i);
+        }
+        let cx = rect.x + rect.w as i32 / 2;
+        let cy = rect.y + rect.h as i32 / 2;
+        Some(self.monitor_at(cx, cy))
+    }
+
+    fn set_rwm_monitor(&self, win: Window, mi: usize) -> Result {
+        let Some(m) = self.monitors.get(mi) else {
+            return Ok(());
+        };
+        let r = m.rect;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            self.atoms.rwm_monitor,
+            AtomEnum::CARDINAL,
+            &[r.x as u32, r.y as u32, r.w, r.h],
+        )?;
+        Ok(())
+    }
+
+    fn read_wm_class(&self, win: Window) -> Option<(String, String)> {
+        let reply = self
+            .conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 64)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.value.is_empty() {
+            return None;
+        }
+        let mut parts = reply
+            .value
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+        let instance = parts.next()?;
+        let class = parts.next().unwrap_or_default();
+        Some((instance, class))
+    }
+
+    fn read_window_name(&self, win: Window) -> String {
+        let utf8 = self
+            .conn
+            .get_property(
+                false,
+                win,
+                self.atoms.net_wm_name,
+                self.atoms.utf8_string,
+                0,
+                256,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok());
+        if let Some(r) = utf8.filter(|r| !r.value.is_empty()) {
+            return String::from_utf8_lossy(&r.value).into_owned();
+        }
+        self.conn
+            .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+            .unwrap_or_default()
+    }
+
+    fn should_ignore_window(&self, win: Window) -> bool {
+        if let Some((instance, class)) = self.read_wm_class(win) {
+            if instance.eq_ignore_ascii_case("picom") || class.eq_ignore_ascii_case("picom") {
+                return true;
+            }
+        }
+        let name = self.read_window_name(win);
+        name.starts_with("Qt Selection Owner for ")
+            || name.starts_with("Qt Clipboard Owner for ")
+    }
+
+    fn read_win_type(&self, win: Window) -> WinType {
+        let cookie = match self.conn.get_property(
+            false,
+            win,
+            self.atoms.net_wm_window_type,
+            AtomEnum::ATOM,
+            0,
+            16,
+        ) {
+            Ok(c) => c,
+            Err(_) => return WinType::Normal,
+        };
+        let reply = match cookie.reply() {
+            Ok(r) => r,
+            Err(_) => return WinType::Normal,
+        };
+        if reply.format == 0 {
+            return WinType::Normal;
+        }
+        if let Some(atoms) = reply.value32() {
+            for a in atoms {
+                if a == self.atoms.net_wm_window_type_dialog {
+                    return WinType::Dialog;
+                } else if a == self.atoms.net_wm_window_type_utility {
+                    return WinType::Utility;
+                } else if a == self.atoms.net_wm_window_type_toolbar {
+                    return WinType::Toolbar;
+                } else if a == self.atoms.net_wm_window_type_menu {
+                    return WinType::Menu;
+                } else if a == self.atoms.net_wm_window_type_dropdown_menu {
+                    return WinType::DropdownMenu;
+                } else if a == self.atoms.net_wm_window_type_popup_menu {
+                    return WinType::PopupMenu;
+                } else if a == self.atoms.net_wm_window_type_tooltip {
+                    return WinType::Tooltip;
+                } else if a == self.atoms.net_wm_window_type_notification {
+                    return WinType::Notification;
+                } else if a == self.atoms.net_wm_window_type_splash {
+                    return WinType::Splash;
+                } else if a == self.atoms.net_wm_window_type_dock {
+                    return WinType::Dock;
+                } else if a == self.atoms.net_wm_window_type_desktop {
+                    return WinType::Desktop;
+                }
+            }
+        }
+        WinType::Normal
     }
 
     /// The monitor's area below the bar, set by `update_bar_pos`.
@@ -905,8 +1658,18 @@ impl Wm {
             .collect()
     }
 
-    /// The outer box `win` is drawn in: its floating geometry or its tile.
+    /// The outer box `win` is drawn in: the monitor for a fullscreen client,
+    /// otherwise its floating geometry or its tile.
     fn geometry(&self, mi: usize, win: Window) -> Option<Rect> {
+        if let Some(c) = self.clients.iter().find(|c| c.win == win && c.fullscreen) {
+            let m = self.monitors[c.mon].rect;
+            return Some(Rect {
+                x: m.x,
+                y: m.y,
+                w: m.w,
+                h: m.h,
+            });
+        }
         if let Some(c) = self
             .clients
             .iter()
@@ -918,6 +1681,28 @@ impl Wm {
             .into_iter()
             .find(|(w, _)| *w == win)
             .map(|(_, r)| r)
+    }
+
+    /// The box of a client's transient parent, when it is managed. A tiled
+    /// parent has no `geom`, so this uses its actual layout/frame geometry.
+    fn transient_geometry(&self, transient: Option<Window>, fallback_mon: usize) -> Option<Rect> {
+        let parent = transient?;
+        let pm = self
+            .clients
+            .iter()
+            .find(|c| c.win == parent)
+            .map(|c| c.mon)
+            .unwrap_or(fallback_mon);
+        self.geometry(pm, parent)
+    }
+
+    /// Where an automatically placed floating window goes after a resize that
+    /// did not come with a new position: on its parent, or work-area center.
+    fn auto_float_origin(&self, c: &Client, w: i32, h: i32) -> (i32, i32) {
+        let area = self
+            .transient_geometry(c.transient_for, c.mon)
+            .unwrap_or_else(|| self.work(c.mon));
+        centered_in(area, w, h)
     }
 
     /// dwm's `getgaps()`: the gaps in use for the current window count.
@@ -1242,16 +2027,8 @@ impl Wm {
         w.min(budget)
     }
 
-    /// rwm has no `Client::isfullscreen` flag, so use the same geometry test as
-    /// `finder_open()`: a selected client covering its monitor is fullscreen.
     fn monitor_fullscreen(&self, mi: usize) -> bool {
-        let m = &self.monitors[mi];
-        m.sel.is_some_and(|w| {
-            self.clients
-                .iter()
-                .find(|c| c.win == w)
-                .is_some_and(|c| c.geom.w >= m.rect.w && c.geom.h >= m.rect.h)
-        })
+        self.clients.iter().any(|c| c.fullscreen && c.mon == mi && self.is_visible(c))
     }
 
     /// Owner of a monitor's center window, with Finder overriding notification.
@@ -1431,7 +2208,14 @@ impl Wm {
     /// dwm's `configure()`: tells the client the geometry the WM settled on.
     /// The X server also reports the real configure, but the explicit one is
     /// what dwm sends and some clients rely on it to repaint during a drag.
-    fn send_configure(&self, win: Window, rect: Rect, inner_w: u32, inner_h: u32) -> Result {
+    fn send_configure(
+        &self,
+        win: Window,
+        rect: Rect,
+        inner_w: u32,
+        inner_h: u32,
+        border: u32,
+    ) -> Result {
         let event = ConfigureNotifyEvent {
             response_type: CONFIGURE_NOTIFY_EVENT,
             sequence: 0,
@@ -1442,7 +2226,7 @@ impl Wm {
             y: rect.y as i16,
             width: inner_w as u16,
             height: inner_h as u16,
-            border_width: BORDERPX as u16,
+            border_width: border as u16,
             override_redirect: false,
         };
         self.conn
@@ -1454,23 +2238,26 @@ impl Wm {
     /// when the geometry changed. Returns the geometry actually applied, after
     /// `WM_NORMAL_HINTS` for floating clients, and whether it changed.
     fn place_client(&self, c: &Client, rect: Rect) -> Result<(Rect, bool)> {
-        let rect = if c.floating {
-            constrain_size(&c.hints, rect, BORDERPX, self.bar_h())
+        let border = client_border(c);
+        // A fullscreen client owns the whole monitor: no border and no size
+        // hint clamping, so its content matches the screen exactly.
+        let rect = if c.floating && !c.fullscreen {
+            constrain_size(&c.hints, rect, border, self.bar_h())
         } else {
             rect
         };
-        let inner_w = (rect.w as i32 - 2 * BORDERPX).max(1) as u32;
-        let inner_h = (rect.h as i32 - 2 * BORDERPX).max(1) as u32;
+        let inner_w = (rect.w as i32 - 2 * border).max(1) as u32;
+        let inner_h = (rect.h as i32 - 2 * border).max(1) as u32;
         let changed = self.configure_cached(
             c.win,
             rect.x,
             rect.y,
             inner_w as i32,
             inner_h as i32,
-            BORDERPX as u32,
+            border as u32,
         )?;
         if changed {
-            self.send_configure(c.win, rect, inner_w, inner_h)?;
+            self.send_configure(c.win, rect, inner_w, inner_h, border as u32)?;
         }
         Ok((rect, changed))
     }
@@ -1480,7 +2267,9 @@ impl Wm {
     fn resize_bar_win(&self, mi: usize) -> Result {
         let m = &self.monitors[mi];
         let bh = self.bar_h();
-        if !m.showbar {
+        // If any fullscreen client is on this monitor, hide the bar entirely.
+        let has_fullscreen = self.clients.iter().any(|c| c.fullscreen && c.mon == mi && self.is_visible(c));
+        if !m.showbar || has_fullscreen {
             for win in [
                 m.barwin,
                 m.bartitlewin,
@@ -1489,6 +2278,7 @@ impl Wm {
                 m.barrightwin,
             ] {
                 self.place_cached(win, m.wx, m.by, 1, bh)?;
+                self.set_mapped(win, false)?;
             }
             self.set_mapped(m.mpris_markerwin, false)?;
             self.unmap_finder_marker(mi)?;
@@ -1501,6 +2291,7 @@ impl Wm {
         let rx = lx + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw;
 
         self.place_cached(m.barwin, lx, m.by, b.tw, bh)?;
+        self.set_mapped(m.barwin, true)?;
 
         let kx = lx + b.tw + BARGAP;
         self.place_cached(m.barkbwin, kx, m.by, b.kw, bh)?;
@@ -1530,8 +2321,6 @@ impl Wm {
             }
             self.clock_place(mi).is_some()
         };
-        // dwm unmaps the center window over fullscreen content, even if a
-        // notification is pending. The queue is cleared when fullscreen starts.
         if self.monitor_fullscreen(mi) {
             show_clock = false;
         }
@@ -1539,8 +2328,6 @@ impl Wm {
         let was_shown = self.center_shown.borrow()[mi];
         if was_shown != show_clock {
             self.center_shown.borrow_mut()[mi] = show_clock;
-            // A remapped clock window needs an explicit repaint even when its
-            // text and size match the last draw.
             if show_clock {
                 self.force_windows.borrow_mut().insert(m.barcenterwin);
                 if notification_center {
@@ -1785,13 +2572,17 @@ impl Wm {
                     }
                     let area = self.tile_area(target);
                     let tags = self.tags_of(target);
-                    let t = &mut self.monitors[target];
-                    t.tree = Some(tree::append(t.tree.take(), win, area));
+                    {
+                        let t = &mut self.monitors[target];
+                        t.tree = Some(tree::append(t.tree.take(), win, area));
+                        if t.sel.is_none() {
+                            t.sel = Some(win);
+                        }
+                    }
                     self.clients[ci].mon = target;
                     self.clients[ci].tags = tags;
-                    if t.sel.is_none() {
-                        t.sel = Some(win);
-                    }
+                    let _ = self.set_client_desktop(win, tags);
+                    let _ = self.set_rwm_monitor(win, target);
                 }
             }
             self.destroy_monitor_ui(old);
@@ -1834,6 +2625,9 @@ impl Wm {
         self.clock_drawn.borrow_mut().clear();
         self.geom_cache.borrow_mut().clear();
         self.bar_dirty = true;
+        for c in &self.clients {
+            let _ = self.set_rwm_monitor(c.win, c.mon);
+        }
         self.arrange()
     }
 
@@ -1871,9 +2665,169 @@ impl Wm {
         Ok(())
     }
 
+    fn update_client_list(&self) -> Result {
+        let wins: Vec<u32> = self.clients.iter().map(|c| c.win).collect();
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_client_list,
+            AtomEnum::WINDOW,
+            &wins,
+        )?;
+        Ok(())
+    }
+
+    fn update_client_list_stacking(&self) -> Result {
+        // Bottom to top: reverse of clients list? clients is newest-first in our model;
+        // stacking order in our model is roughly that order on top; for simplicity use clients order reversed
+        let wins: Vec<u32> = self.clients.iter().rev().map(|c| c.win).collect();
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_client_list_stacking,
+            AtomEnum::WINDOW,
+            &wins,
+        )?;
+        Ok(())
+    }
+
+    fn update_active_window(&self) -> Result {
+        let sel = self.monitors.get(self.selmon).and_then(|m| m.sel).unwrap_or(0);
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_active_window,
+            AtomEnum::WINDOW,
+            &[sel],
+        )?;
+        Ok(())
+    }
+
+    fn set_client_desktop(&self, win: Window, tags: u32) -> Result {
+        let desk = if tags == 0 || tags == !0 {
+            // treat all-set or invalid as sticky
+            0xFFFFFFFFu32
+        } else if tags.count_ones() != 1 {
+            0xFFFFFFFFu32
+        } else {
+            tags.trailing_zeros()
+        };
+        if desk == 0xFFFFFFFF || desk < TAG_COUNT {
+            let _ = self.conn.change_property32(
+                PropMode::REPLACE,
+                win,
+                self.atoms.net_wm_desktop,
+                AtomEnum::CARDINAL,
+                &[desk],
+            );
+        }
+        Ok(())
+    }
+
+    fn update_workarea(&self) -> Result {
+        let mut data: Vec<u32> = Vec::new();
+        for m in &self.monitors {
+            let wa = self.work_area_for_monitor(m);
+            data.push(wa.x.max(0) as u32);
+            data.push(wa.y.max(0) as u32);
+            data.push(wa.w);
+            data.push(wa.h);
+        }
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_workarea,
+            AtomEnum::CARDINAL,
+            &data,
+        )?;
+        Ok(())
+    }
+
+    fn work_area_for_monitor(&self, m: &Monitor) -> Rect {
+        let mut wa = if m.showbar {
+            if TOPBAR {
+                Rect {
+                    x: m.rect.x,
+                    y: m.rect.y + self.bar_h(),
+                    w: m.rect.w,
+                    h: m.rect.h.saturating_sub(self.bar_h() as u32),
+                }
+            } else {
+                Rect {
+                    x: m.rect.x,
+                    y: m.rect.y,
+                    w: m.rect.w,
+                    h: m.rect.h.saturating_sub(self.bar_h() as u32),
+                }
+            }
+        } else {
+            m.rect
+        };
+        // Heuristic STRUT application: only apply left to leftmost monitor, right to rightmost, etc.
+        let min_x = self.monitors.iter().map(|mm| mm.rect.x).min().unwrap_or(0);
+        let max_x = self.monitors.iter().map(|mm| mm.rect.x + mm.rect.w as i32).max().unwrap_or(0);
+        let min_y = self.monitors.iter().map(|mm| mm.rect.y).min().unwrap_or(0);
+        let max_y = self.monitors.iter().map(|mm| mm.rect.y + mm.rect.h as i32).max().unwrap_or(0);
+        let is_leftmost = m.rect.x == min_x;
+        let is_rightmost = (m.rect.x + m.rect.w as i32) == max_x;
+        let is_topmost = m.rect.y == min_y;
+        let is_bottommost = (m.rect.y + m.rect.h as i32) == max_y;
+        // Apply STRUTs: use cached atoms
+        for c in &self.clients {
+            let mut v4: Option<[u32; 4]> = None;
+            if let Ok(prop) = self.conn.get_property(false, c.win, self.atoms.net_wm_strut_partial, AtomEnum::CARDINAL, 0, 12) {
+                if let Ok(r2) = prop.reply() {
+                    if let Some(vals) = r2.value32() {
+                        let v: Vec<u32> = vals.collect();
+                        if v.len() >= 4 {
+                            v4 = Some([v[0], v[1], v[2], v[3]]);
+                        }
+                    }
+                }
+            }
+            if v4.is_none() {
+                if let Ok(prop) = self.conn.get_property(false, c.win, self.atoms.net_wm_strut, AtomEnum::CARDINAL, 0, 4) {
+                    if let Ok(r2) = prop.reply() {
+                        if let Some(vals) = r2.value32() {
+                            let v: Vec<u32> = vals.collect();
+                            if v.len() >= 4 {
+                                v4 = Some([v[0], v[1], v[2], v[3]]);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(v) = v4 {
+                let left = v[0] as i32;
+                let right = v[1] as i32;
+                let top = v[2] as i32;
+                let bottom = v[3] as i32;
+                if is_leftmost && left > 0 {
+                    wa.x = wa.x.max(m.rect.x + left);
+                }
+                if is_topmost && top > 0 {
+                    wa.y = wa.y.max(m.rect.y + top);
+                }
+                let right_edge = if is_rightmost && right > 0 {
+                    (m.rect.x + m.rect.w as i32 - right).min(wa.x + wa.w as i32)
+                } else {
+                    wa.x + wa.w as i32
+                };
+                let bottom_edge = if is_bottommost && bottom > 0 {
+                    (m.rect.y + m.rect.h as i32 - bottom).min(wa.y + wa.h as i32)
+                } else {
+                    wa.y + wa.h as i32
+                };
+                wa.w = (right_edge - wa.x).max(0) as u32;
+                wa.h = (bottom_edge - wa.y).max(0) as u32;
+            }
+        }
+        wa
+    }
+
     /// dwm's `focus()`: gives the selected window of the selected monitor the
     /// focus border colour and every other window the normal one.
-    fn focus(&self) -> Result {
+    fn focus(&mut self) -> Result {
         let sel = self.monitors[self.selmon].sel;
         for c in &self.clients {
             let pixel = if Some(c.win) == sel {
@@ -1891,19 +2845,166 @@ impl Wm {
         // X input focus to a client behind the popup.
         if self.finder.is_active() {
             self.conn.flush()?;
+            let _ = self.update_active_window();
             return Ok(());
         }
         let target = sel.unwrap_or(self.root);
+        let mut focus_target = target;
+        if sel.is_some_and(|w| self.clients.iter().any(|c| c.win == w && c.hidden)) {
+            // Iconified windows are unmapped; X would refuse to focus them.
+            // Drop the stale selection so _NET_ACTIVE_WINDOW does not name one.
+            self.monitors[self.selmon].sel = None;
+            focus_target = self.root;
+        } else if let Some(win) = sel {
+            if let Some(c) = self.clients.iter().find(|cc| cc.win == win) {
+                if c.take_focus {
+                    let ev = ClientMessageEvent::new(
+                        32,
+                        win,
+                        self.atoms.wm_protocols,
+                        [self.atoms.wm_take_focus, CURRENT_TIME, 0, 0, 0],
+                    );
+                    let _ = self.conn.send_event(false, win, EventMask::NO_EVENT, ev);
+                }
+                // If client does not want input and doesn't use take_focus, avoid focusing it
+                if !c.wants_input && !c.take_focus {
+                    focus_target = self.root;
+                } else {
+                    focus_target = win;
+                }
+            }
+        } else {
+            focus_target = self.root;
+        }
         self.conn
-            .set_input_focus(InputFocus::POINTER_ROOT, target, CURRENT_TIME)?;
+            .set_input_focus(InputFocus::POINTER_ROOT, focus_target, CURRENT_TIME)?;
+        // Clear urgency/demands_attention on focused client
+        if let Some(win) = sel {
+            if let Some(idx) = self.clients.iter().position(|c| c.win == win) {
+                if self.clients[idx].demands_attention || self.clients[idx].urgent {
+                    self.clients[idx].demands_attention = false;
+                    self.clients[idx].urgent = false;
+                    let _ = self.sync_client_wm_state(&self.clients[idx]);
+                }
+            }
+        }
+        let _ = self.update_active_window();
         self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Unmap a client that is not visible on the current tag set.
+    ///
+    /// Drop the cached geometry for every hidden client, fullscreen ones
+    /// included. Games often resize their render buffer on `UnmapNotify` or
+    /// when they remap; without a fresh configure and synthetic
+    /// `ConfigureNotify` on the way back, they keep the smaller tile size while
+    /// the X window itself is fullscreen, leaving black borders. The reconfigure
+    /// always uses the fullscreen geometry, so it cannot shrink the client out
+    /// of fullscreen.
+    fn unmap_hidden_client(&self, c: &Client) -> Result {
+        self.geom_cache.borrow_mut().remove(&c.win);
+        self.conn.unmap_window(c.win)?;
+        Ok(())
+    }
+
+    /// Publish ICCCM `WM_STATE`. Panels use IconicState to show a client as
+    /// minimized, so unmapping the X window alone is not enough to be iconic.
+    fn sync_wm_state(&self, c: &Client) -> Result {
+        let state = if c.hidden { WM_STATE_ICONIC } else { WM_STATE_NORMAL };
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            c.win,
+            self.atoms.wm_state,
+            self.atoms.wm_state,
+            &[state, 0], // state, icon_window (None)
+        )?;
+        Ok(())
+    }
+
+    /// Flip a client's hidden state, keeping the restore stack and both state
+    /// properties in sync. Callers run `arrange()` afterwards to apply mapping.
+    fn set_hidden(&mut self, win: Window, hidden: bool) -> Result {
+        let Some(idx) = self.clients.iter().position(|c| c.win == win) else {
+            return Ok(());
+        };
+        if self.clients[idx].hidden == hidden {
+            return Ok(());
+        }
+        self.clients[idx].hidden = hidden;
+        self.iconified_stack.retain(|&w| w != win);
+        if hidden {
+            self.iconified_stack.push(win);
+        }
+        let c = &self.clients[idx];
+        let _ = self.sync_client_wm_state(c);
+        let _ = self.sync_wm_state(c);
+        Ok(())
+    }
+
+    /// Super+H: iconify the focused client. `arrange()` then unmaps it, lets its
+    /// tile collapse and focuses the next visible client on the same monitor.
+    fn iconify(&mut self) -> Result {
+        let Some(win) = self.monitors[self.selmon].sel else {
+            return Ok(());
+        };
+        self.set_hidden(win, true)?;
+        self.arrange()
+    }
+
+    /// Map a hidden client, switching to its tag and monitor when needed so the
+    /// restored window is actually on screen, then select and focus it.
+    fn restore_client(&mut self, win: Window) -> Result {
+        let Some((mi, tags)) = self
+            .clients
+            .iter()
+            .find(|c| c.win == win)
+            .map(|c| (c.mon, c.tags & TAGMASK))
+        else {
+            return Ok(());
+        };
+        self.set_hidden(win, false)?;
+        self.selmon = mi;
+        self.monitors[mi].sel = Some(win);
+        if tags != 0 && tags != self.tags_of(mi) {
+            // view() arranges and focuses the selection we just set.
+            return self.view(tags);
+        }
+        self.arrange()
+    }
+
+    /// Super+Shift+H: restore the most recently iconified client, regardless of
+    /// which window is focused now. Stale stack entries are skipped so repeated
+    /// presses restore every window that was hidden, newest first.
+    fn deiconify(&mut self) -> Result {
+        while let Some(win) = self.iconified_stack.pop() {
+            if self.clients.iter().any(|c| c.win == win && c.hidden) {
+                return self.restore_client(win);
+            }
+        }
         Ok(())
     }
 
     fn apply_layout(&mut self) -> Result {
         let mut boxes: Vec<(Window, Rect, bool)> = Vec::new();
+        // A fullscreen client covers its own monitor, not the whole screen
+        // array. Pick the topmost visible fullscreen client per monitor so
+        // monitor 1 and monitor 2 can both be fullscreen at the same time.
+        let fullscreen: Vec<Option<(usize, Window)>> = (0..self.monitors.len())
+            .map(|mi| self.fullscreen_owner(mi))
+            .collect();
+        let fs_on = |mi: usize| fullscreen.get(mi).copied().flatten();
+
         for mi in 0..self.monitors.len() {
             self.resize_bar_win(mi)?;
+            if let Some((fidx, fwin)) = fs_on(mi) {
+                let mrect = self.monitors[mi].rect;
+                let frect = Rect { x: mrect.x, y: mrect.y, w: mrect.w, h: mrect.h };
+                let (rect, changed) = self.place_client(&self.clients[fidx], frect)?;
+                self.clients[fidx].geom = rect;
+                boxes.push((fwin, rect, changed));
+                continue;
+            }
             for (win, r) in self.layout_mon(mi) {
                 let Some(idx) = self.clients.iter().position(|c| c.win == win) else {
                     continue;
@@ -1913,7 +3014,10 @@ impl Wm {
                 boxes.push((win, rect, changed));
             }
         }
-        // Oldest first, so the newest floating window ends up on top.
+
+        // Oldest first, so the newest floating window ends up on top. Floating
+        // windows are placed on fullscreen monitors too, so a dialog spawned
+        // over a fullscreen client still gets configured and stacked above it.
         let floating: Vec<(usize, Rect)> = self
             .clients
             .iter()
@@ -1937,25 +3041,23 @@ impl Wm {
         for c in self
             .clients
             .iter()
-            .filter(|c| c.dragging && self.is_visible(c))
+            .filter(|c| c.dragging && self.is_visible(c) && fs_on(c.mon).is_none())
         {
             boxes.push((c.win, c.geom, false));
         }
-        let shown: HashSet<Window> = self
-            .clients
-            .iter()
-            .filter(|c| self.is_visible(c))
-            .map(|c| c.win)
-            .collect();
+
+        // On a fullscreen monitor only its owner and floating windows are
+        // mapped; tiled windows stay hidden behind it. `view()` changes the tag
+        // set before `arrange()` runs, so windows from the tag we just switched
+        // away from are no longer "visible" here and must not be left mapped on
+        // top of the fullscreen window.
         for c in &self.clients {
-            if shown.contains(&c.win) {
+            let shown = self.is_visible(c)
+                && Self::map_allowed(c.win, c.floating, fs_on(c.mon).map(|(_, w)| w));
+            if shown {
                 self.conn.map_window(c.win)?;
             } else {
-                // Drop the cached geometry while hidden. A client may change its
-                // own size on UnmapNotify, and the next arrange must configure
-                // it again when its tag becomes visible.
-                self.geom_cache.borrow_mut().remove(&c.win);
-                self.conn.unmap_window(c.win)?;
+                self.unmap_hidden_client(c)?;
             }
         }
         for idx in 0..self.clients.len() {
@@ -1963,8 +3065,6 @@ impl Wm {
             match boxes.iter().find(|(w, _, _)| *w == win) {
                 Some((_, r, changed)) => {
                     let zones = self.clients[idx].edge_wins;
-                    // Floating clients are restacked above on every layout, so
-                    // their zones need to follow even when the box is unchanged.
                     let restack =
                         *changed || self.clients[idx].floating || self.clients[idx].dragging;
                     self.place_edge_zones(zones, win, *r, restack)?;
@@ -2051,42 +3151,113 @@ impl Wm {
             self.sync_tree(mi);
         }
         self.apply_layout()?;
-        self.focus()
+        // Minimal restack for above/below (avoid conflict: above wins)
+        for c in self.clients.iter().rev() {
+            if c.below && !c.above && self.is_visible(c) {
+                let _ = self.conn.configure_window(c.win, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW));
+            }
+        }
+        for c in &self.clients {
+            if c.above && self.is_visible(c) {
+                let _ = self.conn.configure_window(c.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+            }
+        }
+        self.focus()?;
+        let _ = self.update_client_list();
+        let _ = self.update_client_list_stacking();
+        let _ = self.update_workarea();
+        Ok(())
     }
 
     fn manage(&mut self, win: Window) -> Result {
+        self.manage_on(win, None, None)
+    }
+
+    /// Adopt `win`. `initial_tags`/`initial_mon` are only passed by the startup
+    /// scan: a window hidden on another workspace or monitor must not inherit
+    /// the monitor/workspace that happens to be selected when rwm starts.
+    fn manage_on(
+        &mut self,
+        win: Window,
+        initial_tags: Option<u32>,
+        initial_mon: Option<usize>,
+    ) -> Result {
+        let attrs = self
+            .conn
+            .get_window_attributes(win)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        if attrs
+            .as_ref()
+            .is_some_and(|a| a.override_redirect || a.class == WindowClass::INPUT_ONLY)
+        {
+            return Ok(());
+        }
+        if self.should_ignore_window(win) {
+            return Ok(());
+        }
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
         let (mx, my) = (pointer.root_x as i32, pointer.root_y as i32);
-        let mi = self.monitor_at(mx, my);
+        let mi = initial_mon
+            .filter(|&m| m < self.monitors.len())
+            .unwrap_or_else(|| self.monitor_at(mx, my));
 
-        let leaves = self.layout_mon(mi);
-        let work = self.tile_area(mi);
-        let target = leaves
-            .iter()
-            .copied()
-            .find(|(_, r)| r.contains(mx, my))
-            .or(leaves.last().copied());
-        let tree = &mut self.monitors[mi].tree;
-        match target {
-            Some((target, rect)) => {
-                let (new_first, side_by_side) = tree::split_for_drop(rect, (mx, my));
-                if let Some(t) = tree.as_mut() {
-                    t.insert(target, win, new_first, side_by_side);
+        let hints = self.read_size_hints(win).unwrap_or_default();
+        let transient_for = self.read_transient_for(win);
+        let win_type = self.read_win_type(win);
+        let is_modal = self.read_net_wm_state_modal(win);
+        let initial_fullscreen = self
+            .read_net_wm_state(win)
+            .contains(&self.atoms.net_wm_state_fullscreen);
+        let take_focus = self.supports_take_focus(win);
+        let (wants_input, urgent) = self.read_wm_hints(win);
+
+        // EWMH dialog-like types, transients and modal windows float; so do
+        // windows whose size hints allow exactly one size, like updater popups
+        // that forget to set an EWMH window type.
+        let should_float = wants_floating(win_type, transient_for, is_modal, &hints);
+
+        // Dock/Desktop: for now, do not tile normally in a heavy way; float them out of the way
+        let is_dock_or_desktop = matches!(win_type, WinType::Dock | WinType::Desktop);
+
+        if !should_float && !is_dock_or_desktop {
+            let work = self.tile_area(mi);
+            let restore = initial_mon.is_some();
+            let target = if restore {
+                None
+            } else {
+                let leaves = self.layout_mon(mi);
+                leaves
+                    .iter()
+                    .copied()
+                    .find(|(_, r)| r.contains(mx, my))
+                    .or(leaves.last().copied())
+            };
+            let tree = &mut self.monitors[mi].tree;
+            match target {
+                Some((target, rect)) => {
+                    let (new_first, side_by_side) = tree::split_for_drop(rect, (mx, my));
+                    if let Some(t) = tree.as_mut() {
+                        t.insert(target, win, new_first, side_by_side);
+                    }
                 }
-            }
-            None => {
-                let t = tree::append(tree.take(), win, work);
-                *tree = Some(t);
+                None => {
+                    let t = tree::append(tree.take(), win, work);
+                    *tree = Some(t);
+                }
             }
         }
 
-        let tags = self.tags_of(mi);
-        let geom = Rect {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-        };
+        let tags = initial_tags.unwrap_or_else(|| self.tags_of(mi));
+        let mut geom = Rect { x: 0, y: 0, w: 0, h: 0 };
+        if should_float || is_dock_or_desktop {
+            // Dialogs and other requested-floating windows get their size from
+            // WM_NORMAL_HINTS when available, then center below the bar or on
+            // the transient parent. An explicit hint position wins over both.
+            let parent = self.transient_geometry(transient_for, mi);
+            geom = floating_geometry(&hints, self.work(mi), parent, BORDERPX);
+        }
+
         let mut edge_wins = [NONE; 8];
         for (i, slot) in edge_wins.iter_mut().enumerate() {
             let zone = self.conn.generate_id()?;
@@ -2107,29 +3278,67 @@ impl Wm {
             )?;
             *slot = zone;
         }
-        let hints = self.read_size_hints(win).unwrap_or_default();
         self.clients.insert(
             0,
             Client {
                 win,
                 tags,
                 mon: mi,
-                floating: false,
+                floating: should_float || is_dock_or_desktop,
                 dragging: false,
                 geom,
+                auto_place: true,
                 hints,
                 edge_wins,
+                transient_for,
+                win_type,
+                is_modal,
+                fullscreen: false,
+                maximized_horz: false,
+                maximized_vert: false,
+                above: false,
+                below: false,
+                demands_attention: false,
+                hidden: false,
+                sticky: false,
+                skip_taskbar: false,
+                skip_pager: false,
+                saved_geom: None,
+                saved_floating: false,
+                take_focus,
+                wants_input,
+                urgent,
             },
         );
         self.selmon = mi;
         self.monitors[mi].sel = Some(win);
+        // Every managed client gets an ICCCM state, so taskbars can tell a
+        // managed window from a window merely hidden by a tag switch.
+        if let Some(c) = self.clients.iter().find(|cc| cc.win == win) {
+            let _ = self.sync_wm_state(c);
+        }
+        let _ = self.set_client_desktop(win, tags);
+        let _ = self.set_rwm_monitor(win, mi);
+        if urgent {
+            if let Some(c) = self.clients.iter().find(|cc| cc.win == win) {
+                let _ = self.sync_client_wm_state(c);
+            }
+        }
         self.conn.change_window_attributes(
             win,
             &ChangeWindowAttributesAux::new()
                 .event_mask(EventMask::ENTER_WINDOW | EventMask::PROPERTY_CHANGE),
         )?;
         self.grab_buttons(win)?;
-        self.arrange()
+        // Some clients set _NET_WM_STATE_FULLSCREEN on the window before
+        // mapping instead of sending a _NET_WM_STATE message. Honor that
+        // initial state so they do not need a manual keybind toggle.
+        if initial_fullscreen && !self.clients.iter().any(|c| c.win == win && c.fullscreen) {
+            self.toggle_fullscreen_for(win)?;
+        } else {
+            self.arrange()?;
+        }
+        Ok(())
     }
 
     fn unmanage(&mut self, win: Window) -> Result {
@@ -2137,6 +3346,7 @@ impl Wm {
             return Ok(());
         };
         let client = self.clients.remove(idx);
+        self.iconified_stack.retain(|&w| w != win);
         self.name_cache.borrow_mut().remove(&win);
         self.geom_cache.borrow_mut().remove(&win);
         for zone in client.edge_wins {
@@ -3280,7 +4490,29 @@ impl Wm {
         match event {
             Event::MapRequest(e) => {
                 if !self.is_managed(e.window) {
-                    self.manage(e.window)?;
+                    // Do not manage override-redirect or InputOnly windows.
+                    let attrs = self
+                        .conn
+                        .get_window_attributes(e.window)
+                        .ok()
+                        .and_then(|c| c.reply().ok());
+                    if let Some(attrs) = attrs {
+                        if attrs.override_redirect || attrs.class == WindowClass::INPUT_ONLY {
+                            let _ = self.conn.map_window(e.window);
+                            let _ = self.conn.flush();
+                        } else if self.should_ignore_window(e.window) {
+                            let _ = self.conn.map_window(e.window);
+                            let _ = self.conn.flush();
+                        } else {
+                            self.manage(e.window)?;
+                        }
+                    }
+                } else {
+                    // A managed client mapping itself must not escape its
+                    // workspace: let the layout decide whether it is visible.
+                    // A blind map here would leave a hidden window on screen
+                    // until the next arrange() unmaps it again.
+                    self.arrange()?;
                 }
                 self.bar_dirty = true;
             }
@@ -3293,6 +4525,12 @@ impl Wm {
             }
             Event::ConfigureNotify(e) if e.window == self.root => {
                 self.updategeom()?;
+            }
+            Event::MappingNotify(e) => {
+                // Refresh keyboard mapping when changed
+                if e.request == x11rb::protocol::xproto::Mapping::KEYBOARD || e.request == x11rb::protocol::xproto::Mapping::MODIFIER {
+                    let _ = self.refresh_keysyms();
+                }
             }
             Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
                 self.updategeom()?;
@@ -3344,14 +4582,43 @@ impl Wm {
                         if rect.y + rect.h as i32 <= m.y {
                             rect.y = m.y;
                         }
+                        let pos_mask = u16::from(ConfigWindow::X) | u16::from(ConfigWindow::Y);
+                        let asked_position = mask & pos_mask != 0;
+                        // Ignore the (0,0) default many toolkits send: they
+                        // still expect the WM to center a fresh dialog.
+                        let placeholder = asked_position
+                            && e.x == 0
+                            && e.y == 0
+                            && !self.clients[idx].hints.user_position;
+                        if asked_position && !placeholder {
+                            // The client (or the user via a launcher) picked a
+                            // position: stop auto-centering this window.
+                            self.clients[idx].auto_place = false;
+                        } else if self.clients[idx].auto_place {
+                            // Size-only request: keep the dialog centered at
+                            // its new size, or over its transient parent.
+                            let (x, y) = self.auto_float_origin(
+                                &self.clients[idx],
+                                rect.w as i32,
+                                rect.h as i32,
+                            );
+                            rect.x = x;
+                            rect.y = y;
+                        }
                         self.clients[idx].geom = rect;
                         self.place_floating(e.window)?;
                     } else if let Some(rect) = self.geometry(mi, e.window) {
                         // A tiled client cannot resize itself. Tell it the
                         // geometry dwm chose instead of relaying the request.
-                        let inner_w = (rect.w as i32 - 2 * BORDERPX).max(1) as u32;
-                        let inner_h = (rect.h as i32 - 2 * BORDERPX).max(1) as u32;
-                        self.send_configure(e.window, rect, inner_w, inner_h)?;
+                        let border = self
+                            .clients
+                            .iter()
+                            .find(|c| c.win == e.window)
+                            .map(client_border)
+                            .unwrap_or(BORDERPX);
+                        let inner_w = (rect.w as i32 - 2 * border).max(1) as u32;
+                        let inner_h = (rect.h as i32 - 2 * border).max(1) as u32;
+                        self.send_configure(e.window, rect, inner_w, inner_h, border as u32)?;
                         self.conn.flush()?;
                     }
                 } else {
@@ -3592,16 +4859,118 @@ impl Wm {
                 self.bar_dirty = true;
             }
             Event::PropertyNotify(e) if e.atom == u32::from(AtomEnum::WM_NORMAL_HINTS) => {
-                let Some(idx) = self.clients.iter().position(|c| c.win == e.window) else {
-                    return Ok(());
-                };
-                let hints = self.read_size_hints(e.window).unwrap_or_default();
-                self.clients[idx].hints = hints;
-                if self.clients[idx].floating && self.is_visible(&self.clients[idx]) {
-                    let geom = self.clients[idx].geom;
-                    self.clients[idx].geom = geom;
-                    self.place_floating(e.window)?;
+                if let Some(idx) = self.clients.iter().position(|c| c.win == e.window) {
+                    let hints = self.read_size_hints(e.window).unwrap_or_default();
+                    let (mon, transient, win_type, is_modal, auto_place, fullscreen) = {
+                        let c = &self.clients[idx];
+                        (
+                            c.mon,
+                            c.transient_for,
+                            c.win_type,
+                            c.is_modal,
+                            c.auto_place,
+                            c.fullscreen,
+                        )
+                    };
+                    self.clients[idx].hints = hints;
+                    // A client may publish its fixed size only after mapping;
+                    // move it out of (or back into) the tiling tree then.
+                    let changed = if fullscreen {
+                        false
+                    } else {
+                        self.set_client_floating(
+                            idx,
+                            wants_floating(win_type, transient, is_modal, &hints),
+                        )
+                    };
+                    // Toolkits often publish size hints after mapping. Resize
+                    // and re-center a still auto-placed floating window around
+                    // them, including one that just became floating here.
+                    if self.clients[idx].floating
+                        && auto_place
+                        && self.is_visible(&self.clients[idx])
+                    {
+                        let parent = self.transient_geometry(transient, mon);
+                        self.clients[idx].geom =
+                            floating_geometry(&hints, self.work(mon), parent, BORDERPX);
+                        self.place_floating(e.window)?;
+                    }
+                    if changed {
+                        self.arrange()?;
+                    }
                 }
+            }
+            Event::PropertyNotify(e) if e.atom == u32::from(AtomEnum::WM_HINTS) => {
+                if let Some(idx) = self.clients.iter().position(|c| c.win == e.window) {
+                    let (wants_input, urgent) = self.read_wm_hints(e.window);
+                    self.clients[idx].wants_input = wants_input;
+                    self.clients[idx].urgent = urgent;
+                    self.clients[idx].demands_attention = urgent;
+                    if urgent {
+                        let _ = self.sync_client_wm_state(&self.clients[idx]);
+                    }
+                    self.bar_dirty = true;
+                }
+            }
+            Event::PropertyNotify(e)
+                if e.atom == self.atoms.wm_transient_for
+                    || e.atom == self.atoms.net_wm_window_type
+                    || e.atom == self.atoms.net_wm_state =>
+            {
+                if let Some(idx) = self.clients.iter().position(|c| c.win == e.window) {
+                    let win = e.window;
+                    // Honor fullscreen requested by writing _NET_WM_STATE
+                    // directly, without a _NET_WM_STATE ClientMessage.
+                    let wants_fullscreen = self
+                        .read_net_wm_state(win)
+                        .contains(&self.atoms.net_wm_state_fullscreen);
+                    if wants_fullscreen != self.clients[idx].fullscreen {
+                        self.toggle_fullscreen_for(win)?;
+                    }
+                    let transient_for = self.read_transient_for(win);
+                    let win_type = self.read_win_type(win);
+                    let is_modal = self.read_net_wm_state_modal(win);
+                    let (mon, old_transient, fullscreen) = {
+                        let c = &self.clients[idx];
+                        (c.mon, c.transient_for, c.fullscreen)
+                    };
+                    self.clients[idx].transient_for = transient_for;
+                    self.clients[idx].win_type = win_type;
+                    self.clients[idx].is_modal = is_modal;
+                    let want_float =
+                        wants_floating(win_type, transient_for, is_modal, &self.clients[idx].hints)
+                            || matches!(win_type, WinType::Dock | WinType::Desktop);
+                    // Leave the saved layout state of a fullscreen client alone.
+                    let changed = if fullscreen {
+                        false
+                    } else {
+                        self.set_client_floating(idx, want_float)
+                    };
+                    // pkexec-style dialogs often set _NET_WM_WINDOW_TYPE after
+                    // mapping. Give those windows a real floating placement
+                    // instead of freezing their temporary tiling tile.
+                    let reposition = want_float
+                        && self.clients[idx].auto_place
+                        && (changed || transient_for != old_transient);
+                    if reposition {
+                        let parent = self.transient_geometry(transient_for, mon);
+                        self.clients[idx].geom = floating_geometry(
+                            &self.clients[idx].hints,
+                            self.work(mon),
+                            parent,
+                            BORDERPX,
+                        );
+                        self.place_floating(win)?;
+                    }
+                    if changed || reposition {
+                        self.arrange()?;
+                    } else {
+                        self.bar_dirty = true;
+                    }
+                }
+            }
+            Event::ClientMessage(e) => {
+                self.client_message(e)?;
             }
             Event::Expose(e) => {
                 // Like dwm's expose(), only the last event in a batch needs a
@@ -3630,6 +4999,192 @@ impl Wm {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn client_message(&mut self, e: ClientMessageEvent) -> Result {
+        if e.type_ == self.atoms.net_active_window {
+            let win = e.window;
+            if let Some(ci) = self.clients.iter().position(|c| c.win == win) {
+                let mon = self.clients[ci].mon;
+                self.selmon = mon;
+                self.monitors[mon].sel = Some(win);
+                self.focus()?;
+                self.bar_dirty = true;
+            }
+        } else if e.type_ == self.atoms.net_close_window {
+            let win = e.window;
+            if self.is_managed(win) {
+                if self.supports_delete(win) {
+                    let ev = ClientMessageEvent::new(
+                        32,
+                        win,
+                        self.atoms.wm_protocols,
+                        [self.atoms.wm_delete, CURRENT_TIME, 0, 0, 0],
+                    );
+                    self.conn.send_event(false, win, EventMask::NO_EVENT, ev)?;
+                } else {
+                    self.conn.kill_client(win)?;
+                }
+                self.conn.flush()?;
+            }
+        } else if e.type_ == self.atoms.net_current_desktop {
+            let idx = e.data.as_data32()[0] as usize;
+            if idx < TAG_COUNT as usize {
+                let tag = 1u32 << idx;
+                self.view(tag)?;
+            }
+        } else if e.type_ == self.atoms.net_wm_desktop {
+            // A client is not allowed to decide which workspace the user
+            // wants it on. Firefox-based browsers (and other apps with
+            // session restore) replay the desktop their last window was on
+            // as soon as a new window is mapped, which yanks the new window
+            // off the workspace it was spawned on. EWMH explicitly lets a
+            // WM treat application requests differently from direct user
+            // actions: only honor a move when a pager asks for it (source
+            // indication 2). Source 0/1 is an application or an old client.
+            if e.data.as_data32()[1] != 2 {
+                return Ok(());
+            }
+            let desk = e.data.as_data32()[0];
+            if desk == 0xFFFFFFFF {
+                // sticky: mark as all tags (best effort) - not fully modeled; skip
+            } else {
+                let idx = desk as usize;
+                if idx < TAG_COUNT as usize {
+                    let tag = 1u32 << idx;
+                    if let Some(ci) = self.clients.iter().position(|c| c.win == e.window) {
+                        self.clients[ci].tags = tag;
+                        let _ = self.set_client_desktop(self.clients[ci].win, tag);
+                        self.arrange()?;
+                    }
+                }
+            }
+        } else if e.type_ == self.atoms.net_wm_state {
+            let data = e.data.as_data32();
+            let action = data[0];
+            let atom1 = data[1];
+            let atom2 = data[2];
+            let win = e.window;
+            if self.is_managed(win) {
+                let mut changed = false;
+                for atom in [atom1, atom2] {
+                    if atom == 0 { continue; }
+                    if let Some(idx) = self.clients.iter().position(|c| c.win == win) {
+                        if atom == self.atoms.net_wm_state_fullscreen {
+                            let is_fs = self.clients[idx].fullscreen;
+                            let want = match action { 0 => false, 1 => true, 2 => !is_fs, _ => is_fs };
+                            if want != is_fs {
+                                self.toggle_fullscreen_for(win)?;
+                                changed = true;
+                            }
+                        } else if atom == self.atoms.net_wm_state_maximized_horz || atom == self.atoms.net_wm_state_maximized_vert {
+                            self.apply_maximize_request(win, atom, action)?;
+                            changed = true;
+                        } else {
+                            let cur = if atom == self.atoms.net_wm_state_above { self.clients[idx].above }
+                                else if atom == self.atoms.net_wm_state_below { self.clients[idx].below }
+                                else if atom == self.atoms.net_wm_state_modal { self.clients[idx].is_modal }
+                                else if atom == self.atoms.net_wm_state_demands_attention { self.clients[idx].demands_attention }
+                                else if atom == self.atoms.net_wm_state_hidden { self.clients[idx].hidden }
+                                else if atom == self.atoms.net_wm_state_sticky { self.clients[idx].sticky }
+                                else if atom == self.atoms.net_wm_state_skip_taskbar { self.clients[idx].skip_taskbar }
+                                else if atom == self.atoms.net_wm_state_skip_pager { self.clients[idx].skip_pager }
+                                else { false };
+                            let want = match action { 0 => false, 1 => true, 2 => !cur, _ => cur };
+                            if atom == self.atoms.net_wm_state_above { self.clients[idx].above = want; }
+                            else if atom == self.atoms.net_wm_state_below { self.clients[idx].below = want; }
+                            else if atom == self.atoms.net_wm_state_modal { self.clients[idx].is_modal = want; }
+                            else if atom == self.atoms.net_wm_state_demands_attention { self.clients[idx].demands_attention = want; }
+                            else if atom == self.atoms.net_wm_state_hidden {
+                                // Use the same path as Super+H/Shift+H so the
+                                // restore stack and ICCCM state stay in sync.
+                                if want { self.set_hidden(win, true)?; }
+                                else { self.restore_client(win)?; }
+                            }
+                            else if atom == self.atoms.net_wm_state_sticky { self.clients[idx].sticky = want; }
+                            else if atom == self.atoms.net_wm_state_skip_taskbar { self.clients[idx].skip_taskbar = want; }
+                            else if atom == self.atoms.net_wm_state_skip_pager { self.clients[idx].skip_pager = want; }
+                            if let Some(c) = self.clients.get(idx) {
+                                let _ = self.sync_client_wm_state(c);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                if changed { self.arrange()?; }
+            }
+        } else if e.type_ == self.atoms.wm_change_state {
+            // ICCCM WM_CHANGE_STATE
+            let state = e.data.as_data32()[0];
+            if state == WM_STATE_ICONIC {
+                self.set_hidden(e.window, true)?;
+                self.arrange()?;
+            } else if state == WM_STATE_NORMAL {
+                self.restore_client(e.window)?;
+            } else if state == WM_STATE_WITHDRAWN {
+                // WithdrawnState -> unmap
+                let _ = self.conn.unmap_window(e.window);
+                self.conn.flush()?;
+            }
+        } else if e.type_ == self.atoms.net_wm_ping {
+            // Reply to ping
+            let mut ev = e;
+            ev.response_type = x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT;
+            let _ = self.conn.send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
+            self.conn.flush()?;
+        }
+        Ok(())
+    }
+
+    fn apply_maximize_request(&mut self, win: Window, atom: u32, action: u32) -> Result {
+        let Some(idx) = self.clients.iter().position(|c| c.win == win) else { return Ok(()); };
+        let mi = self.clients[idx].mon;
+        let is_horz = atom == self.atoms.net_wm_state_maximized_horz;
+        let cur = if is_horz { self.clients[idx].maximized_horz } else { self.clients[idx].maximized_vert };
+        let want = match action { 0 => false, 1 => true, 2 => !cur, _ => cur };
+        if want == cur { return Ok(()); }
+        if self.clients[idx].saved_geom.is_none() && !self.clients[idx].fullscreen {
+            self.clients[idx].saved_geom = Some(self.clients[idx].geom);
+            self.clients[idx].saved_floating = self.clients[idx].floating;
+        }
+        if is_horz { self.clients[idx].maximized_horz = want; } else { self.clients[idx].maximized_vert = want; }
+        let mrect = self.monitors[mi].rect;
+        let any_max = self.clients[idx].maximized_horz || self.clients[idx].maximized_vert;
+        if any_max {
+            let mut g = self.clients[idx].saved_geom.unwrap_or(self.clients[idx].geom);
+            if self.clients[idx].maximized_horz {
+                g.x = mrect.x;
+                g.w = mrect.w;
+            } else if let Some(saved) = self.clients[idx].saved_geom {
+                g.x = saved.x; g.w = saved.w;
+            }
+            if self.clients[idx].maximized_vert {
+                g.y = mrect.y;
+                g.h = mrect.h;
+            } else if let Some(saved) = self.clients[idx].saved_geom {
+                g.y = saved.y; g.h = saved.h;
+            }
+            self.clients[idx].floating = true;
+            self.clients[idx].geom = g;
+            // Maximizing chooses an explicit geometry; stop auto-placing.
+            self.clients[idx].auto_place = false;
+        } else {
+            // restore
+            if let Some(saved) = self.clients[idx].saved_geom.take() {
+                self.clients[idx].geom = saved;
+            }
+            self.clients[idx].floating = self.clients[idx].saved_floating;
+            self.clients[idx].saved_floating = false;
+            if !self.clients[idx].floating {
+                if !self.monitors[mi].tree.as_ref().is_some_and(|t| t.has_leaf(win)) {
+                    let area = self.tile_area(mi);
+                    let tree = &mut self.monitors[mi].tree;
+                    *tree = Some(tree::append(tree.take(), win, area));
+                }
+            }
+        }
+        let _ = self.sync_client_wm_state(&self.clients[idx]);
         Ok(())
     }
 
@@ -3667,6 +5222,9 @@ impl Wm {
             Action::MoveStack(d) => self.movestack(d),
             Action::Zoom => self.zoom(),
             Action::ToggleFloating => self.togglefloating(),
+            Action::ToggleFullScreen => self.toggle_fullscreen(),
+            Action::Iconify => self.iconify(),
+            Action::Deiconify => self.deiconify(),
             Action::KillClient => self.killclient(),
             Action::ForceKillClient => self.forcekillclient(),
             Action::FocusMon(d) => self.focusmon(d),
@@ -3903,14 +5461,15 @@ impl Wm {
     /// first, then reinserted as an even split into the tile under the pointer
     /// in the expanded layout, the same order `onWindowCreatedTiling` uses.
     fn movemouse(&mut self, win: Window, (px, py): (i32, i32)) -> Result {
-        let Some((mi, floating)) = self
-            .clients
-            .iter()
-            .find(|c| c.win == win)
-            .map(|c| (c.mon, c.floating))
-        else {
+        let Some(client) = self.clients.iter().find(|c| c.win == win) else {
             return Ok(());
         };
+        // A fullscreen window owns the whole monitor; dragging it would break
+        // that, so ignore Super+drag until it leaves fullscreen.
+        if client.fullscreen {
+            return Ok(());
+        }
+        let (mi, floating) = (client.mon, client.floating);
         let Some(start) = self.geometry(mi, win) else {
             return Ok(());
         };
@@ -3963,6 +5522,10 @@ impl Wm {
             self.monitors[tm].sel = Some(win);
         }
         if floating {
+            // A user-placed window keeps its spot across property updates.
+            if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
+                c.auto_place = false;
+            }
             return self.arrange();
         }
         // Remove the dragged window before looking at the layout, just like
@@ -4007,14 +5570,13 @@ impl Wm {
         (mx, my): (i32, i32),
         zone: Option<(bool, bool, bool, bool)>,
     ) -> Result {
-        let Some((mi, floating)) = self
-            .clients
-            .iter()
-            .find(|c| c.win == win)
-            .map(|c| (c.mon, c.floating))
-        else {
+        let Some(client) = self.clients.iter().find(|c| c.win == win) else {
             return Ok(());
         };
+        if client.fullscreen {
+            return Ok(());
+        }
+        let (mi, floating) = (client.mon, client.floating);
         let Some(rect) = self.geometry(mi, win) else {
             return Ok(());
         };
@@ -4032,6 +5594,9 @@ impl Wm {
                 }
                 wm.place_floating_inner(win, false)
             })?;
+            if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
+                c.auto_place = false;
+            }
             return self.arrange();
         }
         let (mut lx, mut ly) = (mx, my);
@@ -4059,8 +5624,42 @@ impl Wm {
         }
     }
 
-    /// dwm's `togglefloating()`: moves the selected window between the tiling
-    /// tree and the floating layer without losing its place in the tree.
+    /// Reconcile an already managed client with a new floating decision, for
+    /// example when a client publishes `_NET_WM_WINDOW_TYPE` or fixed size
+    /// hints only after mapping. Returns true if its state changed.
+    fn set_client_floating(&mut self, idx: usize, float: bool) -> bool {
+        if self.clients[idx].floating == float {
+            return false;
+        }
+        let win = self.clients[idx].win;
+        let mi = self.clients[idx].mon;
+        if float {
+            let geom = if self.clients[idx].auto_place {
+                let hints = self.clients[idx].hints;
+                let parent = self.transient_geometry(self.clients[idx].transient_for, mi);
+                floating_geometry(&hints, self.work(mi), parent, BORDERPX)
+            } else {
+                self.geometry(mi, win).unwrap_or(self.clients[idx].geom)
+            };
+            self.clients[idx].floating = true;
+            self.clients[idx].geom = geom;
+        } else {
+            self.clients[idx].floating = false;
+            // Windows that were floating from the start never had a tile.
+            // Put one back so the layout has a box to draw them in.
+            if !self.monitors[mi]
+                .tree
+                .as_ref()
+                .is_some_and(|t| t.has_leaf(win))
+            {
+                let area = self.tile_area(mi);
+                let tree = &mut self.monitors[mi].tree;
+                *tree = Some(tree::append(tree.take(), win, area));
+            }
+        }
+        true
+    }
+
     fn togglefloating(&mut self) -> Result {
         let mi = self.selmon;
         let Some(sel) = self.monitors[mi].sel else {
@@ -4069,12 +5668,13 @@ impl Wm {
         let Some(c) = self.clients.iter().find(|c| c.win == sel) else {
             return Ok(());
         };
+        if c.fullscreen {
+            return Ok(()); // don't toggle floating while fullscreen
+        }
         if c.floating {
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
                 c.floating = false;
             }
-            // A floated window keeps its leaf in the tree; tiled_order() hides
-            // it while floating, so toggling back restores the old split.
             if !self.monitors[mi]
                 .tree
                 .as_ref()
@@ -4091,7 +5691,88 @@ impl Wm {
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
                 c.floating = true;
                 c.geom = rect;
+                // The user chose this geometry; property updates must not
+                // recenter it behind their back.
+                c.auto_place = false;
             }
+        }
+        self.arrange()
+    }
+
+    fn toggle_fullscreen(&mut self) -> Result {
+        let mi = self.selmon;
+        let Some(sel) = self.monitors[mi].sel else {
+            return Ok(());
+        };
+        self.toggle_fullscreen_for(sel)
+    }
+
+    fn sync_client_wm_state(&self, c: &Client) -> Result {
+        let mut atoms: Vec<u32> = Vec::new();
+        if c.fullscreen { atoms.push(self.atoms.net_wm_state_fullscreen); }
+        if c.maximized_horz { atoms.push(self.atoms.net_wm_state_maximized_horz); }
+        if c.maximized_vert { atoms.push(self.atoms.net_wm_state_maximized_vert); }
+        if c.above { atoms.push(self.atoms.net_wm_state_above); }
+        if c.below { atoms.push(self.atoms.net_wm_state_below); }
+        if c.is_modal { atoms.push(self.atoms.net_wm_state_modal); }
+        if c.demands_attention { atoms.push(self.atoms.net_wm_state_demands_attention); }
+        if c.hidden { atoms.push(self.atoms.net_wm_state_hidden); }
+        if c.sticky { atoms.push(self.atoms.net_wm_state_sticky); }
+        if c.skip_taskbar { atoms.push(self.atoms.net_wm_state_skip_taskbar); }
+        if c.skip_pager { atoms.push(self.atoms.net_wm_state_skip_pager); }
+        if atoms.is_empty() {
+            let _ = self.conn.delete_property(c.win, self.atoms.net_wm_state);
+        } else {
+            let _ = self.conn.change_property32(
+                PropMode::REPLACE,
+                c.win,
+                self.atoms.net_wm_state,
+                AtomEnum::ATOM,
+                &atoms,
+            );
+        }
+        Ok(())
+    }
+
+    fn toggle_fullscreen_for(&mut self, win: Window) -> Result {
+        let Some(idx) = self.clients.iter().position(|c| c.win == win) else {
+            return Ok(());
+        };
+        let mi = self.clients[idx].mon;
+        if self.clients[idx].fullscreen {
+            // exit fullscreen: restore
+            let saved_geom = self.clients[idx].saved_geom.take();
+            let saved_floating = self.clients[idx].saved_floating;
+            self.clients[idx].fullscreen = false;
+            self.clients[idx].floating = saved_floating;
+            if let Some(g) = saved_geom {
+                self.clients[idx].geom = g;
+            }
+            // If it was tiled before, ensure it's in tree
+            if !saved_floating {
+                if !self.monitors[mi].tree.as_ref().is_some_and(|t| t.has_leaf(win)) {
+                    let area = self.tile_area(mi);
+                    let tree = &mut self.monitors[mi].tree;
+                    *tree = Some(tree::append(tree.take(), win, area));
+                }
+            }
+            let _ = self.sync_client_wm_state(&self.clients[idx]);
+        } else {
+            // enter fullscreen: keep current tiling/floating state but cover screen
+            let cur_geom = self.geometry(mi, win).unwrap_or(self.clients[idx].geom);
+            let was_floating = self.clients[idx].floating;
+            self.clients[idx].saved_geom = Some(cur_geom);
+            self.clients[idx].saved_floating = was_floating;
+            self.clients[idx].fullscreen = true;
+            // Do NOT force floating; keep layout state. Just make it cover monitor.
+            let mrect = self.monitors[mi].rect;
+            self.clients[idx].geom = Rect {
+                x: mrect.x,
+                y: mrect.y,
+                w: mrect.w,
+                h: mrect.h,
+            };
+            let _ = self.sync_client_wm_state(&self.clients[idx]);
         }
         self.arrange()
     }
@@ -4156,8 +5837,13 @@ impl Wm {
         if t == 0 {
             return Ok(());
         }
+        let mut changed: Option<(Window, u32)> = None;
         if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
             c.tags = t;
+            changed = Some((c.win, c.tags));
+        }
+        if let Some((win, tags)) = changed {
+            let _ = self.set_client_desktop(win, tags);
         }
         self.arrange()
     }
@@ -4166,15 +5852,19 @@ impl Wm {
         let Some(sel) = self.monitors[self.selmon].sel else {
             return Ok(());
         };
-        let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) else {
-            return Ok(());
-        };
-        let newtags = c.tags ^ (ui & TAGMASK);
-        if newtags == 0 {
-            return Ok(());
+        let mut changed: Option<(Window, u32)> = None;
+        if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
+            let newtags = c.tags ^ (ui & TAGMASK);
+            if newtags != 0 {
+                c.tags = newtags;
+                changed = Some((c.win, newtags));
+            }
         }
-        c.tags = newtags;
-        self.arrange()
+        if let Some((win, tags)) = changed {
+            let _ = self.set_client_desktop(win, tags);
+            self.arrange()?;
+        }
+        Ok(())
     }
 
     fn shiftview(&mut self, d: i32) -> Result {
@@ -4193,17 +5883,39 @@ impl Wm {
         let Some(sel) = self.monitors[mi].sel else {
             return Ok(());
         };
-        let order = self.stack_order(mi);
-        let (Some(idx), n) = (order.iter().position(|&w| w == sel), order.len()) else {
-            return Ok(());
-        };
-        let next = if d > 0 {
-            (idx + 1) % n
+        let fs_owner = self.fullscreen_owner(mi).map(|(_, win)| win);
+        // Tiled windows are unmapped behind a fullscreen client, so Alt+Tab
+        // only offers the fullscreen window and floating overlays there.
+        let order: Vec<Window> = if fs_owner.is_some() {
+            self.clients
+                .iter()
+                .filter(|c| {
+                    c.mon == mi && self.is_visible(c) && (Some(c.win) == fs_owner || c.floating)
+                })
+                .map(|c| c.win)
+                .collect()
         } else {
-            (idx + n - 1) % n
+            self.stack_order(mi)
+        };
+        if order.is_empty() {
+            return Ok(());
+        }
+        let next = match order.iter().position(|&w| w == sel) {
+            Some(idx) if d > 0 => (idx + 1) % order.len(),
+            Some(idx) => (idx + order.len() - 1) % order.len(),
+            // The current selection is hidden behind fullscreen (e.g. a tiled
+            // window selected before fullscreen was entered): start at the top.
+            None if d > 0 => 0,
+            None => order.len() - 1,
         };
         let c = order[next];
         self.monitors[mi].sel = Some(c);
+        if fs_owner.is_some() {
+            // Re-run the fullscreen map/stack gate so a floating window picked
+            // with Alt+Tab gets raised above the fullscreen client. Tiled
+            // windows are never in `order` here and stay unmapped.
+            self.apply_layout()?;
+        }
         self.focus()?;
         if let Some(r) = self.geometry(mi, c) {
             self.conn
@@ -4288,6 +6000,18 @@ impl Wm {
             .unwrap_or(false)
     }
 
+    fn supports_take_focus(&self, win: Window) -> bool {
+        self.conn
+            .get_property(false, win, self.atoms.wm_protocols, AtomEnum::ATOM, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| {
+                r.value32()
+                    .map(|mut it| it.any(|a| a == self.atoms.wm_take_focus))
+            })
+            .unwrap_or(false)
+    }
+
     fn killclient(&self) -> Result {
         let Some(sel) = self.monitors[self.selmon].sel else {
             return Ok(());
@@ -4362,10 +6086,14 @@ impl Wm {
 
         let area = self.tile_area(target);
         let tags = self.tags_of(target);
-        let t = &mut self.monitors[target];
-        t.tree = Some(tree::append(t.tree.take(), win, area));
+        {
+            let t = &mut self.monitors[target];
+            t.tree = Some(tree::append(t.tree.take(), win, area));
+        }
         self.clients[ci].mon = target;
         self.clients[ci].tags = tags;
+        let _ = self.set_client_desktop(win, tags);
+        let _ = self.set_rwm_monitor(win, target);
         self.arrange()
     }
 
@@ -4499,6 +6227,17 @@ mod tests {
     }
 
     #[test]
+    fn map_allowed_respects_fullscreen_owner_and_floating() {
+        // No fullscreen client: every visible window may map.
+        assert!(Wm::map_allowed(1, false, None));
+        assert!(Wm::map_allowed(2, true, None));
+        // With a fullscreen owner, only it and floating windows may map.
+        assert!(Wm::map_allowed(1, false, Some(1)));
+        assert!(!Wm::map_allowed(2, false, Some(1)));
+        assert!(Wm::map_allowed(2, true, Some(1)));
+    }
+
+    #[test]
     fn size_hints_enforce_minimum() {
         let hints = SizeHints {
             min_w: 200,
@@ -4537,6 +6276,77 @@ mod tests {
     }
 
     #[test]
+    fn fixed_size_hints_mean_equal_positive_min_and_max() {
+        let fixed = SizeHints {
+            min_w: 300,
+            min_h: 350,
+            max_w: 300,
+            max_h: 350,
+            ..Default::default()
+        };
+        assert!(has_fixed_size(&fixed));
+        assert!(!has_fixed_size(&SizeHints {
+            max_w: 0,
+            max_h: 0,
+            ..fixed
+        }));
+        assert!(!has_fixed_size(&SizeHints {
+            max_w: 600,
+            ..fixed
+        }));
+        // Zero means "unspecified" in ICCCM, not a fixed size.
+        assert!(!has_fixed_size(&SizeHints::default()));
+    }
+
+    #[test]
+    fn fixed_size_normal_window_wants_floating_without_any_app_rule() {
+        let fixed = SizeHints {
+            min_w: 300,
+            min_h: 350,
+            max_w: 300,
+            max_h: 350,
+            ..Default::default()
+        };
+        assert!(wants_floating(WinType::Normal, None, false, &fixed));
+        // A normal window with only a minimum stays tiled.
+        assert!(!wants_floating(
+            WinType::Normal,
+            None,
+            false,
+            &SizeHints {
+                min_w: 940,
+                min_h: 500,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn fixed_size_floating_window_uses_its_hinted_size_and_position() {
+        let hints = SizeHints {
+            min_w: 300,
+            min_h: 350,
+            max_w: 300,
+            max_h: 350,
+            base_w: 300,
+            base_h: 350,
+            requested_size: Some((300, 350)),
+            requested_pos: Some((810, 209)),
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!(
+            geom,
+            Rect {
+                x: 810,
+                y: 209,
+                w: 304,
+                h: 354
+            }
+        );
+    }
+
+    #[test]
     fn drag_geom_keeps_grab_offset_and_size_instead_of_centering_on_pointer() {
         let start = Rect {
             x: 100,
@@ -4558,6 +6368,111 @@ mod tests {
                 h: 500
             }
         );
+    }
+
+    fn work_area() -> Rect {
+        Rect {
+            x: 0,
+            y: 30,
+            w: 1920,
+            h: 1050,
+        }
+    }
+
+    #[test]
+    fn dialog_centers_in_work_area_below_the_bar() {
+        let geom = floating_geometry(&SizeHints::default(), work_area(), None, BORDERPX);
+        assert_eq!(
+            geom,
+            Rect {
+                x: 658,
+                y: 353,
+                w: 604,
+                h: 404
+            }
+        );
+    }
+
+    #[test]
+    fn dialog_uses_its_own_base_size_instead_of_a_fixed_600x400() {
+        let hints = SizeHints {
+            min_w: 400,
+            min_h: 300,
+            base_w: 400,
+            base_h: 300,
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!((geom.w, geom.h), (404, 304));
+        assert_eq!((geom.x, geom.y), (758, 403));
+    }
+
+    #[test]
+    fn requested_position_and_gravity_are_honored_and_clamped() {
+        let hints = SizeHints {
+            min_w: 400,
+            min_h: 300,
+            base_w: 400,
+            base_h: 300,
+            requested_pos: Some((1800, 100)),
+            gravity: Some(Gravity::NORTH_EAST),
+            ..Default::default()
+        };
+        // NorthEastGravity means x points at the right edge of the window.
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!((geom.x, geom.y), (1396, 100));
+
+        let offscreen = SizeHints {
+            requested_pos: Some((-100, -100)),
+            requested_size: Some((800, 600)),
+            ..Default::default()
+        };
+        let geom = floating_geometry(&offscreen, work_area(), None, BORDERPX);
+        assert_eq!((geom.x, geom.y), (0, 30));
+    }
+
+    #[test]
+    fn placeholder_program_position_does_not_defeat_centering() {
+        let hints = SizeHints {
+            requested_pos: Some((0, 0)),
+            user_position: false,
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!((geom.x, geom.y), (658, 353));
+
+        let explicit = SizeHints {
+            user_position: true,
+            ..hints
+        };
+        let geom = floating_geometry(&explicit, work_area(), None, BORDERPX);
+        assert_eq!((geom.x, geom.y), (0, 30));
+    }
+
+    #[test]
+    fn transient_dialog_centers_on_its_parent() {
+        let parent = Rect {
+            x: 200,
+            y: 100,
+            w: 1000,
+            h: 800,
+        };
+        let geom = floating_geometry(&SizeHints::default(), work_area(), Some(parent), BORDERPX);
+        assert_eq!((geom.x, geom.y), (398, 298));
+    }
+
+    #[test]
+    fn requested_size_is_rounded_to_the_size_increment() {
+        let hints = SizeHints {
+            base_w: 100,
+            base_h: 100,
+            inc_w: 50,
+            inc_h: 50,
+            requested_size: Some((230, 230)),
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!((geom.w, geom.h), (204, 204));
     }
 
     #[test]

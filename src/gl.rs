@@ -788,7 +788,7 @@ impl Bloom {
         let c = compat()?;
 
         unsafe {
-            let _state = BloomState::new(c, width, height)?;
+            let state = BloomState::new(c, width, height)?;
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
             gl::FramebufferTexture2D(
@@ -854,6 +854,11 @@ impl Bloom {
 
             gl::UseProgram(0);
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            // Offscreen passes deliberately ignore the caller's scissor so the
+            // FBO is cleared and blurred across its full extent. Restore it
+            // before the final composite so callers can clip bloom output (for
+            // example Finder's app list must not paint over the clock row).
+            state.restore_scissor();
             gl::Enable(gl::BLEND);
             blend_separate();
             gl::BindTexture(gl::TEXTURE_2D, input);
@@ -885,7 +890,9 @@ impl Bloom {
 }
 
 /// Saves the fixed-function state that dwm pushes/disables around a bloom draw
-/// and restores it on every exit path. This mirrors 11654-11655, 11656-11662,
+/// and restores it on every exit path. The scissor is disabled for the offscreen
+/// passes but re-enabled for the final composite, so a caller's clip still
+/// applies to what is actually painted. This mirrors 11654-11655, 11656-11662,
 /// 11713-11719 and 11918-11925 without duplicating the restore sequence in
 /// each of the three original call sites.
 struct BloomState {
@@ -910,6 +917,17 @@ impl BloomState {
             c.load_identity();
         }
         Ok(BloomState { compat: c, scissor })
+    }
+
+    /// Re-enable the caller's scissor before the final on-screen composite.
+    /// The offscreen passes still run unclipped so blur can sample the whole
+    /// source texture; only the output is constrained.
+    fn restore_scissor(&self) {
+        if self.scissor {
+            unsafe {
+                gl::Enable(gl::SCISSOR_TEST);
+            }
+        }
     }
 }
 
@@ -1919,6 +1937,48 @@ mod tests {
             );
             assert_eq!(gl::GetError(), gl::NO_ERROR);
             assert!(pixel[3] > 0, "expected visible bloom pixel, got {pixel:?}");
+
+            // Bloom's final composite must respect the caller's scissor. Clip
+            // to the left third and confirm the centre pixel stays cleared,
+            // even though the offscreen blur was rendered across full width.
+            unsafe {
+                gl::Disable(gl::SCISSOR_TEST);
+                gl::Clear(gl::COLOR_BUFFER_BIT);
+                gl::Enable(gl::SCISSOR_TEST);
+                gl::Scissor(0, 0, 100, 40);
+            }
+            let clipped = bloom
+                .render(300, 40, 2.0, 1.0, None, || {
+                    gl::Disable(gl::TEXTURE_2D);
+                    c.color4f(1.0, 1.0, 1.0, 1.0);
+                    c.begin(gl::QUADS);
+                    c.vertex2f(120.0, 10.0);
+                    c.vertex2f(180.0, 10.0);
+                    c.vertex2f(180.0, 30.0);
+                    c.vertex2f(120.0, 30.0);
+                    c.end();
+                })
+                .expect("clipped bloom render");
+            assert!(clipped);
+            unsafe {
+                gl::Disable(gl::SCISSOR_TEST);
+            }
+            assert_eq!(gl::GetError(), gl::NO_ERROR);
+            let mut clipped_pixel = [0u8; 4];
+            gl::ReadPixels(
+                150,
+                20,
+                1,
+                1,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                clipped_pixel.as_mut_ptr().cast(),
+            );
+            assert_eq!(gl::GetError(), gl::NO_ERROR);
+            assert_eq!(
+                clipped_pixel[3], 0,
+                "scissored bloom leaked outside the clip: {clipped_pixel:?}"
+            );
 
             drop(bloom);
             drop(gl);

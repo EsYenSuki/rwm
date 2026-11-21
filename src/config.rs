@@ -2,6 +2,11 @@
 
 /// config.def.h `floatbar`: the bar floats inside the outer gap.
 pub const FLOATBAR: bool = true;
+/// Float windows whose `WM_NORMAL_HINTS` pin both axes to one size (min == max).
+/// EWMH dialog types already float; this is the fallback for clients that
+/// publish no window type but are unresizable, such as updater popups. No app
+/// names are involved, so any client with the same hints gets the same rule.
+pub const FLOAT_FIXED_SIZE: bool = true;
 /// config.def.h `topbar`.
 pub const TOPBAR: bool = true;
 /// Attempt a 32-bit ARGB visual (with an XRender alpha mask) for the center

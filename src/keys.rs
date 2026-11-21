@@ -34,6 +34,11 @@ pub enum Action {
     MoveStack(i32),
     Zoom,
     ToggleFloating,
+    ToggleFullScreen,
+    /// Unmap (iconify) the focused window.
+    Iconify,
+    /// Map the most recently iconified window again.
+    Deiconify,
     KillClient,
     ForceKillClient,
     FocusMon(i32),
@@ -299,6 +304,21 @@ pub fn bindings() -> Vec<Key> {
             mods: MOD_4,
             keysym: XK_w,
             action: ToggleFloating,
+        },
+        Key {
+            mods: MOD_4,
+            keysym: XK_f,
+            action: ToggleFullScreen,
+        },
+        Key {
+            mods: MOD_4,
+            keysym: XK_h,
+            action: Iconify,
+        },
+        Key {
+            mods: MOD_4 | MOD_SHIFT,
+            keysym: XK_h,
+            action: Deiconify,
         },
         Key {
             mods: MOD_4,

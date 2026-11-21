@@ -5,6 +5,7 @@
 //! smooth scrolling, filter animation, aggressive ARGB opacity, and the
 //! separate white marker window.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::error::Error;
@@ -14,6 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use x11::keysym::{
@@ -109,6 +111,8 @@ struct App {
     icon_name: String,
     icon_tex: u32,
     icon_loaded: bool,
+    /// A lookup or decode failed, so do not retry it on every tick.
+    icon_failed: bool,
     recent: i32,
     score: i32,
 }
@@ -609,7 +613,7 @@ impl Finder {
     }
 
     fn load_apps(&mut self) {
-        self.apps.clear();
+        self.clear_apps();
         for dir in FINDER_APP_DIRS {
             if self.apps.len() >= MAX_APPS {
                 break;
@@ -637,6 +641,7 @@ impl Finder {
                     icon_name: String::new(),
                     icon_tex: 0,
                     icon_loaded: false,
+                    icon_failed: false,
                     recent: 0,
                     score: 0,
                 };
@@ -752,9 +757,9 @@ impl Finder {
         };
         let mut child = Command::new("gio");
         child.arg("launch").arg(&file);
-        let spawned =
-            child.spawn().is_ok() || Command::new("sh").arg("-c").arg(&exec).spawn().is_ok();
-        let _ = spawned;
+        // Launch through the WM's detached spawn path as well: an app opened
+        // from Finder must not die when rwm is killed.
+        let _ = crate::wm::spawn_command(child).is_ok() || crate::wm::spawn(&exec).is_ok();
         if let Some(pos) = self.recent.iter().position(|r| *r == file) {
             self.recent.remove(pos);
         }
@@ -768,70 +773,218 @@ impl Finder {
     // Icon lookup and GL texture upload
     // -----------------------------------------------------------------------
 
-    fn icon_path(name: &str) -> Option<PathBuf> {
+    const ICON_SIZES: &[&str] = &[
+        "scalable", "512x512", "384x384", "256x256", "192x192", "128x128", "96x96", "64x64",
+        "48x48", "32x32", "24x24", "22x22", "16x16", "512", "384", "256", "192", "128", "96", "64",
+        "48", "32", "24", "22", "16",
+    ];
+    const ICON_CONTEXTS: &[&str] = &["apps", "legacy", "categories", "preferences", "status"];
+    /// Raster formats the `image` crate can decode. Tried before SVG so an app
+    /// with both `firefox.png` and `firefox.svg` uses the cheap raster path.
+    const RASTER_ICON_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+    /// SVG is rasterized with `resvg`; XPM is listed for completeness but no
+    /// decoder is currently available, so those apps simply get no icon.
+    const OTHER_ICON_EXTS: &[&str] = &["svg", "xpm"];
+
+    fn is_icon_ext(ext: &str) -> bool {
+        let ext = ext.to_ascii_lowercase();
+        matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "svg" | "xpm"
+        )
+    }
+
+    /// Theme/pixmap roots, in priority order. `FINDER_APP_DIRS` knows about
+    /// flatpak applications, so their exported icon directories belong here too.
+    fn icon_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(home) = env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            roots.push(home.join(".icons"));
+            roots.push(home.join(".local/share/icons"));
+            roots.push(home.join(".local/share/flatpak/exports/share/icons"));
+        }
+        roots.push(PathBuf::from("/usr/local/share/icons"));
+        roots.push(PathBuf::from("/usr/share/icons"));
+        roots.push(PathBuf::from("/var/lib/flatpak/exports/share/icons"));
+        roots.push(PathBuf::from("/var/lib/snapd/desktop/icons"));
+        roots.push(PathBuf::from("/usr/local/share/pixmaps"));
+        roots.push(PathBuf::from("/usr/share/pixmaps"));
+        roots
+    }
+
+    /// Resolves an icon name against the supplied roots. Kept separate from
+    /// [`Self::icon_path`] so the lookup rules can be unit tested.
+    fn resolve_icon_path(name: &str, roots: &[PathBuf]) -> Option<PathBuf> {
         if name.is_empty() {
             return None;
         }
         if name.starts_with('/') {
-            return Some(PathBuf::from(name));
+            let path = PathBuf::from(name);
+            return path.is_file().then_some(path);
         }
-        let home = env::var_os("HOME").map(PathBuf::from);
-        if name.contains('.') {
-            let mut bases = Vec::new();
-            if let Some(home) = &home {
-                bases.push(home.join(".local/share/icons").join(name));
-            }
-            bases.push(PathBuf::from("/usr/local/share/icons").join(name));
-            bases.push(PathBuf::from("/usr/share/icons").join(name));
-            bases.push(PathBuf::from("/usr/share/pixmaps").join(name));
-            for p in bases {
-                if p.exists() {
-                    return Some(p);
+        let icon_path = Path::new(name);
+        let file_name = icon_path.file_name()?.to_str()?;
+        let has_icon_ext = icon_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(Self::is_icon_ext);
+        // `.desktop` files normally omit the extension, but accept `foo.svg`
+        // too: try that exact file first, then search themes for `foo.*`.
+        let base_name = if has_icon_ext {
+            icon_path.file_stem()?.to_str()?
+        } else {
+            file_name
+        };
+        if has_icon_ext {
+            for root in roots {
+                let path = root.join(file_name);
+                if path.is_file() {
+                    return Some(path);
                 }
             }
         }
-        const SIZES: &[&str] = &[
-            "scalable", "512x512", "384x384", "256x256", "192x192", "128x128", "96x96", "64x64",
-            "48x48", "32x32", "24x24", "22x22", "16x16", "512", "384", "256", "192", "128", "96",
-            "64", "48", "32", "24", "22", "16",
-        ];
-        const EXTS: &[&str] = &["png", "svg", "xpm"];
-        let mut theme_bases = Vec::new();
-        if let Some(home) = &home {
-            theme_bases.push(home.join(".local/share/icons"));
+        for root in roots {
+            let is_pixmaps = root
+                .file_name()
+                .is_some_and(|part| part.to_string_lossy().contains("pixmaps"));
+            if !is_pixmaps {
+                continue;
+            }
+            for ext in Self::RASTER_ICON_EXTS
+                .iter()
+                .chain(Self::OTHER_ICON_EXTS.iter())
+            {
+                let path = root.join(format!("{base_name}.{ext}"));
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
         }
-        theme_bases.push(PathBuf::from("/usr/local/share/icons"));
-        theme_bases.push(PathBuf::from("/usr/share/icons"));
-        for base in theme_bases {
-            let Ok(themes) = fs::read_dir(&base) else {
+        for root in roots {
+            if root
+                .file_name()
+                .is_some_and(|part| part.to_string_lossy().contains("pixmaps"))
+            {
+                continue;
+            }
+            let Ok(themes) = fs::read_dir(root) else {
                 continue;
             };
-            for theme in themes.flatten() {
-                let tname = theme.file_name().to_string_lossy().into_owned();
-                if tname.starts_with('.') {
+            let mut themes: Vec<PathBuf> = themes
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            // Prefer hicolor (the fallback theme most app icons live in), then
+            // Adwaita, then a stable alphabetical order instead of read_dir's
+            // arbitrary directory order.
+            let rank = |path: &Path| match path.file_name().and_then(|part| part.to_str()) {
+                Some("hicolor") => 0,
+                Some("Adwaita") => 1,
+                _ => 2,
+            };
+            themes.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+            for theme in themes {
+                if theme
+                    .file_name()
+                    .and_then(|part| part.to_str())
+                    .is_some_and(|part| part.starts_with('.'))
+                {
                     continue;
                 }
-                for size in SIZES {
-                    for ext in EXTS {
-                        let p = theme
-                            .path()
-                            .join(size)
-                            .join("apps")
-                            .join(format!("{name}.{ext}"));
-                        if p.exists() {
-                            return Some(p);
+                // Both freedesktop layouts: <theme>/<size>/<context>/ and the
+                // Breeze-style <theme>/<context>/<size>/. Collect existing
+                // directories once, then probe file names in each of them.
+                let mut dirs = Vec::new();
+                for size in Self::ICON_SIZES {
+                    for context in Self::ICON_CONTEXTS {
+                        let dir = theme.join(size).join(context);
+                        if dir.is_dir() {
+                            dirs.push(dir);
+                        }
+                        let dir = theme.join(context).join(size);
+                        if dir.is_dir() {
+                            dirs.push(dir);
+                        }
+                    }
+                }
+                // Two passes: any raster icon wins over an SVG in the same
+                // theme, matching what a size-aware icon loader would do.
+                for exts in [Self::RASTER_ICON_EXTS, Self::OTHER_ICON_EXTS] {
+                    for ext in exts {
+                        let file = format!("{base_name}.{ext}");
+                        for dir in &dirs {
+                            let path = dir.join(&file);
+                            if path.is_file() {
+                                return Some(path);
+                            }
                         }
                     }
                 }
             }
         }
-        for ext in EXTS {
-            let p = PathBuf::from("/usr/share/pixmaps").join(format!("{name}.{ext}"));
-            if p.exists() {
-                return Some(p);
-            }
-        }
         None
+    }
+
+    /// Cached wrapper: a name is resolved at most once per process, so the
+    /// expanded directory walk never repeats on later Finder opens.
+    fn icon_path(name: &str) -> Option<PathBuf> {
+        static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(cache) = cache.lock()
+            && let Some(result) = cache.get(name)
+        {
+            return result.clone();
+        }
+        let result = Self::resolve_icon_path(name, &Self::icon_roots());
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(name.to_string(), result.clone());
+        }
+        result
+    }
+
+    /// Decodes one icon into tight, non-premultiplied RGBA pixels. `image`
+    /// handles raster formats; SVG uses the already-declared `resvg`, whose
+    /// premultiplied output must be converted for `draw_icon`'s blend mode.
+    fn load_icon_rgba(path: &Path, size: u32) -> Option<(Vec<u8>, u32, u32)> {
+        let ext = path
+            .extension()
+            .and_then(|part| part.to_str())
+            .unwrap_or("");
+        if ext.eq_ignore_ascii_case("svg") {
+            let bytes = fs::read(path).ok()?;
+            let options = resvg::usvg::Options::default();
+            let tree = resvg::usvg::Tree::from_data(&bytes, &options).ok()?;
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
+            let svg_size = tree.size();
+            let scale = (size as f32 / svg_size.width()).min(size as f32 / svg_size.height());
+            let tx = (size as f32 - svg_size.width() * scale) / 2.0;
+            let ty = (size as f32 - svg_size.height() * scale) / 2.0;
+            let transform =
+                resvg::tiny_skia::Transform::from_translate(tx, ty).pre_scale(scale, scale);
+            {
+                let mut pixmap_mut = pixmap.as_mut();
+                resvg::render(&tree, transform, &mut pixmap_mut);
+            }
+            let mut data = pixmap.data().to_vec();
+            for pixel in data.chunks_exact_mut(4) {
+                let alpha = pixel[3] as u16;
+                if alpha > 0 && alpha < 255 {
+                    for channel in &mut pixel[..3] {
+                        *channel = ((*channel as u16 * 255) / alpha).min(255) as u8;
+                    }
+                }
+            }
+            Some((data, size, size))
+        } else {
+            let image = image::open(path)
+                .ok()?
+                .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
+            let (width, height) = image.dimensions();
+            Some((image.into_raw(), width, height))
+        }
     }
 
     /// Decodes and uploads at most one visible icon per call, like dwm's
@@ -839,8 +992,9 @@ impl Finder {
     /// enough to delay a frame when done for every row at once; one icon per
     /// event-loop pass keeps the popup responsive while it fills in.
     ///
-    /// Returns true when an icon was attempted, so the caller keeps the pending
-    /// flag set until a pass finds nothing left to load.
+    /// Returns true when a texture was uploaded, so the caller keeps the
+    /// pending flag set until a pass finds nothing left to load. Failed icons
+    /// are marked and skipped instead of being retried every tick.
     fn load_next_icon(&mut self) -> bool {
         let Some(gl) = self.gl.as_mut() else {
             return true;
@@ -850,26 +1004,18 @@ impl Finder {
         let last = (self.scroll_visual + FINDER_ROWS as f64 + 1.0).ceil() as usize;
         for i in first..last.min(self.visible) {
             let idx = self.order[i];
-            if self.apps[idx].icon_loaded {
+            if self.apps[idx].icon_loaded || self.apps[idx].icon_failed {
                 continue;
             }
-            self.apps[idx].icon_loaded = true;
-            let Some(path) = Self::icon_path(&self.apps[idx].icon_name) else {
-                return true;
+            let name = self.apps[idx].icon_name.clone();
+            let Some(path) = Self::icon_path(&name) else {
+                self.apps[idx].icon_failed = true;
+                continue;
             };
-            let Ok(img) = image::open(&path) else {
-                return true;
+            let Some((rgba, w, h)) = Self::load_icon_rgba(&path, ICON_SIZE as u32) else {
+                self.apps[idx].icon_failed = true;
+                continue;
             };
-            // dwm scales icons to FINDER_ICON_SIZE before uploading them.
-            // Uploading a larger source and letting GL scale it with LINEAR
-            // produces the soft, blurred icons the port currently shows.
-            let img = img.resize_exact(
-                ICON_SIZE as u32,
-                ICON_SIZE as u32,
-                image::imageops::FilterType::Lanczos3,
-            );
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
             unsafe {
                 let mut tex = 0;
                 gl::GenTextures(1, &mut tex);
@@ -888,15 +1034,37 @@ impl Finder {
                         0,
                         gl::RGBA,
                         gl::UNSIGNED_BYTE,
-                        rgba.as_raw().as_ptr() as *const _,
+                        rgba.as_ptr() as *const _,
                     );
                     self.apps[idx].icon_tex = tex;
+                    self.apps[idx].icon_loaded = true;
                     self.bump_content_epoch();
+                } else {
+                    self.apps[idx].icon_failed = true;
                 }
             }
             return true;
         }
         false
+    }
+
+    /// GL textures outlive the `App` values that own them, so free them before
+    /// rebuilding the app list on the next open.
+    fn clear_apps(&mut self) {
+        let has_textures = self.apps.iter().any(|app| app.icon_tex != 0);
+        if has_textures
+            && let Some(gl) = self.gl.as_mut()
+            && gl.pbuffer.make_current().is_ok()
+        {
+            unsafe {
+                for app in &self.apps {
+                    if app.icon_tex != 0 {
+                        gl::DeleteTextures(1, &app.icon_tex);
+                    }
+                }
+            }
+        }
+        self.apps.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -944,7 +1112,7 @@ impl Finder {
         self.filter_display_rows = 0;
         self.filter_animating = false;
         self.net.cancel();
-        self.apps.clear();
+        self.clear_apps();
         self.visible = 0;
         self.order.clear();
         self.loading = true;
@@ -2682,6 +2850,13 @@ impl Finder {
         Ok(())
     }
 
+    /// GL scissor rectangle (bottom-left origin) for the app list. The popup
+    /// projection is top-left, so the list must start at `bh` in screen space;
+    /// otherwise scrolling rows paint over the clock/query band on top.
+    fn list_scissor(w: i32, h: i32, bh: i32) -> (i32, i32, i32, i32) {
+        (0, EDGE, w, (h - bh - EDGE).max(0))
+    }
+
     /// Atomically moves/resizes and presents the cached frame. Shared by the
     /// GL-cache-miss path and the cheap cached-frame path.
     fn present(&mut self, drw: &Drw, win: u64, geom: PresentGeom, clock_text: &str) -> Result<()> {
@@ -3005,7 +3180,8 @@ impl Finder {
             } else {
                 unsafe {
                     gl::Enable(gl::SCISSOR_TEST);
-                    gl::Scissor(0, EDGE, w as i32, (h as i32 - 2 * EDGE).max(0));
+                    let (sx, sy, sw, sh) = Self::list_scissor(w as i32, h as i32, bh);
+                    gl::Scissor(sx, sy, sw, sh);
                 }
                 if filter_animating {
                     for pass in [true, false] {
@@ -3548,5 +3724,81 @@ mod tests {
         f.query = "hello".to_string();
         assert!(!f.needs_draw(300, 93, 490, 14, 38, "12:01"));
         assert!(f.needs_draw(300, 93, 491, 14, 38, "12:01"));
+    }
+
+    #[test]
+    fn list_scissor_clips_at_clock_row() {
+        let bh = 38;
+        let h = bh * (1 + FINDER_ROWS) as i32 + EDGE;
+        let (x, y, w, height) = Finder::list_scissor(300, h, bh);
+        assert_eq!((x, y, w), (0, EDGE, 300));
+        // GL y is bottom-left; the top edge in screen space must be `bh`, not
+        // EDGE, so a scrolling row is masked before it enters the clock band.
+        assert_eq!(h - (y + height), bh);
+        assert_eq!(y + height, h - bh);
+    }
+
+    fn icon_test_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rwm-icon-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn icon_path_prefers_raster_over_svg() {
+        let root = icon_test_root("raster");
+        let svg = root.join("hicolor/scalable/apps/sample.svg");
+        let png = root.join("hicolor/48x48/apps/sample.png");
+        std::fs::create_dir_all(svg.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        std::fs::write(&svg, "<svg/>").unwrap();
+        std::fs::write(&png, "png").unwrap();
+        assert_eq!(
+            Finder::resolve_icon_path("sample", &[root.clone()]).unwrap(),
+            png
+        );
+        assert_eq!(
+            Finder::resolve_icon_path("sample.svg", &[root.clone()]).unwrap(),
+            png
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn icon_path_supports_alternate_layouts_and_contexts() {
+        let root = icon_test_root("layouts");
+        let breeze = root.join("breeze/apps/48/legacy-app.svg");
+        let legacy = root.join("AdwaitaLegacy/48x48/legacy/named-app.png");
+        std::fs::create_dir_all(breeze.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&breeze, "<svg/>").unwrap();
+        std::fs::write(&legacy, "png").unwrap();
+        assert_eq!(
+            Finder::resolve_icon_path("legacy-app", &[root.clone()]).unwrap(),
+            breeze
+        );
+        assert_eq!(
+            Finder::resolve_icon_path("named-app", &[root.clone()]).unwrap(),
+            legacy
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn svg_icon_is_rasterized_to_rgba() {
+        let root = icon_test_root("rasterize");
+        let path = root.join("icon.svg");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\">\
+             <rect width=\"24\" height=\"24\" fill=\"#ff0000\"/></svg>",
+        )
+        .unwrap();
+        let (data, w, h) = Finder::load_icon_rgba(&path, ICON_SIZE as u32).unwrap();
+        assert_eq!((w, h), (ICON_SIZE as u32, ICON_SIZE as u32));
+        assert_eq!(data.len(), (ICON_SIZE as usize).pow(2) * 4);
+        assert!(data.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
