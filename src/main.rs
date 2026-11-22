@@ -11,6 +11,7 @@ mod notification;
 mod sound;
 mod status;
 mod text;
+mod tray;
 mod tree;
 mod wm;
 
@@ -18,6 +19,7 @@ use std::env;
 use std::error::Error;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use x11rb::connection::Connection;
@@ -29,6 +31,17 @@ use tree::Rect;
 use wm::Wm;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
+
+/// `kill rwm` (SIGTERM), Ctrl-C, or a hung-up terminal must unwind through
+/// `Drop`: destroying the tray window also destroys every embedded icon, which
+/// crashes apps like Discord when their GdkWindow disappears underneath them.
+/// Signals do not run destructors, so flag the request and let the main loop
+/// call `shutdown()` (via `Drop`) before exiting.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_shutdown_signal(_: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 fn monitor_rects(conn: &RustConnection, root: Window, screen: Rect) -> Result<Vec<Rect>> {
     let reply = randr::get_monitors(conn, root, true)?.reply()?;
@@ -53,6 +66,9 @@ fn main() -> Result {
     // window management on its own connection, as in AnDWM's single `dpy`.
     unsafe {
         x11::xlib::XInitThreads();
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_shutdown_signal as libc::sighandler_t);
+        }
     }
     let (conn, screen_num) = x11rb::connect(None)?;
     let (root, width, height, min_kc, max_kc) = {
@@ -82,6 +98,12 @@ fn main() -> Result {
     }
 
     loop {
+        // A signal interrupts poll() with EINTR; check the flag on every turn
+        // so Drop can reparent tray icons back to root before the connection
+        // closes. Without this, `kill rwm` would strand them in the tray window.
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            break;
+        }
         while let Some(event) = wm.conn.poll_for_event()? {
             wm.handle(event)?;
         }
@@ -98,4 +120,5 @@ fn main() -> Result {
         let timeout = wm.next_tick().saturating_duration_since(Instant::now());
         wm.wait_event(timeout)?;
     }
+    Ok(())
 }

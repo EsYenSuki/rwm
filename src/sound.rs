@@ -1,5 +1,5 @@
 //! dwm.c's `sound_monitor_*` and `on_process`: captures the system output
-//! through PipeWire and publishes its peak level for the clock bar animation.
+//! through PipeWire and publishes raw RMS and peak for the adaptive clock animation.
 
 use std::error::Error;
 use std::io::Cursor;
@@ -21,37 +21,50 @@ use spa::utils::SpaTypes;
 
 use crate::config::PW_MONITOR_SINK;
 
-/// Peak level in `0.0..=1.0` after the `sqrt` mapping, stored as f32 bits.
-pub type Peak = Arc<AtomicU32>;
+/// Raw RMS for the adaptive gain and raw peak for the punchy envelope, both
+/// `0.0..=1.0` stored as f32 bits. Normalization and mapping happen in the WM.
+pub struct Levels {
+    rms: AtomicU32,
+    peak: AtomicU32,
+}
+
+pub type Level = Arc<Levels>;
 
 struct State {
     format: AudioInfoRaw,
-    peak: Peak,
+    level: Level,
 }
 
-/// Starts the capture thread and returns the shared peak. The peak stays at 0
-/// when PipeWire is unavailable, which leaves the clock at its fixed width.
-pub fn start() -> Peak {
-    let peak: Peak = Arc::new(AtomicU32::new(0));
-    let writer = peak.clone();
+/// Starts the capture thread and returns the shared level. It stays at 0 when
+/// PipeWire is unavailable, which leaves the clock at its fixed width.
+pub fn start() -> Level {
+    let level: Level = Arc::new(Levels {
+        rms: AtomicU32::new(0),
+        peak: AtomicU32::new(0),
+    });
+    let writer = level.clone();
     let spawned = thread::Builder::new()
         .name("rwm-sound-bar".into())
         .spawn(move || {
             if let Err(err) = run(writer) {
-                eprintln!("rwm: clock peak monitor stopped: {err}");
+                eprintln!("rwm: clock level monitor stopped: {err}");
             }
         });
     if let Err(err) = spawned {
-        eprintln!("rwm: clock peak monitor not started: {err}");
+        eprintln!("rwm: clock level monitor not started: {err}");
     }
-    peak
+    level
 }
 
-pub fn read(peak: &Peak) -> f32 {
-    f32::from_bits(peak.load(Ordering::Relaxed))
+/// Returns `(rms, peak)` from the most recent buffer.
+pub fn read(level: &Level) -> (f32, f32) {
+    (
+        f32::from_bits(level.rms.load(Ordering::Relaxed)),
+        f32::from_bits(level.peak.load(Ordering::Relaxed)),
+    )
 }
 
-fn run(peak: Peak) -> Result<(), Box<dyn Error>> {
+fn run(level: Level) -> Result<(), Box<dyn Error>> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -70,7 +83,7 @@ fn run(peak: Peak) -> Result<(), Box<dyn Error>> {
     let _listener = stream
         .add_local_listener_with_user_data(State {
             format: AudioInfoRaw::default(),
-            peak,
+            level,
         })
         .param_changed(|_, state, id, param| {
             let Some(param) = param else {
@@ -101,17 +114,23 @@ fn run(peak: Peak) -> Result<(), Box<dyn Error>> {
                 return;
             };
             let count = (size / mem::size_of::<f32>()).min(samples.len() / mem::size_of::<f32>());
+            if count == 0 {
+                return;
+            }
 
-            let mut max = 0.0f32;
+            let mut sum = 0.0f32;
+            let mut peak = 0.0f32;
             for bytes in
                 samples[..count * mem::size_of::<f32>()].chunks_exact(mem::size_of::<f32>())
             {
                 let sample = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                max = max.max(sample.abs());
+                sum += sample * sample;
+                peak = peak.max(sample.abs());
             }
 
-            let level = max.min(1.0).sqrt();
-            state.peak.store(level.to_bits(), Ordering::Relaxed);
+            let rms = (sum / count as f32).sqrt();
+            state.level.rms.store(rms.to_bits(), Ordering::Relaxed);
+            state.level.peak.store(peak.to_bits(), Ordering::Relaxed);
         })
         .register()?;
 

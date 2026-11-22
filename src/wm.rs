@@ -29,7 +29,8 @@ use x11rb::{CURRENT_TIME, NONE};
 
 use crate::bar::{
     BAR_BACKGROUND_PIXEL, BAR_TRANSPARENT_PIXEL, BARGAP, CLOCKPAD, CursorLoader, HORIZPADBAR,
-    KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL, Metrics, TAG_LABEL, TAGS,
+    KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL, Metrics, SYSTRAY_SPACING, TAG_LABEL, TAGS,
+    TRAY_ICON_MAX, TRAY_ICON_MIN, VERTPADBAR,
 };
 use crate::config::{self, BORDERPX, FLOATBAR, TOPBAR};
 use crate::drw::Drw;
@@ -51,18 +52,18 @@ const WM_STATE_ICONIC: u32 = 3;
 
 /// Pointer motion throttle during a drag, matching dwm's `1000 / 60`.
 const DRAG_FRAME: Duration = Duration::from_millis(16);
-/// The one cadence for every animated bar value. Clock peaks and scrolling
+/// The one cadence for every animated bar value. Clock levels and scrolling
 /// titles advance on this same grid, so redraws never come from two timers
-/// with different phases. This is dwm's `1000 / DRAW_FPS` = 50 fps.
-const BAR_TICK: Duration = Duration::from_millis(20);
+/// with different phases. 1000 / 60 rounded up to whole microseconds.
+const BAR_TICK: Duration = Duration::from_micros(16_667);
 /// `poll()` has millisecond resolution, so accept a wakeup up to 1 ms early.
-/// Otherwise a 19 ms return skips to the next 20 ms slot and halves the rate.
+/// Otherwise a 16 ms return skips the next 16.67 ms slot and halves the rate.
 const TICK_GRACE: Duration = Duration::from_millis(1);
 /// Slow fallback for wakeups that only background threads can cause (PipeWire
-/// peaks and MPRIS snapshots). Used when no bar animation is active.
+/// levels and MPRIS snapshots). Used when no bar animation is active.
 const IDLE_POLL: Duration = Duration::from_millis(500);
-/// Scrolling title moves one pixel every two bar ticks (40 ms). A separate
-/// 33 ms timer used to fire between ticks and produced uneven redraw gaps.
+/// Scrolling title moves one pixel every two bar ticks (~33 ms). A separate
+/// timer used to fire between ticks and produced uneven redraw gaps.
 const SCROLL_TICKS: u32 = 2;
 /// Don't repaint the MPRIS panel until the interpolated progress bar would
 /// move by about a pixel. This replaces the old once-per-second Position poll.
@@ -156,8 +157,8 @@ fn hinted_axis(
 }
 
 /// Initial outer geometry of a floating client. A client-requested position
-/// wins; otherwise a transient dialog centers on its parent and any other
-/// floating window centers on the monitor's work area (below the bar).
+/// that belongs to this monitor wins; a stale one from another monitor falls
+/// back to centering on the transient parent or the monitor's work area.
 fn floating_geometry(hints: &SizeHints, area: Rect, parent: Option<Rect>, border: i32) -> Rect {
     let avail_w = (area.w as i32 - 2 * FLOAT_MARGIN).max(1);
     let avail_h = (area.h as i32 - 2 * FLOAT_MARGIN).max(1);
@@ -191,13 +192,18 @@ fn floating_geometry(hints: &SizeHints, area: Rect, parent: Option<Rect>, border
     rect.w = rect.w.min(avail_w.max(2 * border + 1) as u32);
     rect.h = rect.h.min(avail_h.max(2 * border + 1) as u32);
 
-    // Toolkits routinely publish PPosition=(0,0) as a placeholder. Only an
-    // explicit user position (or a non-origin program position) overrides
-    // centering; otherwise that placeholder would pin pkexec dialogs to the
-    // top-left corner.
-    let explicit_pos = hints
-        .requested_pos
-        .filter(|(x, y)| hints.user_position || *x != 0 || *y != 0);
+    // ICCCM distinguishes a weak PPosition ("program specified") from a strong
+    // USPosition ("user specified"). Toolkits routinely publish PPosition=(0,0)
+    // as a placeholder, and Electron-style clients may compute a real one for
+    // a different monitor (or before the screens were arranged). Trust a user
+    // position always, but only trust a program position that lands on this
+    // monitor; anything else centers here instead of being clamped to an edge.
+    let explicit_pos = hints.requested_pos.filter(|(x, y)| {
+        if *x == 0 && *y == 0 && !hints.user_position {
+            return false;
+        }
+        hints.user_position || area.contains(*x, *y)
+    });
     let (x, y) = if let Some((hx, hy)) = explicit_pos {
         let (ox, oy) = gravity_offset(hints.gravity, rect.w as i32, rect.h as i32);
         (hx - ox, hy - oy)
@@ -322,6 +328,47 @@ fn wants_floating(
     ) || transient_for.is_some()
         || is_modal
         || has_fixed_size(hints)
+}
+
+/// The map state we last told X to put a client in. `pending_unmaps` counts
+/// UnmapNotify events from our own UnmapWindow requests that have not arrived
+/// yet; an UnmapNotify with no such event outstanding came from the client.
+#[derive(Clone, Copy, Default)]
+struct MapTracking {
+    mapped: bool,
+    pending_unmaps: u32,
+}
+
+impl MapTracking {
+    /// True when an UnmapWindow request must be sent. X emits no UnmapNotify
+    /// for a window that is already unmapped, so do not count those.
+    fn unmap(&mut self) -> bool {
+        if !self.mapped {
+            return false;
+        }
+        self.mapped = false;
+        self.pending_unmaps += 1;
+        true
+    }
+
+    /// A remap does not consume a pending unmap event: the event is still in
+    /// the queue and still belongs to the WM's earlier request.
+    fn map(&mut self) {
+        self.mapped = true;
+    }
+
+    /// True when this UnmapNotify came from the client and should iconify it.
+    fn consume_unmap(&mut self) -> bool {
+        if self.pending_unmaps > 0 {
+            self.pending_unmaps -= 1;
+            return false;
+        }
+        if self.mapped {
+            self.mapped = false;
+            return true;
+        }
+        false
+    }
 }
 
 pub struct Client {
@@ -498,6 +545,13 @@ struct Atoms {
     motif_wm_hints: u32,
     no_animation: u32,
     rwm_monitor: u32,
+    manager: u32,
+    net_system_tray_opcode: u32,
+    net_system_tray_orientation: u32,
+    net_system_tray_visual: u32,
+    xembed: u32,
+    xembed_info: u32,
+    targets: u32,
 }
 
 pub struct Wm {
@@ -509,6 +563,11 @@ pub struct Wm {
     /// Iconified clients in the order they were unmapped. `Deiconify` pops the
     /// newest, so any number of windows can be hidden and restored one by one.
     iconified_stack: Vec<Window>,
+    /// The WM's view of each managed client's X map state, including unmap
+    /// events we still owe from our own UnmapWindow requests. Those events are
+    /// not a withdraw; any other UnmapNotify means the client unmapped itself
+    /// (e.g. closing to the tray) and must be treated as iconification.
+    client_maps: RefCell<HashMap<Window, MapTracking>>,
     pub selmon: usize,
     keys: Vec<Key>,
     keysyms: Vec<u32>,
@@ -535,15 +594,19 @@ pub struct Wm {
     /// an XRender picture for the 32-bit window.
     finder_argb_visual_ptr: *mut xlib::Visual,
     clock: String,
-    /// Shared PipeWire peak for the animated clock width. It is sampled in the
+    /// Shared PipeWire RMS for the animated clock width. It is sampled in the
     /// main loop instead of a separate fixed-cadence thread, so there is no
-    /// second 50 Hz wakeup just to publish one atomic.
-    clock_peak: Option<crate::sound::Peak>,
-    /// Last time the peak was sampled, on the shared `BAR_TICK` grid.
+    /// second 60 Hz wakeup just to publish one atomic.
+    clock_level: Option<crate::sound::Level>,
+    /// Smoothed adaptive gain applied to the level before the dBFS mapping.
+    clock_gain: f32,
+    /// Last time the level was sampled, on the shared `BAR_TICK` grid.
     clock_anim_last: Instant,
     /// dwm's `clockbar_dynw` minus `clockbar_cw`: px the clock bar grows past
     /// its text width on the selected monitor.
     clock_extra: i32,
+    /// Freedesktop system tray: selection owner and the docked XEMBED icons.
+    tray: crate::tray::Tray,
     /// Typed top-right bar values and `kbstr` (keyboard layout).
     bar_status: crate::status::Status,
     kbstr: String,
@@ -814,6 +877,13 @@ impl Wm {
             motif_wm_hints: intern(b"_MOTIF_WM_HINTS")?,
             no_animation: intern(b"_NO_ANIMATION")?,
             rwm_monitor: intern(b"_RWM_MONITOR")?,
+            manager: intern(b"MANAGER")?,
+            net_system_tray_opcode: intern(b"_NET_SYSTEM_TRAY_OPCODE")?,
+            net_system_tray_orientation: intern(b"_NET_SYSTEM_TRAY_ORIENTATION")?,
+            net_system_tray_visual: intern(b"_NET_SYSTEM_TRAY_VISUAL")?,
+            xembed: intern(b"_XEMBED")?,
+            xembed_info: intern(b"_XEMBED_INFO")?,
+            targets: intern(b"TARGETS")?,
         };
 
         let (visual_id, depth) = bar_visual(&conn, root)?;
@@ -895,18 +965,41 @@ impl Wm {
             };
         let metrics = Metrics::new(dpy, screen)?;
         let drw = Drw::new(dpy, screen, root as x11::xlib::Window)?;
-        let clock_peak = if config::CLOCK_ANIMATE {
+        let clock_level = if config::CLOCK_ANIMATE {
             Some(crate::sound::start())
         } else {
             None
         };
         let monitor_count = monitors.len();
+        // Use the root visual for the tray. An ARGB visual would look nicer,
+        // but already-running apps (Discord included) create their icon
+        // windows on the 24-bit root visual and XReparentWindow rejects a
+        // depth mismatch.
+        let (tray_visual, tray_depth) = (visual_id, depth);
+        let tray = crate::tray::Tray::new(
+            &conn,
+            root,
+            crate::tray::Atoms {
+                manager: atoms.manager,
+                opcode: atoms.net_system_tray_opcode,
+                orientation: atoms.net_system_tray_orientation,
+                visual: atoms.net_system_tray_visual,
+                xembed: atoms.xembed,
+                xembed_info: atoms.xembed_info,
+                targets: atoms.targets,
+            },
+            cursor_loader.screen(),
+            tray_visual,
+            tray_depth,
+            BAR_BACKGROUND_PIXEL,
+        )?;
         let mut wm = Wm {
             conn,
             root,
             monitors,
             clients: Vec::new(),
             iconified_stack: Vec::new(),
+            client_maps: RefCell::new(HashMap::new()),
             selmon: 0,
             keys,
             keysyms,
@@ -923,9 +1016,11 @@ impl Wm {
             finder_argb_colormap,
             finder_argb_visual_ptr,
             clock: now_clock(),
-            clock_peak,
+            clock_level,
+            clock_gain: 1.0,
             clock_anim_last: Instant::now() - BAR_TICK,
             clock_extra: 0,
+            tray,
             bar_status,
             kbstr: "us".to_string(),
             bar_dirty: true,
@@ -971,6 +1066,7 @@ impl Wm {
                 eprintln!("rwm: notification GL unavailable: {err}");
             }
         }
+        wm.tray.claim(&wm.conn, wm.root)?;
         wm.conn.change_property32(
             PropMode::REPLACE,
             root,
@@ -985,6 +1081,13 @@ impl Wm {
         wm.init_xkb();
         wm.init_randr();
         wm.setup_ewmh()?;
+        // Apps that started before this WM (or before the last restart) do not
+        // resend their one-shot dock request. Adopt their XEMBED windows now,
+        // before the normal client scan can mistake them for clients.
+        let scanned = wm.tray.scan_existing(&wm.conn, wm.root)?;
+        if scanned > 0 {
+            wm.relayout_tray()?;
+        }
         wm.scan_existing_windows()?;
         wm.conn.flush()?;
         Ok(wm)
@@ -1226,6 +1329,7 @@ impl Wm {
             ours.insert(m.finder_markerwin);
         }
         ours.insert(self.supporting_wm_check);
+        ours.insert(self.tray.window);
         // A previous WM that does not publish _NET_WM_DESKTOP (vanilla dwm is
         // one) leaves hidden windows with no record of their workspace. Keep
         // them off the workspace selected now instead of dumping them all
@@ -1373,6 +1477,51 @@ impl Wm {
 
     fn bar_h(&self) -> i32 {
         self.metrics.bar_height()
+    }
+
+    /// dwm's `updatesystrayicongeom()`: icons fill `bh - vertpadbar` vertically.
+    fn tray_icon_size(&self) -> i32 {
+        (self.bar_h() - VERTPADBAR).clamp(TRAY_ICON_MIN, TRAY_ICON_MAX)
+    }
+
+    /// Only the selected monitor shows the single system tray, so only its
+    /// status section is pushed left to make room for it.
+    fn tray_width(&self, mi: usize) -> i32 {
+        if mi == self.selmon {
+            self.tray.width(self.tray_icon_size(), SYSTRAY_SPACING)
+        } else {
+            0
+        }
+    }
+
+    fn tray_x(&self, mi: usize) -> i32 {
+        let m = &self.monitors[mi];
+        let bar_right = if FLOATBAR {
+            m.wx + m.ww - m.gaps.ov
+        } else {
+            m.wx + m.ww
+        };
+        bar_right - self.tray_width(mi)
+    }
+
+    fn is_tray_icon(&self, win: Window) -> bool {
+        self.tray.contains(win)
+    }
+
+    fn relayout_tray(&mut self) -> Result {
+        let size = self.tray_icon_size();
+        self.tray
+            .layout(&self.conn, size, SYSTRAY_SPACING, self.bar_h())?;
+        self.conn.flush()?;
+        self.bar_dirty = true;
+        Ok(())
+    }
+
+    fn dock_tray_icon(&mut self, win: Window) -> Result {
+        if self.tray.dock(&self.conn, win)? {
+            self.relayout_tray()?;
+        }
+        Ok(())
     }
 
     /// dwm's `updatesizehints()`, using x11rb's `WM_SIZE_HINTS` parser.
@@ -2071,7 +2220,9 @@ impl Wm {
         };
         let kw = self.metrics.text_width(&self.kbstr) + 2 * KBLAYOUTPAD;
         let tw = self.tagsbarwidth();
-        let used = tw + rw + cw + kw + 4 * BARGAP;
+        let tray_w = self.tray_width(mi);
+        let tray_gap = if tray_w > 0 { BARGAP } else { 0 };
+        let used = tw + rw + cw + kw + 4 * BARGAP + tray_w + tray_gap;
         let avail = if barw > used { barw - used } else { 0 };
         let budget = if avail > BORDERPX {
             avail - BORDERPX
@@ -2096,7 +2247,7 @@ impl Wm {
     fn clock_window_width(&self, mi: usize, cw: i32) -> i32 {
         if mi == self.selmon && (self.finder.is_active() || self.notification.is_center_active()) {
             // The popup geometry is already the full center width; the audio
-            // peak animation is suppressed while an overlay owns this window.
+            // audio animation is suppressed while an overlay owns this window.
             cw
         } else if mi == self.selmon {
             cw + self.clock_extra
@@ -2280,6 +2431,9 @@ impl Wm {
                 self.place_cached(win, m.wx, m.by, 1, bh)?;
                 self.set_mapped(win, false)?;
             }
+            if mi == self.selmon {
+                self.set_mapped(self.tray.window, false)?;
+            }
             self.set_mapped(m.mpris_markerwin, false)?;
             self.unmap_finder_marker(mi)?;
             self.center_shown.borrow_mut()[mi] = false;
@@ -2288,7 +2442,7 @@ impl Wm {
 
         let b = self.barwidths(mi);
         let lx = if FLOATBAR { m.wx + m.gaps.ov } else { m.wx };
-        let rx = lx + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw;
+        let rx = self.rightbar_x(mi);
 
         self.place_cached(m.barwin, lx, m.by, b.tw, bh)?;
         self.set_mapped(m.barwin, true)?;
@@ -2343,6 +2497,18 @@ impl Wm {
         };
         self.place_cached(m.barrightwin, rx, m.by, b.rw, right_h)?;
         self.set_mapped(m.barrightwin, true)?;
+
+        if mi == self.selmon {
+            let tw = self.tray_width(mi);
+            self.place_cached(
+                self.tray.window,
+                self.tray_x(mi),
+                m.by,
+                tw.max(1),
+                bh,
+            )?;
+            self.set_mapped(self.tray.window, tw > 0)?;
+        }
         Ok(())
     }
 
@@ -2893,6 +3059,62 @@ impl Wm {
         Ok(())
     }
 
+    /// Record the initial X map state of a client we just adopted.
+    fn track_client(&self, win: Window, mapped: bool) {
+        self.client_maps.borrow_mut().insert(
+            win,
+            MapTracking {
+                mapped,
+                pending_unmaps: 0,
+            },
+        );
+    }
+
+    /// Unmap a client ourselves, counting the UnmapNotify it will generate so
+    /// the event handler does not mistake it for the client withdrawing. X
+    /// emits no event when the window is already unmapped, so only count (and
+    /// send) when we believe it is mapped.
+    fn wm_unmap(&self, win: Window) -> Result {
+        let mut maps = self.client_maps.borrow_mut();
+        let Some(state) = maps.get_mut(&win) else {
+            self.conn.unmap_window(win)?;
+            return Ok(());
+        };
+        if !state.unmap() {
+            return Ok(());
+        }
+        drop(maps);
+        if let Err(err) = self.conn.unmap_window(win) {
+            if let Some(state) = self.client_maps.borrow_mut().get_mut(&win) {
+                state.pending_unmaps = state.pending_unmaps.saturating_sub(1);
+            }
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
+    /// Map a visible client. Keep any pending unmap count: even after we remap,
+    /// the earlier UnmapNotify can still be waiting in the event queue and
+    /// must still be attributed to the WM, not to the client.
+    fn wm_map(&self, win: Window) -> Result {
+        if let Some(state) = self.client_maps.borrow_mut().get_mut(&win) {
+            state.map();
+        }
+        self.conn.map_window(win)?;
+        Ok(())
+    }
+
+    /// Consume one UnmapNotify. Returns true when it was caused by the client
+    /// (rather than by an UnmapWindow request of ours) and the client was
+    /// believed mapped at the time.
+    fn consume_client_unmap(&self, win: Window) -> bool {
+        let mut maps = self.client_maps.borrow_mut();
+        let Some(state) = maps.get_mut(&win) else {
+            return false;
+        };
+        state.consume_unmap()
+    }
+
     /// Unmap a client that is not visible on the current tag set.
     ///
     /// Drop the cached geometry for every hidden client, fullscreen ones
@@ -2904,8 +3126,7 @@ impl Wm {
     /// of fullscreen.
     fn unmap_hidden_client(&self, c: &Client) -> Result {
         self.geom_cache.borrow_mut().remove(&c.win);
-        self.conn.unmap_window(c.win)?;
-        Ok(())
+        self.wm_unmap(c.win)
     }
 
     /// Publish ICCCM `WM_STATE`. Panels use IconicState to show a client as
@@ -3055,7 +3276,7 @@ impl Wm {
             let shown = self.is_visible(c)
                 && Self::map_allowed(c.win, c.floating, fs_on(c.mon).map(|(_, w)| w));
             if shown {
-                self.conn.map_window(c.win)?;
+                self.wm_map(c.win)?;
             } else {
                 self.unmap_hidden_client(c)?;
             }
@@ -3196,6 +3417,13 @@ impl Wm {
         if self.should_ignore_window(win) {
             return Ok(());
         }
+        // A MapRequest arrives before the server maps the window (the WM has
+        // SubstructureRedirect), so its attributes still say UNMAPPED there.
+        // arrange() maps it right after adoption and updates the tracking.
+        let initial_mapped = attrs
+            .as_ref()
+            .map(|a| a.map_state == x11rb::protocol::xproto::MapState::VIEWABLE)
+            .unwrap_or(true);
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
         let (mx, my) = (pointer.root_x as i32, pointer.root_y as i32);
         let mi = initial_mon
@@ -3310,6 +3538,7 @@ impl Wm {
                 urgent,
             },
         );
+        self.track_client(win, initial_mapped);
         self.selmon = mi;
         self.monitors[mi].sel = Some(win);
         // Every managed client gets an ICCCM state, so taskbars can tell a
@@ -3347,6 +3576,7 @@ impl Wm {
         };
         let client = self.clients.remove(idx);
         self.iconified_stack.retain(|&w| w != win);
+        self.client_maps.borrow_mut().remove(&win);
         self.name_cache.borrow_mut().remove(&win);
         self.geom_cache.borrow_mut().remove(&win);
         for zone in client.edge_wins {
@@ -3402,34 +3632,62 @@ impl Wm {
         true
     }
 
-    /// Current peak-derived width in pixels, without changing any state.
-    fn pending_clock_extra(&self) -> i32 {
-        let Some(peak) = self.clock_peak.as_ref() else {
-            return 0;
+    /// Maps a normalized level to the one-bar dBFS meter. `CLOCK_METER_MIN_DB`
+    /// is 0 px and full scale is `CLOCK_ANIM_EXTRA` px.
+    fn clock_extra_from_rms(normalized_rms: f32) -> i32 {
+        let db = if normalized_rms > 1e-8 {
+            20.0 * normalized_rms.log10()
+        } else {
+            -100.0
         };
-        let level = crate::sound::read(peak);
-        if level < config::CLOCK_PEAK_EPSILON {
-            return 0;
-        }
+        // Expand around the expected normalized peak so quiet passages drop
+        // much lower and beats push higher, instead of hovering at one level.
+        let center = 20.0 * (config::CLOCK_RMS_TARGET * config::CLOCK_EXPECTED_CREST).log10();
+        let db = (center + (db - center) * config::CLOCK_DYNAMIC_EXPAND)
+            .clamp(config::CLOCK_METER_MIN_DB, 0.0);
+        let span = -config::CLOCK_METER_MIN_DB;
+        let px = (db - config::CLOCK_METER_MIN_DB) / span * config::CLOCK_ANIM_EXTRA as f32;
         let step = config::CLOCK_ANIM_STEP.max(1);
-        let raw = (level * config::CLOCK_ANIM_EXTRA as f32) as i32;
+        let raw = px as i32;
         ((raw / step) * step).clamp(0, config::CLOCK_ANIM_EXTRA)
     }
 
-    /// Samples the PipeWire peak on the shared `BAR_TICK` grid. The main loop
-    /// now always provides that cadence while clock animation is enabled; this
-    /// returns true when the quantized width changed.
+    /// Adapts a linear gain so `rms` lands near `CLOCK_RMS_TARGET`. Near silence
+    /// the previous gain is held, and changes are smoothed in log (dB) space
+    /// with the same time constant in both directions.
+    fn adaptive_gain(gain: f32, rms: f32, dt: f32) -> f32 {
+        let desired = if rms >= config::CLOCK_RMS_GATE {
+            (config::CLOCK_RMS_TARGET / rms.max(config::CLOCK_RMS_FLOOR))
+                .clamp(config::CLOCK_GAIN_MIN, config::CLOCK_GAIN_MAX)
+        } else {
+            gain
+        };
+        let alpha = 1.0 - (-dt / config::CLOCK_GAIN_ADAPT_SECS).exp();
+        let current = gain.max(1e-6).ln();
+        let target = desired.max(1e-6).ln();
+        (current + (target - current) * alpha).exp()
+    }
+
+    /// Samples the PipeWire RMS/peak on the shared `BAR_TICK` grid. The RMS
+    /// drives the adaptive gain (normalization); the normalized peak goes
+    /// straight to the meter. Returns true when the quantized width changed.
     pub fn update_clock_anim(&mut self) -> bool {
-        if self.clock_peak.is_none() {
+        let Some(level) = self.clock_level.as_ref() else {
             return false;
-        }
+        };
         let now = Instant::now();
-        if now.duration_since(self.clock_anim_last) + TICK_GRACE < BAR_TICK {
+        let elapsed = now.duration_since(self.clock_anim_last);
+        if elapsed + TICK_GRACE < BAR_TICK {
             return false;
         }
         self.clock_anim_last = now;
 
-        let extra = self.pending_clock_extra();
+        // Cap long gaps (e.g. while a popup owns the center window) so the
+        // gain does not jump in one step when animation resumes.
+        let dt = elapsed.as_secs_f32().min(0.1);
+        let (rms, peak) = crate::sound::read(level);
+        self.clock_gain = Self::adaptive_gain(self.clock_gain, rms, dt);
+        let extra = Self::clock_extra_from_rms(peak * self.clock_gain);
         if extra == self.clock_extra {
             return false;
         }
@@ -3517,7 +3775,7 @@ impl Wm {
     }
 
     /// Picks the earliest deadline for the next bar tick. Keeping this pure
-    /// makes the 50 fps clock guarantee testable without a live `Wm`.
+    /// makes the 60 fps clock guarantee testable without a live `Wm`.
     fn bar_next_tick(
         now: Instant,
         status_next: Instant,
@@ -3528,10 +3786,10 @@ impl Wm {
         finder_next: Option<Instant>,
     ) -> Instant {
         let mut next = status_next;
-        // dwm's run(): always clamp the poll timeout to 1000 / DRAW_FPS while
-        // the clock visualizer is enabled. Sampling only when the last sample
-        // already differs from the drawn width misses peaks that arrive just
-        // after the deadline was computed, which left idle animation at 1 fps.
+        // Clamp the poll timeout to BAR_TICK while the clock visualizer is
+        // enabled. Sampling only when the last sample already differs from the
+        // drawn width misses levels that arrive just after the deadline was
+        // computed, which left idle animation at 1 fps.
         if clock_animate && !finder_active {
             next = next.min(now + BAR_TICK);
         }
@@ -4018,9 +4276,7 @@ impl Wm {
                 let ph = (bh * 2) as u32;
                 let (marker_x, marker_y, marker_w, marker_h) =
                     crate::bar::mpris_knob(rw as i32, bh, player.volume, marker_hovered);
-                let lx = if FLOATBAR { m.wx + m.gaps.ov } else { m.wx };
-                let rx = lx + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw;
-                let x = rx + marker_x;
+                let x = self.rightbar_x(mi) + marker_x;
                 let y = m.by + marker_y;
                 self.place_cached(marker_win, x, y, marker_w, marker_h)?;
                 self.set_mapped(marker_win, true)?;
@@ -4141,9 +4397,9 @@ impl Wm {
         }
         // dwm freezes the animated clock width while Finder or a notification
         // owns the center window, so its resize deadline never competes with
-        // the popup frames. Still sample the peak so it resumes in sync.
-        let clock_peak_changed = self.update_clock_anim();
-        let clock_anim = !finder_active && !notification_active && clock_peak_changed;
+        // the popup frames. Still sample the level so it resumes in sync.
+        let clock_level_changed = self.update_clock_anim();
+        let clock_anim = !finder_active && !notification_active && clock_level_changed;
         if self.update_status() {
             bars = true;
         }
@@ -4198,10 +4454,9 @@ impl Wm {
     }
 
     fn rightbar_x(&self, mi: usize) -> i32 {
-        let m = &self.monitors[mi];
         let b = self.barwidths(mi);
-        let left = if FLOATBAR { m.wx + m.gaps.ov } else { m.wx };
-        left + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw
+        let gap = if self.tray_width(mi) > 0 { BARGAP } else { 0 };
+        self.tray_x(mi) - gap - b.rw
     }
 
     fn update_mpris_marker_class(&self, mi: usize) -> Result {
@@ -4489,6 +4744,11 @@ impl Wm {
         }
         match event {
             Event::MapRequest(e) => {
+                if self.is_tray_icon(e.window) {
+                    self.tray.set_visible(e.window, true);
+                    self.relayout_tray()?;
+                    return Ok(());
+                }
                 if !self.is_managed(e.window) {
                     // Do not manage override-redirect or InputOnly windows.
                     let attrs = self
@@ -4511,16 +4771,57 @@ impl Wm {
                     // A managed client mapping itself must not escape its
                     // workspace: let the layout decide whether it is visible.
                     // A blind map here would leave a hidden window on screen
-                    // until the next arrange() unmaps it again.
+                    // until the next arrange() unmaps it again. Clear the
+                    // iconified flag first, though: a client restoring from the
+                    // tray withdrew itself, so without this arrange() would
+                    // unmap it again on the same pass.
+                    self.set_hidden(e.window, false)?;
+                    // apply_layout() sets the real map state when it maps the
+                    // window; if the client belongs to another tag it stays
+                    // unmapped and must not be counted as mapped here.
                     self.arrange()?;
                 }
                 self.bar_dirty = true;
             }
-            // Hidden clients are unmapped by apply_layout, so UnmapNotify is
-            // not a sign that a client went away. DestroyNotify handles that.
-            Event::UnmapNotify(_) => {}
+            // Tray icons hide by unmapping, so the row must shrink to close the
+            // gap. Managed clients we unmapped ourselves (tag switch, iconify,
+            // fullscreen) are marked by wm_unmap(); anything else is the client
+            // withdrawing its own window, e.g. "close to tray" in Electron apps.
+            // DestroyNotify is still what removes a client that went away.
+            Event::UnmapNotify(e) => {
+                // Reparenting a mapped icon (scan_existing adopting an icon left
+                // mapped by Discord or a previous WM) makes X do an internal
+                // UnmapWindow before the reparent. That UnmapNotify is reported
+                // via SubstructureNotify on the old parent, root, which we
+                // select. It is our own reparent, not the app hiding the icon,
+                // so ignore it or the freshly docked icon is immediately hidden.
+                if self.is_tray_icon(e.window)
+                    && e.event != self.root
+                    && self.tray.set_visible(e.window, false)
+                {
+                    self.relayout_tray()?;
+                }
+                if !self.consume_client_unmap(e.window) {
+                    return Ok(());
+                }
+                if self.is_managed(e.window)
+                    && !self.clients.iter().any(|c| c.win == e.window && c.hidden)
+                {
+                    // Without this the client stays "visible" in the tree: its
+                    // tile is never released, and switching workspaces makes
+                    // apply_layout() map the window again even though the
+                    // client has stopped painting it, leaving an empty frame.
+                    self.set_hidden(e.window, true)?;
+                    self.arrange()?;
+                    self.bar_dirty = true;
+                }
+            }
             Event::DestroyNotify(e) => {
-                self.unmanage(e.window)?;
+                if self.tray.undock(e.window) {
+                    self.relayout_tray()?;
+                } else {
+                    self.unmanage(e.window)?;
+                }
                 self.bar_dirty = true;
             }
             Event::ConfigureNotify(e) if e.window == self.root => {
@@ -4536,6 +4837,11 @@ impl Wm {
                 self.updategeom()?;
             }
             Event::ConfigureRequest(e) => {
+                if self.is_tray_icon(e.window) {
+                    // Icons do not choose their own cell; re-apply our geometry.
+                    self.relayout_tray()?;
+                    return Ok(());
+                }
                 if let Some((idx, mi, floating)) = self
                     .clients
                     .iter()
@@ -4833,6 +5139,13 @@ impl Wm {
                 self.bar_dirty = true;
             }
             Event::PropertyNotify(e)
+                if e.atom == self.atoms.xembed_info && self.is_tray_icon(e.window) =>
+            {
+                if self.tray.read_info(&self.conn, e.window) {
+                    self.relayout_tray()?;
+                }
+            }
+            Event::PropertyNotify(e)
                 if e.atom == u32::from(AtomEnum::WM_NAME) || e.atom == self.atoms.net_wm_name =>
             {
                 if e.window == self.root {
@@ -4972,6 +5285,16 @@ impl Wm {
             Event::ClientMessage(e) => {
                 self.client_message(e)?;
             }
+            Event::SelectionRequest(e) => {
+                self.tray.selection_request(&self.conn, &e)?;
+                self.conn.flush()?;
+            }
+            Event::SelectionClear(e) if e.selection == self.tray.selection => {
+                // Another tray took over. Hide our icons so their windows are
+                // not stranded as visible children of an inert tray.
+                self.tray.release(&self.conn);
+                self.bar_dirty = true;
+            }
             Event::Expose(e) => {
                 // Like dwm's expose(), only the last event in a batch needs a
                 // repaint, and only the window that was actually exposed. A
@@ -5003,6 +5326,29 @@ impl Wm {
     }
 
     fn client_message(&mut self, e: ClientMessageEvent) -> Result {
+        if e.type_ == self.atoms.net_system_tray_opcode {
+            // Freedesktop sends the message to the selection owner, with the
+            // icon window both in `window` and in data.l[1]. Accept either
+            // convention so different toolkits can dock.
+            let data = e.data.as_data32();
+            let icon = data.get(2).copied().or_else(|| data.get(1).copied()).unwrap_or(0);
+            if e.window == self.tray.window || icon == e.window
+                || data.get(1).copied().unwrap_or(0) == e.window
+            {
+                if self.tray.opcode(&self.conn, self.tray.window, &data)? {
+                    // A newly docked icon must be placed and mapped now; apps
+                    // do not necessarily follow the dock request with a map.
+                    self.relayout_tray()?;
+                    self.conn.flush()?;
+                }
+                return Ok(());
+            }
+        }
+        if self.tray.is_xembed_message(&e) {
+            self.tray.handle_xembed(&self.conn, &e)?;
+            self.conn.flush()?;
+            return Ok(());
+        }
         if e.type_ == self.atoms.net_active_window {
             let win = e.window;
             if let Some(ci) = self.clients.iter().position(|c| c.win == win) {
@@ -5123,9 +5469,11 @@ impl Wm {
             } else if state == WM_STATE_NORMAL {
                 self.restore_client(e.window)?;
             } else if state == WM_STATE_WITHDRAWN {
-                // WithdrawnState -> unmap
-                let _ = self.conn.unmap_window(e.window);
-                self.conn.flush()?;
+                // WithdrawnState: the client gives up being shown. Hide it like
+                // an iconified window so its tile collapses and a later tag
+                // switch does not remap an empty, withdrawn window.
+                self.set_hidden(e.window, true)?;
+                self.arrange()?;
             }
         } else if e.type_ == self.atoms.net_wm_ping {
             // Reply to ping
@@ -5324,8 +5672,8 @@ impl Wm {
                     }
                     last_frame = Instant::now();
                 }
-                // Bar animation uses the same 20 ms grid as the main loop, not
-                // the 16 ms pointer gate, so drags cannot run a second clock.
+                // Bar animation uses the main loop's 16.67 ms grid, not the
+                // 16 ms pointer gate, so drags cannot run a second clock.
                 if last_bar_tick.elapsed() >= BAR_TICK {
                     self.refresh()?;
                     last_bar_tick = Instant::now();
@@ -5341,8 +5689,8 @@ impl Wm {
     /// Waits until the X connection has an event or `timeout` expires. The
     /// main loop uses this instead of an unconditional sleep, so an event is
     /// handled as soon as it arrives like C dwm's blocking `XNextEvent`.
-    /// Round up: truncating a just-under-20 ms deadline to 19 ms made the
-    /// 50 fps clock cadence slightly slower than dwm's integer `poll()` value.
+    /// Round up: truncating a fractional-millisecond deadline made the 60 fps
+    /// clock cadence slightly slower than the requested 16.67 ms interval.
     pub fn wait_event(&self, timeout: Duration) -> Result {
         let mut pfd = libc::pollfd {
             fd: self.conn.stream().as_raw_fd(),
@@ -6191,6 +6539,7 @@ impl Wm {
             let _ = self.conn.free_colormap(self.finder_argb_colormap);
             self.finder_argb_colormap = 0;
         }
+        self.tray.destroy(&self.conn);
         let _ = self.conn.flush();
     }
 }
@@ -6210,13 +6559,13 @@ mod tests {
     }
 
     #[test]
-    fn clock_animation_uses_50fps_deadline_without_finder() {
+    fn clock_animation_uses_60fps_deadline_without_finder() {
         let now = Instant::now();
         let status_next = now + Duration::from_secs(1);
 
         let animated = Wm::bar_next_tick(now, status_next, true, false, false, now, None);
         assert_eq!(animated, now + BAR_TICK);
-        assert_eq!(BAR_TICK, Duration::from_millis(20));
+        assert_eq!(BAR_TICK, Duration::from_micros(16_667));
 
         let idle = Wm::bar_next_tick(now, status_next, false, false, false, now, None);
         assert_eq!(idle, now + IDLE_POLL);
@@ -6224,6 +6573,62 @@ mod tests {
         let finder_next = now + Duration::from_millis(10);
         let finder = Wm::bar_next_tick(now, status_next, true, true, false, now, Some(finder_next));
         assert_eq!(finder, finder_next);
+    }
+
+    #[test]
+    fn adaptive_gain_targets_rms_and_smooths_in_log_space() {
+        let rms = 0.008;
+        let desired = config::CLOCK_RMS_TARGET / rms;
+        let alpha = 1.0 - (-1.0_f32).exp(); // one time constant
+        let expected = (desired.ln() * alpha).exp();
+        let gained = Wm::adaptive_gain(1.0, rms, config::CLOCK_GAIN_ADAPT_SECS);
+        assert!((gained - expected).abs() < 1e-4);
+        assert!(gained > 1.0 && gained < desired);
+
+        // Given enough time it settles at the gain that hits the target RMS.
+        let settled = Wm::adaptive_gain(gained, rms, 10.0);
+        assert!((settled - desired).abs() < 0.01);
+    }
+
+    #[test]
+    fn adaptive_gain_holds_near_silence_and_is_bounded() {
+        let held = Wm::adaptive_gain(7.5, config::CLOCK_RMS_GATE / 2.0, 1.0);
+        assert!((held - 7.5).abs() < 1e-4);
+
+        let quiet = Wm::adaptive_gain(1.0, 0.0009, 1.0);
+        assert!(quiet > 1.0 && quiet <= config::CLOCK_GAIN_MAX);
+        let loud = Wm::adaptive_gain(1.0, 1.0, 1.0);
+        assert!(loud >= config::CLOCK_GAIN_MIN && loud < 1.0);
+    }
+
+    #[test]
+    fn adaptive_gain_equalizes_quiet_and_loud_sources() {
+        let mut quiet = 1.0;
+        let mut loud = 1.0;
+        for _ in 0..600 {
+            quiet = Wm::adaptive_gain(quiet, 0.01, BAR_TICK.as_secs_f32());
+            loud = Wm::adaptive_gain(loud, 0.5, BAR_TICK.as_secs_f32());
+        }
+        assert!((0.01 * quiet - config::CLOCK_RMS_TARGET).abs() < 0.001);
+        assert!((0.5 * loud - config::CLOCK_RMS_TARGET).abs() < 0.001);
+    }
+
+    #[test]
+    fn clock_extra_maps_dbfs_to_quantized_pixels() {
+        assert_eq!(Wm::clock_extra_from_rms(0.0), 0);
+        assert_eq!(Wm::clock_extra_from_rms(0.001), 0); // below the meter floor
+        assert_eq!(Wm::clock_extra_from_rms(1.0), config::CLOCK_ANIM_EXTRA);
+
+        let target = Wm::clock_extra_from_rms(config::CLOCK_RMS_TARGET);
+        assert!(target > 0 && target < config::CLOCK_ANIM_EXTRA);
+        assert_eq!(target % config::CLOCK_ANIM_STEP, 0);
+
+        // Expansion must spread quiet and loud levels across the meter rather
+        // than keep them bunched near one width.
+        let quiet = Wm::clock_extra_from_rms(0.02);
+        let loud = Wm::clock_extra_from_rms(0.3);
+        assert!(quiet < config::CLOCK_ANIM_EXTRA / 2);
+        assert!(loud > quiet + config::CLOCK_ANIM_EXTRA / 2);
     }
 
     #[test]
@@ -6235,6 +6640,47 @@ mod tests {
         assert!(Wm::map_allowed(1, false, Some(1)));
         assert!(!Wm::map_allowed(2, false, Some(1)));
         assert!(Wm::map_allowed(2, true, Some(1)));
+    }
+
+    #[test]
+    fn own_unmaps_are_not_mistaken_for_a_client_withdraw() {
+        let mut state = MapTracking {
+            mapped: true,
+            pending_unmaps: 0,
+        };
+        assert!(state.unmap());
+        assert!(!state.consume_unmap());
+        assert_eq!(state.pending_unmaps, 0);
+        // Unmapping an already unmapped client sends no event, so it must not
+        // leave a marker that would swallow a later real withdraw.
+        assert!(!state.unmap());
+        assert_eq!(state.pending_unmaps, 0);
+    }
+
+    #[test]
+    fn unmap_notify_in_flight_when_we_remap_still_belongs_to_us() {
+        let mut state = MapTracking {
+            mapped: true,
+            pending_unmaps: 0,
+        };
+        assert!(state.unmap());
+        state.map(); // a second arrange before the UnmapNotify was read
+        assert!(!state.consume_unmap());
+        assert!(state.mapped);
+        // A genuine withdraw after that is still recognized.
+        assert!(state.consume_unmap());
+        assert!(!state.mapped);
+    }
+
+    #[test]
+    fn client_withdraw_is_recognized_and_not_reported_twice() {
+        let mut state = MapTracking {
+            mapped: true,
+            pending_unmaps: 0,
+        };
+        assert!(state.consume_unmap());
+        assert!(!state.mapped);
+        assert!(!state.consume_unmap());
     }
 
     #[test]
@@ -6425,6 +6871,7 @@ mod tests {
         let offscreen = SizeHints {
             requested_pos: Some((-100, -100)),
             requested_size: Some((800, 600)),
+            user_position: true, // a user choice is clamped, a program one centers
             ..Default::default()
         };
         let geom = floating_geometry(&offscreen, work_area(), None, BORDERPX);
@@ -6447,6 +6894,60 @@ mod tests {
         };
         let geom = floating_geometry(&explicit, work_area(), None, BORDERPX);
         assert_eq!((geom.x, geom.y), (0, 30));
+    }
+
+    #[test]
+    fn program_position_from_another_monitor_centers_on_the_assigned_monitor() {
+        // HDMI-1 starts at y=768. The updater asked for 810,209, which is the
+        // center of eDP-1 at 277x0; it must not be clamped to HDMI's top edge.
+        let area = Rect {
+            x: 0,
+            y: 812,
+            w: 1920,
+            h: 1036,
+        };
+        let hints = SizeHints {
+            min_w: 300,
+            min_h: 350,
+            max_w: 300,
+            max_h: 350,
+            base_w: 300,
+            base_h: 350,
+            requested_size: Some((300, 350)),
+            requested_pos: Some((810, 209)),
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, area, None, BORDERPX);
+        assert_eq!(
+            geom,
+            Rect {
+                x: 808,
+                y: 1153,
+                w: 304,
+                h: 354
+            }
+        );
+    }
+
+    #[test]
+    fn program_position_on_the_assigned_monitor_is_still_honored() {
+        let hints = SizeHints {
+            requested_pos: Some((400, 400)),
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!((geom.x, geom.y), (400, 400));
+    }
+
+    #[test]
+    fn user_position_outside_the_work_area_is_honored_and_clamped() {
+        let hints = SizeHints {
+            requested_pos: Some((810, 10)),
+            user_position: true,
+            ..Default::default()
+        };
+        let geom = floating_geometry(&hints, work_area(), None, BORDERPX);
+        assert_eq!((geom.x, geom.y), (810, 30));
     }
 
     #[test]

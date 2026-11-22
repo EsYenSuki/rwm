@@ -58,13 +58,32 @@ pub const COL_NORM_BORDER: u32 = 0x27372d;
 /// config.def.h `colors[SchemeSel][ColBorder]`: border of the focused window.
 pub const COL_SEL_BORDER: u32 = 0x94E2D5;
 
-/// dwm.c `CLOCK_ANIMATE`: the clock bar grows with the audio peak. 0 disables it.
+/// dwm.c `CLOCK_ANIMATE`: the clock bar grows with the audio level. 0 disables it.
 pub const CLOCK_ANIMATE: bool = true;
 /// dwm.c `CLOCK_ANIM_EXTRA`: most px the clock bar grows past its text width.
-pub const CLOCK_ANIM_EXTRA: i32 = 280;
-/// Peaks below this are treated as silence, so monitor noise cannot make the
-/// clock bar animate while nothing is playing.
-pub const CLOCK_PEAK_EPSILON: f32 = 0.02;
+pub const CLOCK_ANIM_EXTRA: i32 = 100;
+/// Adaptive RMS normalization: target output RMS. Gain is adjusted so a quiet
+/// or loud source still lands near this level, which keeps the bar useful
+/// without touching playback audio.
+pub const CLOCK_RMS_TARGET: f32 = 0.08;
+/// Gain bounds for the visualizer only. 100 is +40 dB.
+pub const CLOCK_GAIN_MIN: f32 = 0.01;
+pub const CLOCK_GAIN_MAX: f32 = 100.0;
+/// Denominator floor when computing gain, plus the gate below which gain is
+/// held instead of boosted (so silence/noise is not amplified).
+pub const CLOCK_RMS_FLOOR: f32 = 0.001;
+pub const CLOCK_RMS_GATE: f32 = 0.0008;
+/// Gain smoothing time constant, in seconds. Long enough to track overall
+/// loudness rather than each beat, so dynamics reach the bar instead of being
+/// compressed away. Smoothing happens in log space.
+pub const CLOCK_GAIN_ADAPT_SECS: f32 = 0.8;
+/// dBFS floor of the one-bar meter. -40..0 dB maps to 0..CLOCK_ANIM_EXTRA px.
+/// A narrower range leaves more pixels for the crest of each beat.
+pub const CLOCK_METER_MIN_DB: f32 = -40.0;
+/// Expected peak/RMS ratio of the normalized signal. Levels near this crest
+/// are the visual center; expansion pushes below it down and peaks further up.
+pub const CLOCK_EXPECTED_CREST: f32 = 3.0;
+pub const CLOCK_DYNAMIC_EXPAND: f32 = 1.7;
 /// Clock animation widths are quantized to this many pixels. Fewer, larger
 /// resizes mean fewer damaged regions for the compositor to repaint.
 pub const CLOCK_ANIM_STEP: i32 = 4;

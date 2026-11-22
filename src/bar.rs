@@ -250,6 +250,12 @@ pub const HORIZPADBAR: i32 = 6;
 pub(crate) const MPRIS_WIDTH: i32 = 240;
 pub(crate) const MPRIS_CONTROL_W: i32 = 34;
 pub(crate) const MPRIS_SCROLL_PAD: i32 = 8;
+/// config.h `systrayspacing`: gap before each icon and after the last one,
+/// matching dwm's `getsystraywidth()` / `updatesystray()`.
+pub const SYSTRAY_SPACING: i32 = 6;
+/// Icon cells are capped so a tall bar does not produce oversized tray icons.
+pub const TRAY_ICON_MAX: i32 = 24;
+pub const TRAY_ICON_MIN: i32 = 16;
 pub const TAGS: usize = 5;
 pub(crate) const ULINEPAD: i32 = 5;
 pub(crate) const ULINESTROKE: i32 = 2;
