@@ -89,8 +89,6 @@ fn tag_keys(keys: &mut Vec<Key>) {
     }
 }
 
-const TOGGLE_KB: &str = "setxkbmap -layout us,th -option grp:win_space_toggle";
-
 /// Bindings in dwm config.def.h order. Every matching binding runs, as in dwm.
 pub fn bindings() -> Vec<Key> {
     use Action::*;
@@ -175,11 +173,9 @@ pub fn bindings() -> Vec<Key> {
             keysym: XK_minus,
             action: Spawn("picom-zoom -0.4"),
         },
-        Key {
-            mods: MOD_4,
-            keysym: XK_space,
-            action: Spawn(TOGGLE_KB),
-        },
+        // Win+Space belongs to XKB's grp:win_space_toggle option. Grabbing it
+        // here made rwm run setxkbmap too, which reset the group right after
+        // XKB switched it to Thai.
         Key {
             mods: MOD_4 | MOD_CONTROL,
             keysym: XK_b,

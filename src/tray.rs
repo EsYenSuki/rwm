@@ -188,6 +188,21 @@ impl Tray {
         self.icons.is_empty()
     }
 
+    /// Icon whose cell contains local coordinate `x`, using the same layout as
+    /// `layout()`. Used to associate a click on the tray with the app that owns
+    /// the icon, so a menu mapped a moment later can be recognised.
+    pub fn icon_at(&self, x: i32, icon_h: i32, spacing: i32) -> Option<Window> {
+        let mut left = spacing;
+        for icon in self.icons.iter().filter(|i| i.visible) {
+            let w = icon.width(icon_h);
+            if x >= left && x < left + w {
+                return Some(icon.win);
+            }
+            left += w + spacing;
+        }
+        None
+    }
+
     /// dwm's `getsystraywidth()`: every icon is preceded by `spacing` and the
     /// last one is followed by another `spacing`. Only visible icons count.
     pub fn width(&self, icon_h: i32, spacing: i32) -> i32 {

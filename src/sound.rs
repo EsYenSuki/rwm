@@ -5,7 +5,7 @@ use std::error::Error;
 use std::io::Cursor;
 use std::mem;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use pipewire as pw;
@@ -26,6 +26,10 @@ use crate::config::PW_MONITOR_SINK;
 pub struct Levels {
     rms: AtomicU32,
     peak: AtomicU32,
+    /// Set while the bar is hidden behind a fullscreen window. The capture
+    /// stream keeps draining buffers, but the per-buffer RMS/peak math is
+    /// skipped so an invisible visualizer costs no CPU.
+    paused: AtomicBool,
 }
 
 pub type Level = Arc<Levels>;
@@ -41,6 +45,7 @@ pub fn start() -> Level {
     let level: Level = Arc::new(Levels {
         rms: AtomicU32::new(0),
         peak: AtomicU32::new(0),
+        paused: AtomicBool::new(false),
     });
     let writer = level.clone();
     let spawned = thread::Builder::new()
@@ -62,6 +67,13 @@ pub fn read(level: &Level) -> (f32, f32) {
         f32::from_bits(level.rms.load(Ordering::Relaxed)),
         f32::from_bits(level.peak.load(Ordering::Relaxed)),
     )
+}
+
+/// Suspends the RMS/peak calculation while the animated bar is invisible.
+/// Buffers are still dequeued (below), so the stream does not stall and the
+/// first frame after resuming uses a current level instead of a stale one.
+pub fn set_paused(level: &Level, paused: bool) {
+    level.paused.store(paused, Ordering::Relaxed);
 }
 
 fn run(level: Level) -> Result<(), Box<dyn Error>> {
@@ -104,6 +116,11 @@ fn run(level: Level) -> Result<(), Box<dyn Error>> {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            // Keep the capture stream flowing while the WM is in fullscreen
+            // idle; only the arithmetic that feeds the hidden bar is skipped.
+            if state.level.paused.load(Ordering::Relaxed) {
+                return;
+            }
             let datas = buffer.datas_mut();
             if datas.is_empty() || state.format.channels() == 0 {
                 return;

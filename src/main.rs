@@ -91,6 +91,11 @@ fn main() -> Result {
     };
     let rects = monitor_rects(&conn, root, screen)?;
     let mut wm = Wm::new(conn, root, rects, min_kc, max_kc)?;
+    // `next_tick()` returns a deadline relative to the moment it is called, so
+    // keep the one computed after the last refresh instead of asking again at
+    // the top of every loop. Otherwise the BAR_TICK deadline is always 16 ms in
+    // the future and only the stale 1 s status deadline can trigger a refresh.
+    let mut next_refresh = wm.next_tick();
 
     // Each argument is a shell command started at launch, e.g. `rwm xterm "firefox"`.
     for cmd in env::args().skip(1) {
@@ -107,6 +112,11 @@ fn main() -> Result {
         while let Some(event) = wm.conn.poll_for_event()? {
             wm.handle(event)?;
         }
+        // Pointer crossings, fullscreen toggles and tag changes can all change
+        // whether the pointer's monitor is fullscreen. Apply that before the
+        // refresh/deadline check so the 60 fps bar tick stops or resumes on the
+        // same loop iteration as the event, not a tick later.
+        wm.sync_bar_suspended();
         if wm.restart {
             // exec() does not run Drop, so release grabs and bar windows first.
             wm.shutdown();
@@ -114,11 +124,16 @@ fn main() -> Result {
             let err = Command::new(exe).args(env::args().skip(1)).exec();
             return Err(err.into());
         }
-        wm.refresh()?;
+        if wm.finder_active()
+            || wm.needs_refresh()
+            || next_refresh.saturating_duration_since(Instant::now()).is_zero()
+        {
+            wm.refresh()?;
+            next_refresh = wm.next_tick();
+        }
         // All animated bar values advance on the single deadline refresh()
         // just computed. Block on the X connection until then or an event.
-        let timeout = wm.next_tick().saturating_duration_since(Instant::now());
-        wm.wait_event(timeout)?;
+        wm.wait_event(next_refresh.saturating_duration_since(Instant::now()))?;
     }
     Ok(())
 }

@@ -11,5 +11,5 @@ libc = "0.2.191"
 pipewire = "0.10.1"
 resvg = "0.45.1"
 x11 = { version = "2.21.0", features = ["xlib", "xft", "xrender", "xcursor", "glx"] }
-x11rb = { version = "0.14.0", features = ["randr", "xkb"] }
+x11rb = { version = "0.14.0", features = ["randr", "shape", "xkb", "xinput"] }
 zbus = "5.19"

@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::ffi::{c_uint, c_ulong};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -15,13 +16,15 @@ use x11rb::connection::Connection;
 use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
 use x11rb::protocol::Event;
 use x11rb::protocol::randr;
+use x11rb::protocol::shape::{ConnectionExt as ShapeConnectionExt, SK, SO};
+use x11rb::protocol::xinput::{self, ConnectionExt as InputConnectionExt};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ButtonPressEvent, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux,
-    ClientMessageEvent, ColormapAlloc, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
-    ConnectionExt, CreateWindowAux, EnterNotifyEvent, EventMask, GrabMode, GrabStatus, Gravity,
-    InputFocus, KeyPressEvent, LeaveNotifyEvent, ModMask, MotionNotifyEvent, PropMode, StackMode,
-    Window, WindowClass,
+    ClientMessageEvent, ClipOrdering, ColormapAlloc, ConfigWindow, ConfigureNotifyEvent,
+    ConfigureWindowAux, ConnectionExt, CreateWindowAux, EnterNotifyEvent, EventMask, GrabMode,
+    GrabStatus, Gravity, InputFocus, KeyPressEvent, LeaveNotifyEvent, ModMask, MotionNotifyEvent,
+    PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -32,7 +35,9 @@ use crate::bar::{
     KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL, Metrics, SYSTRAY_SPACING, TAG_LABEL, TAGS,
     TRAY_ICON_MAX, TRAY_ICON_MIN, VERTPADBAR,
 };
-use crate::config::{self, BORDERPX, FLOATBAR, TOPBAR};
+use crate::config::{
+    self, BORDERPX, FLOATBAR, TOPBAR, TRAY_MENUS_ABOVE_BAR,
+};
 use crate::drw::Drw;
 use crate::finder::Finder;
 use crate::keys::{self, Action, GapScope, Key, MOD_4, TAG_COUNT, TAGMASK};
@@ -62,6 +67,11 @@ const TICK_GRACE: Duration = Duration::from_millis(1);
 /// Slow fallback for wakeups that only background threads can cause (PipeWire
 /// levels and MPRIS snapshots). Used when no bar animation is active.
 const IDLE_POLL: Duration = Duration::from_millis(500);
+/// While the pointer is on a fullscreen monitor the bar is not mapped, so none
+/// of the 60 fps bar work is needed. Wake only this slowly to drain D-Bus
+/// notifications (delivered over a channel, not an X event) before they can
+/// pile up and pop up on resume.
+const FULLSCREEN_IDLE_POLL: Duration = Duration::from_millis(500);
 /// Scrolling title moves one pixel every two bar ticks (~33 ms). A separate
 /// timer used to fire between ticks and produced uneven redraw gaps.
 const SCROLL_TICKS: u32 = 2;
@@ -292,6 +302,16 @@ pub enum WinType {
     Dnd,
 }
 
+/// Menus, context popups and tooltips. These are the windows a tray app maps
+/// when its icon is clicked; they are override-redirect far more often than
+/// regular client windows.
+fn is_popup_win_type(t: WinType) -> bool {
+    matches!(
+        t,
+        WinType::Menu | WinType::DropdownMenu | WinType::PopupMenu | WinType::Tooltip
+    )
+}
+
 /// ICCCM `WM_NORMAL_HINTS` with min == max on both axes leave the WM no legal
 /// resize: tiling such a window would only fight its hints. Zero means "not
 /// specified", so it is not a fixed size. This is deliberately app-agnostic:
@@ -337,6 +357,10 @@ fn wants_floating(
 struct MapTracking {
     mapped: bool,
     pending_unmaps: u32,
+    /// Last iconic value published to the client. `None` until the first sync,
+    /// so an adopted unmapped client still gets an IconicState property. Used
+    /// to avoid rewriting both state properties on every layout pass.
+    published_iconic: Option<bool>,
 }
 
 impl MapTracking {
@@ -490,6 +514,20 @@ enum CenterKind {
     Finder,
 }
 
+/// The last click on a tray icon, used to associate a window the app maps in
+/// response with its icon. Toolkits don't agree on a hint for this: Qt uses
+/// `WM_TRANSIENT_FOR`, GTK mostly uses a popup window type, and some apps set
+/// neither. WM_CLASS plus a short grace period covers the last case.
+struct TrayClick {
+    at: Instant,
+    class: Option<(String, String)>,
+}
+
+/// How long after a tray click a newly mapped window may still be adopted as
+/// that icon's menu. Long enough for slow toolkits, short enough that an
+/// unrelated window opened a second later is left alone.
+const TRAY_MENU_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 struct Atoms {
     wm_protocols: u32,
@@ -607,12 +645,23 @@ pub struct Wm {
     clock_extra: i32,
     /// Freedesktop system tray: selection owner and the docked XEMBED icons.
     tray: crate::tray::Tray,
+    /// Windows opened from a tray icon that must stay stacked above the bar.
+    /// Both popup windows and full client windows the app opens from the icon
+    /// can land here; only the stacking is changed, never their layout.
+    tray_menus: RefCell<Vec<Window>>,
+    /// Most recent ButtonPress delivered to a tray icon or the tray container.
+    tray_click: RefCell<Option<TrayClick>>,
     /// Typed top-right bar values and `kbstr` (keyboard layout).
     bar_status: crate::status::Status,
     kbstr: String,
     /// Set by an event that may change what the bar shows. Window motion and
     /// client configure events deliberately do not set it.
     bar_dirty: bool,
+    /// True while the pointer's monitor shows a fullscreen window. The timed
+    /// bar tick (visualizer, status, scrolling titles and repaints) is suspended
+    /// then; named refreshes still run so entering and leaving fullscreen is
+    /// drawn exactly once. The PipeWire sampler is paused along with it.
+    bar_suspended: bool,
     /// Exposed bar windows must repaint even when their contents are unchanged.
     /// Only these windows are forced, as in dwm's per-monitor `expose()`.
     force_windows: RefCell<HashSet<Window>>,
@@ -656,6 +705,8 @@ pub struct Wm {
     /// dwm's `enablegaps`, toggled by `ToggleGaps`.
     gaps_enabled: bool,
     resize_cursors: ResizeCursors,
+    /// Hand cursor for the clickable tag/workspace strip.
+    tag_cursor: u32,
     /// Modal application launcher, including its GL/presentation resources.
     finder: Finder,
     /// Freedesktop notifications and AnDWM's hover history, drawn through the
@@ -821,6 +872,28 @@ impl Wm {
         )?
         .check()?;
 
+        // Core ButtonPress is exclusive per window: an icon that selects it for
+        // its own menu stops the event from reaching the WM. XI2 has no such
+        // restriction, so watch button presses on the root and use the pointer
+        // position to detect clicks on the tray without stealing the app's
+        // click. Older servers without XI2 simply lose this one heuristic;
+        // transient_for and window type still identify most menus.
+        if TRAY_MENUS_ABOVE_BAR
+            && conn
+                .xinput_xi_query_version(2, 0)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some()
+        {
+            let _ = conn.xinput_xi_select_events(
+                root,
+                &[xinput::EventMask {
+                    deviceid: 0,
+                    mask: vec![xinput::XIEventMask::BUTTON_PRESS],
+                }],
+            );
+        }
+
         let intern =
             |name: &[u8]| -> Result<u32> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
         let atoms = Atoms {
@@ -946,6 +1019,7 @@ impl Wm {
         let bar_status = status.sample_with_mpris(Some(&mpris));
         let cursor_loader = CursorLoader::open()?;
         let resize_cursors = create_resize_cursors(&cursor_loader);
+        let tag_cursor = cursor_loader.load("pointer");
         conn.change_window_attributes(
             root,
             &ChangeWindowAttributesAux::new().cursor(cursor_loader.load("left_ptr")),
@@ -1021,9 +1095,12 @@ impl Wm {
             clock_anim_last: Instant::now() - BAR_TICK,
             clock_extra: 0,
             tray,
+            tray_menus: RefCell::new(Vec::new()),
+            tray_click: RefCell::new(None),
             bar_status,
             kbstr: "us".to_string(),
             bar_dirty: true,
+            bar_suspended: false,
             force_windows: RefCell::new(HashSet::new()),
             bar_mapped: RefCell::new(HashSet::new()),
             bar_drawn: RefCell::new(HashMap::new()),
@@ -1046,6 +1123,7 @@ impl Wm {
             xkb_event_base: 0,
             gaps_enabled: true,
             resize_cursors,
+            tag_cursor,
             finder: Finder::new(),
             notification: crate::notification::NotificationManager::new(notification_handle),
             notification_fullscreen: false,
@@ -1067,6 +1145,7 @@ impl Wm {
             }
         }
         wm.tray.claim(&wm.conn, wm.root)?;
+        wm.set_bar_window_class(wm.tray.window)?;
         wm.conn.change_property32(
             PropMode::REPLACE,
             root,
@@ -1107,9 +1186,23 @@ impl Wm {
 
     /// dwm's setup block: select Xkb StateNotify and read the layout once.
     fn init_xkb(&mut self) {
+        // Xlib calls XkbUseExtension automatically during XOpenDisplay. x11rb
+        // does not, and without that negotiation XKB requests fail with Access.
+        let supported = self
+            .conn
+            .xkb_use_extension(1, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.supported);
+        if !supported {
+            return;
+        }
+        // The XKB extension registers itself as "XKEYBOARD". Querying "XKB"
+        // returns present=0 on this server, which made us skip event selection
+        // entirely, so group-only switches never reached the bar.
         let (present, first_event) = self
             .conn
-            .query_extension(b"XKB")
+            .query_extension(xkb::X11_EXTENSION_NAME.as_bytes())
             .ok()
             .and_then(|c| c.reply().ok())
             .map(|r| (r.present, r.first_event))
@@ -1117,21 +1210,29 @@ impl Wm {
         if !present {
             return;
         }
+        let group_parts = u16::from(xkb::StatePart::GROUP_STATE)
+            | u16::from(xkb::StatePart::GROUP_BASE)
+            | u16::from(xkb::StatePart::GROUP_LATCH)
+            | u16::from(xkb::StatePart::GROUP_LOCK);
         let aux = xkb::SelectEventsAux::new().state_notify(xkb::SelectEventsAuxStateNotify {
-            affect_state: xkb::StatePart::default(),
-            state_details: xkb::StatePart::default(),
+            affect_state: xkb::StatePart::from(group_parts),
+            state_details: xkb::StatePart::from(group_parts),
         });
-        let selected = self
-            .conn
-            .xkb_select_events(
-                xkb::ID::USE_CORE_KBD.into(),
-                xkb::EventType::default(),
-                xkb::EventType::STATE_NOTIFY,
-                xkb::MapPart::default(),
-                xkb::MapPart::default(),
-                &aux,
-            )
-            .is_ok();
+        let selected = match self.conn.xkb_select_events(
+            xkb::ID::USE_CORE_KBD.into(),
+            xkb::EventType::default(),
+            // x11rb derives `affect_which` from `details`. Passing
+            // STATE_NOTIFY here too means "select all details", which
+            // conflicts with the per-event details in `aux` and panics
+            // while serializing.
+            xkb::EventType::default(),
+            xkb::MapPart::default(),
+            xkb::MapPart::default(),
+            &aux,
+        ) {
+            Ok(cookie) => cookie.check().is_ok(),
+            Err(_) => false,
+        };
         if selected {
             self.xkb_event_base = first_event;
         }
@@ -1294,10 +1395,62 @@ impl Wm {
             .get_keyboard_mapping(self.min_keycode, count as u8)?
             .reply()?;
         let per = map.keysyms_per_keycode as usize;
-        self.keysyms = (0..count).map(|i| map.keysyms.get(i * per).copied().unwrap_or(0)).collect();
+        self.keysyms = (0..count)
+            .map(|i| map.keysyms.get(i * per).copied().unwrap_or(0))
+            .collect();
         self.grab_keys(self.max_keycode)?;
         self.conn.flush()?;
+        self.refresh_xlib_keymap();
         Ok(())
+    }
+
+    /// `event_keysym()` uses the Xlib Display from `Drw`. Xlib caches the
+    /// keyboard mapping, so a live `setxkbmap` would leave it translating with
+    /// the old US table even though x11rb and the bar see the new layout.
+    fn refresh_xlib_keymap(&self) {
+        let dpy = self.drw.dpy();
+        if dpy.is_null() {
+            return;
+        }
+        let mut event: xlib::XMappingEvent = unsafe { std::mem::zeroed() };
+        event.type_ = xlib::MappingNotify;
+        event.display = dpy;
+        event.request = xlib::MappingKeyboard;
+        event.first_keycode = self.min_keycode as i32;
+        event.count = (self.max_keycode - self.min_keycode + 1) as i32;
+        unsafe {
+            xlib::XRefreshKeyboardMapping(&mut event);
+        }
+    }
+
+    /// Keysym for a key press in the layout the user is actually typing in.
+    ///
+    /// `keysyms` caches the first keysym of each keycode (group 0), which is
+    /// what WM bindings are grabbed with. An XKB group switch does not emit a
+    /// core MappingNotify, so that cache stays US even when the rest of the
+    /// system has switched to Thai. Text input has to follow the group carried
+    /// in the event state instead, or Finder and notification fields keep
+    /// typing English while every other app accepts Thai.
+    fn event_keysym(&self, e: &KeyPressEvent) -> u32 {
+        let dpy = self.drw.dpy();
+        if !dpy.is_null() {
+            let mut consumed: c_uint = 0;
+            let mut sym: c_ulong = 0;
+            // XLookupKeysym ignores the group bits in the event state (its
+            // index selects group 0/1), which is exactly why Finder stayed in
+            // English. XkbLookupKeySym translates keycode + full event state,
+            // so the active group is honoured.
+            let ok = unsafe {
+                xlib::XkbLookupKeySym(dpy, e.detail, u32::from(e.state), &mut consumed, &mut sym)
+            };
+            if ok != 0 && sym != 0 {
+                return sym as u32;
+            }
+        }
+        self.keysyms
+            .get(usize::from(e.detail.saturating_sub(self.min_keycode)))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Adopt existing top-level windows (startup scan).
@@ -1522,6 +1675,123 @@ impl Wm {
             self.relayout_tray()?;
         }
         Ok(())
+    }
+
+    /// A ButtonPress on an icon (or on the empty tray) marks the short window
+    /// in which windows mapped by that app are treated as its menus. Selecting
+    /// ButtonPress on the icons in `Tray::dock` is what makes these events
+    /// visible; the app still receives the very same click.
+    fn record_tray_click(&self, icon: Window) {
+        if TRAY_MENUS_ABOVE_BAR {
+            *self.tray_click.borrow_mut() = Some(TrayClick {
+                at: Instant::now(),
+                class: if icon != 0 { self.read_wm_class(icon) } else { None },
+            });
+        }
+    }
+
+    /// Is this root coordinate inside the selected monitor's tray cell? The
+    /// tray is only mapped on `selmon`, so other monitors have zero width.
+    fn pointer_in_tray(&self, x: i32, y: i32) -> bool {
+        let mi = self.selmon;
+        let tw = self.tray_width(mi);
+        let tx = self.tray_x(mi);
+        let ty = self.monitors[mi].by;
+        tw > 0 && x >= tx && x < tx + tw && y >= ty && y < ty + self.bar_h()
+    }
+
+    /// Is `win` a menu or window opened from a tray icon?
+    ///
+    /// The reliable hints are checked first: a `WM_TRANSIENT_FOR` pointing at
+    /// an icon, or a menu parented by the icon or the tray container. Toolkits
+    /// that set neither are caught by the popup window type or by the class of
+    /// the icon that was just clicked, within a short grace period.
+    fn is_tray_menu(&self, win: Window) -> bool {
+        if !TRAY_MENUS_ABOVE_BAR
+            || win == 0
+            || win == self.tray.window
+            || self.is_tray_icon(win)
+            || self.tray_menus.borrow().contains(&win)
+        {
+            return false;
+        }
+        let menus = self.tray_menus.borrow();
+        if self.read_transient_for(win).is_some_and(|p| {
+            self.is_tray_icon(p) || p == self.tray.window || menus.contains(&p)
+        }) {
+            return true;
+        }
+        let parent = self
+            .conn
+            .query_tree(win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.parent);
+        let popup = is_popup_win_type(self.read_win_type(win));
+        if parent == Some(self.tray.window) {
+            return true;
+        }
+        // A submenu is commonly transient for, or parented by, the menu that
+        // opened it rather than by the icon. Follow tracked menus here too.
+        if parent.is_some_and(|p| (self.is_tray_icon(p) || menus.contains(&p)) && popup) {
+            return true;
+        }
+        drop(menus);
+        let click_borrow = self.tray_click.borrow();
+        let Some(click) = click_borrow.as_ref() else {
+            return false;
+        };
+        if click.at.elapsed() > TRAY_MENU_GRACE || parent != Some(self.root) {
+            return false;
+        }
+        // Only top-level windows are adopted by the class heuristic; an icon's
+        // own drawing children are not menus and must never be reparented.
+        popup
+            || match (&click.class, self.read_wm_class(win)) {
+                (Some(a), Some(b)) => *a == b,
+                _ => false,
+            }
+    }
+
+    /// Remember a tray menu and put it on top of the bar layer. A menu created
+    /// as a child of an icon has to move to the root first: X stacks siblings
+    /// within one parent, so raising it inside the tray subtree cannot lift it
+    /// above the bar windows, which are siblings of the tray container.
+    fn track_tray_menu(&self, win: Window) -> Result {
+        if !TRAY_MENUS_ABOVE_BAR || win == 0 {
+            return Ok(());
+        }
+        {
+            let mut menus = self.tray_menus.borrow_mut();
+            if menus.contains(&win) {
+                return Ok(());
+            }
+            menus.push(win);
+        }
+        let parent = self.conn.query_tree(win)?.reply()?.parent;
+        if parent == self.tray.window || self.is_tray_icon(parent) {
+            if let Ok(coords) = self
+                .conn
+                .translate_coordinates(win, self.root, 0, 0)?
+                .reply()
+            {
+                self.conn
+                    .reparent_window(win, self.root, coords.dst_x, coords.dst_y)?;
+            }
+        }
+        let _ = self
+            .conn
+            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn raise_tray_menus(&self) {
+        for &win in self.tray_menus.borrow().iter() {
+            let _ = self
+                .conn
+                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        }
     }
 
     /// dwm's `updatesizehints()`, using x11rb's `WM_SIZE_HINTS` parser.
@@ -1909,6 +2179,22 @@ impl Wm {
         Ok(())
     }
 
+    /// dwm gives the bar windows `WM_CLASS(STRING) = "dwm", "dwm"`. Apply it
+    /// to the sections, center and tray; Finder/notification popups and the
+    /// separate markers manage their own classes.
+    fn set_bar_window_class(&self, win: Window) -> Result {
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                win,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                b"dwm\0dwm\0",
+            )?
+            .check()?;
+        Ok(())
+    }
+
     /// Creates the bar windows and markers for a single monitor.
     fn create_monitor_ui(&mut self, mi: usize) -> Result {
         let bh = self.bar_h() as u16;
@@ -1935,8 +2221,17 @@ impl Wm {
             .create_colormap(ColormapAlloc::NONE, cmap, self.root, self.visual_id)?;
 
         let mut wins = [0 as Window; 4];
-        for win in wins.iter_mut() {
+        for (i, win) in wins.iter_mut().enumerate() {
             *win = self.conn.generate_id()?;
+            let aux = CreateWindowAux::new()
+                .background_pixel(BAR_BACKGROUND_PIXEL)
+                .border_pixel(0)
+                .bit_gravity(Gravity::NORTH_WEST)
+                .colormap(cmap)
+                .override_redirect(1)
+                .event_mask(bar_events);
+            // wins[0] is the tag strip; show a hand cursor over its cells.
+            let aux = if i == 0 { aux.cursor(self.tag_cursor) } else { aux };
             self.conn
                 .create_window(
                     self.depth,
@@ -1949,15 +2244,10 @@ impl Wm {
                     0,
                     WindowClass::INPUT_OUTPUT,
                     self.visual_id,
-                    &CreateWindowAux::new()
-                        .background_pixel(BAR_BACKGROUND_PIXEL)
-                        .border_pixel(0)
-                        .bit_gravity(Gravity::NORTH_WEST)
-                        .colormap(cmap)
-                        .override_redirect(1)
-                        .event_mask(bar_events),
+                    &aux,
                 )?
                 .check()?;
+            self.set_bar_window_class(*win)?;
             self.conn.map_window(*win)?;
             self.bar_mapped.borrow_mut().insert(*win);
         }
@@ -2017,6 +2307,7 @@ impl Wm {
                 )?
                 .check()?;
         }
+        self.set_bar_window_class(center)?;
         self.conn.map_window(center)?;
         self.bar_mapped.borrow_mut().insert(center);
 
@@ -2085,6 +2376,22 @@ impl Wm {
                     .override_redirect(1),
             )?
             .check()?;
+        // The marker is only a visual overlay. Give it an empty input shape so
+        // clicks and wheel events land on the Finder popup underneath instead:
+        // while Finder holds a pointer grab, events over a window that selects
+        // no buttons are swallowed (XI2 watchers still see them), which made
+        // the highlighted row unclickable and unscrollable.
+        if let Ok(cookie) = self.conn.shape_rectangles(
+            SO::SET,
+            SK::INPUT,
+            ClipOrdering::UNSORTED,
+            finder_markerwin,
+            0,
+            0,
+            &[],
+        ) {
+            let _ = cookie.check();
+        }
         self.conn
             .change_property8(
                 PropMode::REPLACE,
@@ -2116,8 +2423,8 @@ impl Wm {
         m.finder_marker_stacked.set(false);
         m.finder_marker_pos.set(None);
         m.finder_stacked.set(false);
-        // A new window starts with the toolkit default class even when the
-        // cached kind from the previous monitor layout was not Dwm.
+        // The center window starts as the ordinary bar clock; Finder and
+        // notifications change its class while they own it.
         self.center_kind.borrow_mut()[mi] = CenterKind::Dwm;
         self.set_bar_class(mi)?;
         Ok(())
@@ -2512,7 +2819,72 @@ impl Wm {
         Ok(())
     }
 
-    /// Raise or lower the top-right bar and its volume marker relative to
+    /// Put one monitor's bar windows back in the top layer, bottom-to-top.
+    ///
+    /// The bars are override-redirect, but X has no permanent "always on top"
+    /// layer: any `StackMode::ABOVE` on a client (floating windows,
+    /// `_NET_WM_STATE_ABOVE`, drag zones) or any map of a client window can
+    /// bury them. Raising the whole group in creation order restores both the
+    /// layer and the sections' relative stacking. The transparent center and
+    /// the two markers go last so they stay above their neighbouring sections.
+    fn raise_bar_layer(&self, mi: usize) -> Result {
+        let m = &self.monitors[mi];
+        for win in [
+            m.barwin,
+            m.bartitlewin,
+            m.barkbwin,
+            m.barrightwin,
+            m.barcenterwin,
+            if mi == self.selmon { self.tray.window } else { 0 },
+            m.mpris_markerwin,
+            m.finder_markerwin,
+        ] {
+            if win != 0 {
+                self.conn.configure_window(
+                    win,
+                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                )?;
+            }
+        }
+        // The bar layer is rebuilt on every map, focus change and `_NET_WM_STATE_ABOVE`
+        // client. Put tray menus back on top in the same pass, otherwise a menu
+        // opened from the tray is immediately buried by the bar it came from.
+        self.raise_tray_menus();
+        Ok(())
+    }
+
+    fn raise_bars(&self) -> Result {
+        for mi in 0..self.monitors.len() {
+            self.raise_bar_layer(mi)?;
+        }
+        Ok(())
+    }
+
+    /// True for root children this WM stacks itself, so stacking notifications
+    /// for them must not trigger another `raise_bars()` round trip.
+    fn is_our_window(&self, win: Window) -> bool {
+        self.tray.window == win
+            || self.tray_menus.borrow().contains(&win)
+            || self.supporting_wm_check == win
+            || self.monitors.iter().any(|m| {
+                [
+                    m.barwin,
+                    m.bartitlewin,
+                    m.barkbwin,
+                    m.barcenterwin,
+                    m.barrightwin,
+                    m.mpris_markerwin,
+                    m.finder_markerwin,
+                ]
+                .contains(&win)
+            })
+            || self.clients.iter().any(|c| {
+                c.win == win
+                    || c.edge_wins.contains(&win)
+            })
+    }
+
+    /// Raise or restore the top-right bar and its volume marker relative to
     /// client windows. On hover the panel grows to two rows and can overlap a
     /// floating client, so while expanded it must sit on top of every window;
     /// otherwise the extra row is hidden and its controls cannot be clicked.
@@ -2539,11 +2911,10 @@ impl Wm {
                     .stack_mode(StackMode::BELOW),
             )?;
         } else {
-            // Unwind when the panel collapses. With no sibling these are the
-            // XRaiseWindow/XLowerWindow requests: top and bottom of the stack.
-            let aux = ConfigureWindowAux::new().stack_mode(StackMode::BELOW);
-            self.conn.configure_window(m.mpris_markerwin, &aux)?;
-            self.conn.configure_window(m.barrightwin, &aux)?;
+            // Restore the bar's place in the top layer. Lowering with a bare
+            // `BELOW` would put the collapsed panel under *all* root children,
+            // including clients, which is the opposite of always-on-top.
+            self.raise_bar_layer(mi)?;
         }
         Ok(())
     }
@@ -2564,24 +2935,22 @@ impl Wm {
 
     fn stack_finder(&self, mi: usize, above: bool) -> Result {
         let m = &self.monitors[mi];
-        if m.finder_stacked.get() == above {
+        // The `true` path runs on every popup frame; the cached flag keeps it
+        // from issuing restacks (and crossing events) when nothing moved.
+        // Lowering only runs on close, so always restore the whole layer.
+        if above && m.finder_stacked.get() {
             return Ok(());
         }
-        let aux = ConfigureWindowAux::new().stack_mode(if above {
-            StackMode::ABOVE
-        } else {
-            StackMode::BELOW
-        });
         if above {
+            let aux = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
             self.conn.configure_window(m.barcenterwin, &aux)?;
             if m.finder_markerwin != 0 {
                 self.conn.configure_window(m.finder_markerwin, &aux)?;
             }
         } else {
-            if m.finder_markerwin != 0 {
-                self.conn.configure_window(m.finder_markerwin, &aux)?;
-            }
-            self.conn.configure_window(m.barcenterwin, &aux)?;
+            // Put the center window back in the bar layer instead of lowering
+            // it below clients: a bare `BELOW` buries the normal clock too.
+            self.raise_bar_layer(mi)?;
         }
         m.finder_stacked.set(above);
         Ok(())
@@ -2589,6 +2958,7 @@ impl Wm {
 
     /// dwm's `notification_update_wm_class`. Finder overrides a notification,
     /// and the history gets its own instance name while sharing `notify`.
+    /// Only the center window changes class; the bar sections stay `dwm`.
     fn set_bar_class(&self, mi: usize) -> Result {
         let kind = self.center_kind(mi);
         if self.center_kind.borrow()[mi] == kind {
@@ -3066,6 +3436,7 @@ impl Wm {
             MapTracking {
                 mapped,
                 pending_unmaps: 0,
+                published_iconic: None,
             },
         );
     }
@@ -3073,24 +3444,27 @@ impl Wm {
     /// Unmap a client ourselves, counting the UnmapNotify it will generate so
     /// the event handler does not mistake it for the client withdrawing. X
     /// emits no event when the window is already unmapped, so only count (and
-    /// send) when we believe it is mapped.
+    /// send) when we believe it is mapped. Either way the client is iconic:
+    /// the reason for the unmap (tag switch, fullscreen, iconify) does not
+    /// change what panels must show.
     fn wm_unmap(&self, win: Window) -> Result {
-        let mut maps = self.client_maps.borrow_mut();
-        let Some(state) = maps.get_mut(&win) else {
-            self.conn.unmap_window(win)?;
-            return Ok(());
+        let send = {
+            let mut maps = self.client_maps.borrow_mut();
+            let Some(state) = maps.get_mut(&win) else {
+                self.conn.unmap_window(win)?;
+                return Ok(());
+            };
+            state.unmap()
         };
-        if !state.unmap() {
-            return Ok(());
-        }
-        drop(maps);
-        if let Err(err) = self.conn.unmap_window(win) {
-            if let Some(state) = self.client_maps.borrow_mut().get_mut(&win) {
-                state.pending_unmaps = state.pending_unmaps.saturating_sub(1);
+        if send {
+            if let Err(err) = self.conn.unmap_window(win) {
+                if let Some(state) = self.client_maps.borrow_mut().get_mut(&win) {
+                    state.pending_unmaps = state.pending_unmaps.saturating_sub(1);
+                }
+                return Err(err.into());
             }
-            return Err(err.into());
         }
-        Ok(())
+        self.sync_map_state(win)
     }
 
     /// Map a visible client. Keep any pending unmap count: even after we remap,
@@ -3101,18 +3475,24 @@ impl Wm {
             state.map();
         }
         self.conn.map_window(win)?;
-        Ok(())
+        self.sync_map_state(win)
     }
 
     /// Consume one UnmapNotify. Returns true when it was caused by the client
     /// (rather than by an UnmapWindow request of ours) and the client was
     /// believed mapped at the time.
     fn consume_client_unmap(&self, win: Window) -> bool {
-        let mut maps = self.client_maps.borrow_mut();
-        let Some(state) = maps.get_mut(&win) else {
-            return false;
+        let withdrawn = {
+            let mut maps = self.client_maps.borrow_mut();
+            let Some(state) = maps.get_mut(&win) else {
+                return false;
+            };
+            state.consume_unmap()
         };
-        state.consume_unmap()
+        if withdrawn {
+            let _ = self.sync_map_state(win);
+        }
+        withdrawn
     }
 
     /// Unmap a client that is not visible on the current tag set.
@@ -3129,10 +3509,28 @@ impl Wm {
         self.wm_unmap(c.win)
     }
 
+    /// True when the WM currently keeps `win` unmapped, whatever the reason:
+    /// an explicit iconify, a tag switch, a fullscreen client covering it, or
+    /// a withdraw by the client itself. This is the state panels must see.
+    fn is_iconic(&self, win: Window) -> bool {
+        !self
+            .client_maps
+            .borrow()
+            .get(&win)
+            .is_some_and(|s| s.mapped)
+    }
+
     /// Publish ICCCM `WM_STATE`. Panels use IconicState to show a client as
     /// minimized, so unmapping the X window alone is not enough to be iconic.
+    /// Every unmap is iconic, not just Super+H: the property follows the map
+    /// state we actually asked X for, not the explicit iconify flag.
     fn sync_wm_state(&self, c: &Client) -> Result {
-        let state = if c.hidden { WM_STATE_ICONIC } else { WM_STATE_NORMAL };
+        let iconic = self.is_iconic(c.win);
+        let state = if iconic {
+            WM_STATE_ICONIC
+        } else {
+            WM_STATE_NORMAL
+        };
         self.conn.change_property32(
             PropMode::REPLACE,
             c.win,
@@ -3140,6 +3538,28 @@ impl Wm {
             self.atoms.wm_state,
             &[state, 0], // state, icon_window (None)
         )?;
+        if let Some(s) = self.client_maps.borrow_mut().get_mut(&c.win) {
+            s.published_iconic = Some(iconic);
+        }
+        Ok(())
+    }
+
+    /// Republish `WM_STATE` and `_NET_WM_STATE` after a map or unmap. Repeated
+    /// layout passes write nothing until the published value changes.
+    fn sync_map_state(&self, win: Window) -> Result {
+        let iconic = self.is_iconic(win);
+        if self
+            .client_maps
+            .borrow()
+            .get(&win)
+            .is_some_and(|s| s.published_iconic == Some(iconic))
+        {
+            return Ok(());
+        }
+        if let Some(c) = self.clients.iter().find(|c| c.win == win) {
+            self.sync_wm_state(c)?;
+            self.sync_client_wm_state(c)?;
+        }
         Ok(())
     }
 
@@ -3159,7 +3579,7 @@ impl Wm {
         }
         let c = &self.clients[idx];
         let _ = self.sync_client_wm_state(c);
-        let _ = self.sync_wm_state(c);
+        let _ = self.sync_map_state(win);
         Ok(())
     }
 
@@ -3299,6 +3719,9 @@ impl Wm {
                 }
             }
         }
+        // Floating windows, drag zones and mapped clients are all raised into
+        // the root child stack above. Restore the bar layer after them.
+        self.raise_bars()?;
         self.invalidate_finder_stacking();
         self.conn.flush()?;
         Ok(())
@@ -3349,7 +3772,7 @@ impl Wm {
         let visible: Vec<Window> = self
             .clients
             .iter()
-            .filter(|c| c.mon == mi && !c.floating && self.is_visible(c))
+            .filter(|c| c.mon == mi && !c.floating && !c.dragging && self.is_visible(c))
             .map(|c| c.win)
             .collect();
         let area = self.tile_area(mi);
@@ -3383,6 +3806,9 @@ impl Wm {
                 let _ = self.conn.configure_window(c.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
             }
         }
+        // `_NET_WM_STATE_ABOVE` clients were just raised; keep the bar layer
+        // above them in the same pass.
+        self.raise_bars()?;
         self.focus()?;
         let _ = self.update_client_list();
         let _ = self.update_client_list_stacking();
@@ -3541,11 +3967,9 @@ impl Wm {
         self.track_client(win, initial_mapped);
         self.selmon = mi;
         self.monitors[mi].sel = Some(win);
-        // Every managed client gets an ICCCM state, so taskbars can tell a
-        // managed window from a window merely hidden by a tag switch.
-        if let Some(c) = self.clients.iter().find(|cc| cc.win == win) {
-            let _ = self.sync_wm_state(c);
-        }
+        // Every managed client gets both state properties. A client adopted
+        // while unmapped is iconic from the start, not just one hidden later.
+        let _ = self.sync_map_state(win);
         let _ = self.set_client_desktop(win, tags);
         let _ = self.set_rwm_monitor(win, mi);
         if urgent {
@@ -3781,16 +4205,25 @@ impl Wm {
         status_next: Instant,
         clock_animate: bool,
         finder_active: bool,
+        notification_center_active: bool,
         scroll_active: bool,
         scroll_next: Instant,
         finder_next: Option<Instant>,
+        fullscreen_idle: bool,
     ) -> Instant {
+        if fullscreen_idle {
+            // The pointer's monitor is fullscreen and its bar is unmapped. No
+            // animation, status or scrolling needs a 60 fps wakeup; only drain
+            // channel-delivered notifications at a slow cadence.
+            return now + FULLSCREEN_IDLE_POLL;
+        }
         let mut next = status_next;
         // Clamp the poll timeout to BAR_TICK while the clock visualizer is
         // enabled. Sampling only when the last sample already differs from the
         // drawn width misses levels that arrive just after the deadline was
-        // computed, which left idle animation at 1 fps.
-        if clock_animate && !finder_active {
+        // computed, which left idle animation at 1 fps. Finder and notification
+        // history own the center window and freeze the animated clock width.
+        if clock_animate && !finder_active && !notification_center_active {
             next = next.min(now + BAR_TICK);
         }
         if scroll_active {
@@ -3800,6 +4233,39 @@ impl Wm {
             next = next.min(finder_next);
         }
         next.min(now + IDLE_POLL)
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        self.bar_dirty
+    }
+
+    pub fn finder_active(&self) -> bool {
+        self.finder.is_active()
+    }
+
+    /// The bar is only animated on the monitor under the pointer. While that
+    /// monitor shows a fullscreen window its bar is unmapped, so every per-tick
+    /// bar task (PipeWire level math, status sampling, title scroll, repaints)
+    /// can be skipped. Finder keeps its frames even on a fullscreen monitor.
+    fn bar_suspended_now(&self) -> bool {
+        !self.finder.is_active() && self.monitor_fullscreen(self.selmon)
+    }
+
+    /// Applies the current fullscreen-idle state. Called after every event batch
+    /// so pointer crossings, fullscreen toggles and tag changes take effect even
+    /// when the next timed refresh was still far away. The transition itself
+    /// forces one normal refresh: entering hides the bar and clears any popup,
+    /// leaving restores them from current values.
+    pub fn sync_bar_suspended(&mut self) {
+        let suspended = self.bar_suspended_now();
+        if suspended == self.bar_suspended {
+            return;
+        }
+        self.bar_suspended = suspended;
+        if let Some(level) = self.clock_level.as_ref() {
+            crate::sound::set_paused(level, suspended);
+        }
+        self.bar_dirty = true;
     }
 
     /// Deadline for the next bar tick. The main loop blocks on the X connection
@@ -3812,16 +4278,19 @@ impl Wm {
             // 30 ms for the slower fades, 500 ms for the caret.
             self.finder.next_tick(now)
         });
+        let notification_center_active = self.notification.is_center_active();
         let next = Self::bar_next_tick(
             now,
             self.status.next_sample(),
             config::CLOCK_ANIMATE,
             finder_active,
+            notification_center_active,
             self.scroll_active(),
             self.mpris_scroll_next,
             finder_next,
+            self.bar_suspended,
         );
-        if self.notification.is_active() {
+        if !self.bar_suspended && self.notification.is_active() {
             next.min(self.notification.next_tick(now))
         } else {
             next
@@ -4335,6 +4804,19 @@ impl Wm {
     /// redraws the bars only when their contents or layout changed. Window
     /// motion and client configure events do not get here.
     pub fn refresh(&mut self) -> Result {
+        // A transition forces bar_dirty above, so the frame that enters or
+        // leaves fullscreen still runs the full path. Steady-state timed ticks
+        // while fullscreen take the cheap path below.
+        self.sync_bar_suspended();
+        let mut bars = std::mem::take(&mut self.bar_dirty);
+        if self.bar_suspended && !bars && !self.finder.is_active() {
+            // Keep draining notification events with fullscreen=true so they
+            // are filed in history instead of popping up when fullscreen ends.
+            // Everything else (PipeWire sampling, status, scrolling titles and
+            // bar/X work) is suspended while the pointer's bar is unmapped.
+            let _ = self.notification.poll(true, self.bar_h(), Instant::now())?;
+            return Ok(());
+        }
         let finder_dirty = self.finder.tick()?;
         // OCR finishes on a worker thread while Finder is closed. When its
         // result opens the popup, install the modal grabs here just like a
@@ -4344,7 +4826,7 @@ impl Wm {
         }
         let finder_active = self.finder.is_active();
         self.notification.set_finder_active(finder_active);
-        let mut bars = std::mem::take(&mut self.bar_dirty) || finder_dirty;
+        bars |= finder_dirty;
         let notification_was_active = self.notification_center_active_last;
         let notification_had_focus = self.notification.has_input_focus();
         let fullscreen = self.monitor_fullscreen(self.selmon);
@@ -4536,6 +5018,33 @@ impl Wm {
         }
     }
 
+    /// A left click on a workspace cell switches to that workspace on the
+    /// monitor whose strip was clicked. Cell geometry matches `Drw::tags`:
+    /// the row starts at `BORDERPX` and each tag is `textw(TAG_LABEL)` wide.
+    fn tags_button(&mut self, e: &ButtonPressEvent) -> Result<bool> {
+        if e.detail != 1 {
+            return Ok(false);
+        }
+        if !self.monitors.iter().any(|m| m.barwin == e.event) {
+            return Ok(false);
+        }
+        let x = e.event_x as i32 - BORDERPX;
+        let cell = self.metrics.textw(TAG_LABEL);
+        if x < 0 || cell <= 0 {
+            return Ok(false);
+        }
+        let idx = (x / cell) as usize;
+        if idx >= TAGS {
+            return Ok(false);
+        }
+        // A click also selects the monitor under the pointer, so a strip on a
+        // non-focused monitor switches that monitor's workspace.
+        self.activate_monitor_at(e.root_x as i32, e.root_y as i32)?;
+        self.view(1u32 << idx)?;
+        self.bar_dirty = true;
+        Ok(true)
+    }
+
     /// dwm's `notification_clock_hit`: only the fixed clock-sized part of the
     /// animated center window opens history while the clock is shown.
     fn notification_clock_hit(&self, mi: usize, x: i32) -> bool {
@@ -4656,9 +5165,7 @@ impl Wm {
     /// Returns true when a notification input row or the open history consumed
     /// this key. Ordinary WM bindings must not run in that case.
     fn notification_keypress(&mut self, e: &KeyPressEvent) -> Result<bool> {
-        let Some(&sym) = self.keysyms.get((e.detail - self.min_keycode) as usize) else {
-            return Ok(false);
-        };
+        let sym = self.event_keysym(e);
         let state = u16::from(e.state) & CLEAN_MASK;
         let had_focus = self.notification.has_input_focus();
         let consumed = if had_focus {
@@ -4695,13 +5202,8 @@ impl Wm {
         if self.finder.is_active() {
             match &event {
                 Event::KeyPress(e) => {
-                    let sym = self
-                        .keysyms
-                        .get((e.detail - self.min_keycode) as usize)
-                        .copied();
-                    if let Some(sym) = sym {
-                        self.finder.keypress(sym, u16::from(e.state) & CLEAN_MASK);
-                    }
+                    let sym = self.event_keysym(&e);
+                    self.finder.keypress(sym, u16::from(e.state) & CLEAN_MASK);
                     if !self.finder.is_active() {
                         // Escape and Return close Finder inside Finder itself.
                         self.finder_close()?;
@@ -4743,11 +5245,52 @@ impl Wm {
             }
         }
         match event {
+            // XI2 sees clicks on embedded icon windows without competing with
+            // the app for the core ButtonPress selection.
+            Event::XinputButtonPress(e) => {
+                const FP1616_ONE: i32 = 1 << 16;
+                let (x, y) = (e.root_x / FP1616_ONE, e.root_y / FP1616_ONE);
+                if self.pointer_in_tray(x, y) {
+                    let icon = self.tray.icon_at(
+                        x - self.tray_x(self.selmon),
+                        self.tray_icon_size(),
+                        SYSTRAY_SPACING,
+                    );
+                    self.record_tray_click(icon.unwrap_or(0));
+                }
+                return Ok(());
+            }
+            // Override-redirect menus map without a MapRequest. This is the
+            // only place to catch them before the next raise_bars() buries them.
+            Event::MapNotify(e) if self.is_tray_menu(e.window) => {
+                self.track_tray_menu(e.window)?;
+                return Ok(());
+            }
             Event::MapRequest(e) => {
                 if self.is_tray_icon(e.window) {
                     self.tray.set_visible(e.window, true);
                     self.relayout_tray()?;
                     return Ok(());
+                }
+                let tray_menu = self.is_tray_menu(e.window);
+                if tray_menu && !self.is_managed(e.window) {
+                    let unmanaged = self
+                        .conn
+                        .get_window_attributes(e.window)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .is_some_and(|a| {
+                            a.override_redirect || a.class == WindowClass::INPUT_ONLY
+                        });
+                    if unmanaged || is_popup_win_type(self.read_win_type(e.window)) {
+                        let _ = self.conn.map_window(e.window);
+                        self.track_tray_menu(e.window)?;
+                        return Ok(());
+                    }
+                    // A regular window the app opened from its tray icon is
+                    // still managed like any other client. Remember it before
+                    // arrange() raises the bar layer so it ends up on top.
+                    self.track_tray_menu(e.window)?;
                 }
                 if !self.is_managed(e.window) {
                     // Do not manage override-redirect or InputOnly windows.
@@ -4759,9 +5302,15 @@ impl Wm {
                     if let Some(attrs) = attrs {
                         if attrs.override_redirect || attrs.class == WindowClass::INPUT_ONLY {
                             let _ = self.conn.map_window(e.window);
+                            // Mapping a root child puts it at the top of the
+                            // stack, so restore the bar layer immediately.
+                            let _ = self.raise_bars();
                             let _ = self.conn.flush();
                         } else if self.should_ignore_window(e.window) {
                             let _ = self.conn.map_window(e.window);
+                            // Mapping a root child puts it at the top of the
+                            // stack, so restore the bar layer immediately.
+                            let _ = self.raise_bars();
                             let _ = self.conn.flush();
                         } else {
                             self.manage(e.window)?;
@@ -4817,6 +5366,7 @@ impl Wm {
                 }
             }
             Event::DestroyNotify(e) => {
+                self.tray_menus.borrow_mut().retain(|&w| w != e.window);
                 if self.tray.undock(e.window) {
                     self.relayout_tray()?;
                 } else {
@@ -4827,11 +5377,47 @@ impl Wm {
             Event::ConfigureNotify(e) if e.window == self.root => {
                 self.updategeom()?;
             }
-            Event::MappingNotify(e) => {
-                // Refresh keyboard mapping when changed
-                if e.request == x11rb::protocol::xproto::Mapping::KEYBOARD || e.request == x11rb::protocol::xproto::Mapping::MODIFIER {
-                    let _ = self.refresh_keysyms();
+            Event::ConfigureNotify(e) if e.event == self.root && e.window != self.root => {
+                // SubstructureNotify also reports stacking changes of other
+                // override-redirect root children (menus, tooltips, OSDs).
+                // They can raise themselves without asking the WM, so use the
+                // notification to put the bar back on top. Our own windows and
+                // clients are stacked by the layout paths above.
+                if !self.is_our_window(e.window) {
+                    self.raise_bars()?;
+                    self.conn.flush()?;
                 }
+                return Ok(());
+            }
+            Event::MappingNotify(e) => {
+                // A new layout (e.g. setxkbmap) changes both the keymap used for
+                // grabs and the layout names shown in the bar.
+                if e.request == x11rb::protocol::xproto::Mapping::KEYBOARD
+                    || e.request == x11rb::protocol::xproto::Mapping::MODIFIER
+                {
+                    let _ = self.refresh_keysyms();
+                    self.update_kb();
+                    self.bar_dirty = true;
+                }
+            }
+            Event::XkbStateNotify(e) => {
+                // Switching the XKB group (Win+Space or another app's input
+                // switcher) only changes state: no core MappingNotify is sent.
+                // Modifier-only state changes arrive here too, so re-read the
+                // layout only when a group component actually changed.
+                let group_parts = u16::from(xkb::StatePart::GROUP_STATE)
+                    | u16::from(xkb::StatePart::GROUP_BASE)
+                    | u16::from(xkb::StatePart::GROUP_LATCH)
+                    | u16::from(xkb::StatePart::GROUP_LOCK);
+                if u16::from(e.changed) & group_parts != 0 {
+                    self.update_kb();
+                    self.bar_dirty = true;
+                }
+            }
+            Event::XkbMapNotify(_) | Event::XkbNewKeyboardNotify(_) => {
+                let _ = self.refresh_keysyms();
+                self.update_kb();
+                self.bar_dirty = true;
             }
             Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
                 self.updategeom()?;
@@ -4948,10 +5534,16 @@ impl Wm {
                     if mask & u16::from(ConfigWindow::SIBLING) != 0 {
                         aux = aux.sibling(e.sibling);
                     }
-                    if mask & u16::from(ConfigWindow::STACK_MODE) != 0 {
+                    let restacked = mask & u16::from(ConfigWindow::STACK_MODE) != 0;
+                    if restacked {
                         aux = aux.stack_mode(e.stack_mode);
                     }
                     self.conn.configure_window(e.window, &aux)?;
+                    if restacked {
+                        // An unredirected window may have asked to be raised
+                        // above everything, including the bar.
+                        self.raise_bars()?;
+                    }
                     self.conn.flush()?;
                 }
             }
@@ -5064,6 +5656,9 @@ impl Wm {
             }
             Event::ButtonPress(e) => {
                 if self.notification_button(&e)? {
+                    return Ok(());
+                }
+                if self.tags_button(&e)? {
                     return Ok(());
                 }
                 self.bar_dirty = true;
@@ -5243,9 +5838,9 @@ impl Wm {
                     let transient_for = self.read_transient_for(win);
                     let win_type = self.read_win_type(win);
                     let is_modal = self.read_net_wm_state_modal(win);
-                    let (mon, old_transient, fullscreen) = {
+                    let (mon, old_transient, was_modal, fullscreen) = {
                         let c = &self.clients[idx];
-                        (c.mon, c.transient_for, c.fullscreen)
+                        (c.mon, c.transient_for, c.is_modal, c.fullscreen)
                     };
                     self.clients[idx].transient_for = transient_for;
                     self.clients[idx].win_type = win_type;
@@ -5253,8 +5848,17 @@ impl Wm {
                     let want_float =
                         wants_floating(win_type, transient_for, is_modal, &self.clients[idx].hints)
                             || matches!(win_type, WinType::Dock | WinType::Desktop);
+                    // rwm writes HIDDEN (and the other WM-owned state atoms)
+                    // itself whenever a tag switch maps or unmaps a client.
+                    // That generates a PropertyNotify back to us; treating it
+                    // as a new float decision would undo a manual float just
+                    // because the window left its workspace. Of all the
+                    // _NET_WM_STATE atoms, only MODAL affects floating, so
+                    // recheck the policy only when it really changed (or when
+                    // the type/transient property itself changed).
+                    let recheck = e.atom != self.atoms.net_wm_state || is_modal != was_modal;
                     // Leave the saved layout state of a fullscreen client alone.
-                    let changed = if fullscreen {
+                    let changed = if fullscreen || !recheck {
                         false
                     } else {
                         self.set_client_floating(idx, want_float)
@@ -5758,6 +6362,11 @@ impl Wm {
         let zones = self.clients[idx].edge_wins;
         self.clients[idx].geom = rect;
         self.place_edge_zones(zones, win, rect, restack)?;
+        if restack {
+            // raise_floating()/client ConfigureRequest put this window and its
+            // zones on top; the bars must follow them back into the top layer.
+            self.raise_bars()?;
+        }
         self.conn.flush()?;
         Ok(())
     }
@@ -5771,6 +6380,12 @@ impl Wm {
             w: current.w,
             h: current.h,
         }
+    }
+
+    /// Center of a window's current box. Used when a floating window returns
+    /// to tiling with no pointer involved, so it lands where it is drawn.
+    fn window_center(geom: Rect) -> (i32, i32) {
+        (geom.x + geom.w as i32 / 2, geom.y + geom.h as i32 / 2)
     }
 
     /// Nearest tile to a point. A drop can land in a gap or on the bar, where no
@@ -5802,12 +6417,80 @@ impl Wm {
         })
     }
 
+    /// Insert `win` into the tiling tree at `point` the same way a tile-mode
+    /// drop does. A point on an inner gap becomes a tile of its own between the
+    /// two neighbours; a point in an outer margin (or on the bar) adds a
+    /// row/column on that edge. Neighbours shrink to make room in both cases.
+    /// Otherwise split the tile under the point (or the closest tile). The old
+    /// leaf is removed first, so a window returning from floating lands where
+    /// it is actually drawn instead of in its former tile.
+    fn tile_at(&mut self, win: Window, point: (i32, i32)) -> Result {
+        let tm = self.monitor_at(point.0, point.1);
+        let from = self.clients.iter().find(|c| c.win == win).map(|c| c.mon);
+        if Some(tm) != from {
+            self.sendmon(win, tm)?;
+        }
+        self.selmon = tm;
+        self.monitors[tm].sel = Some(win);
+        // Remove the leaf before reading the layout, just like a drop. The
+        // pre-move half's aspect ratio would otherwise flip the split axis and
+        // make repeated retile/drop operations alternate directions.
+        {
+            let tree = &mut self.monitors[tm].tree;
+            *tree = tree.take().and_then(|t| t.remove(win));
+        }
+        let leaves: Vec<(Window, Rect)> = self.layout_mon(tm).into_iter().collect();
+        // Try the gaps first. The visible leaves are exactly the ones the tree
+        // layout used above, so a strip that contains the pointer is a real
+        // boundary between two tiles on this monitor.
+        let vis: HashSet<Window> = leaves.iter().map(|(w, _)| *w).collect();
+        let area = self.tile_area(tm);
+        let gaps = self.effective_gaps(tm);
+        if let Some(tree) = self.monitors[tm].tree.as_mut()
+            && tree.insert_in_gap(area, &vis, &gaps, point, win)
+        {
+            return Ok(());
+        }
+        // Outer margins, including the bar strip above the work area, are
+        // edges rather than splits: add a row/column there instead of
+        // splitting the nearest tile.
+        let outer = self.monitors[tm].rect;
+        if let Some(tree) = self.monitors[tm].tree.as_mut()
+            && tree.insert_at_edge(outer, area, &vis, &gaps, point, win)
+        {
+            return Ok(());
+        }
+        let target = leaves
+            .iter()
+            .copied()
+            .find(|(_, r)| r.contains(point.0, point.1))
+            .or_else(|| Self::nearest_tile(&leaves, point).copied());
+        match target {
+            Some((target, rect)) => {
+                let (new_first, side_by_side) = tree::split_for_drop(rect, point);
+                if let Some(t) = self.monitors[tm].tree.as_mut() {
+                    t.insert(target, win, new_first, side_by_side);
+                }
+            }
+            None => {
+                // No tile available: append beside what's left of the tree.
+                // Replacing it with a single leaf would drop the hidden leaves
+                // of other tags and break those tags on return.
+                let area = self.tile_area(tm);
+                let tree = &mut self.monitors[tm].tree;
+                *tree = Some(tree::append(tree.take(), win, area));
+            }
+        }
+        Ok(())
+    }
+
     /// dwm's `movemouse()` with Hyprland-style dwindle dragging. A floating
     /// window follows the pointer. A tiled window is temporarily taken out of
     /// the tree at its current size, so its siblings expand while it follows
     /// the pointer. On release it is removed
     /// first, then reinserted as an even split into the tile under the pointer
     /// in the expanded layout, the same order `onWindowCreatedTiling` uses.
+    /// A drop in a gap places the window between the two neighbours there.
     fn movemouse(&mut self, win: Window, (px, py): (i32, i32)) -> Result {
         let Some(client) = self.clients.iter().find(|c| c.win == win) else {
             return Ok(());
@@ -5832,6 +6515,16 @@ impl Wm {
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
                 c.dragging = true;
                 c.geom = start;
+            }
+            // Remove the dragged window from the tree and even out its
+            // row/column so both neighbours grow. Otherwise a dwindle tree
+            // gives all the freed space to one sibling, and dropping the
+            // window back into a gap makes the other windows jump sideways.
+            let vis: HashSet<Window> = self.tiled_order(mi).into_iter().collect();
+            let area = self.tile_area(mi);
+            let gaps = self.effective_gaps(mi);
+            if let Some(tree) = self.monitors[mi].tree.as_mut() {
+                tree.prepare_for_drag(win, &vis, area, &gaps);
             }
             // Raise once at drag start. apply_layout() only restacks the zones;
             // repeated stack requests per frame delay the client's redraw.
@@ -5860,52 +6553,25 @@ impl Wm {
                 return Err(err);
             }
         };
-        let Some((dx, dy)) = end else {
+        // The pointer decides where the window lands, including which gap it
+        // drops into (tile_at() handles the gap case for tiled windows).
+        let Some(point) = end else {
             return self.arrange();
         };
-        let tm = self.monitor_at(dx, dy);
-        if tm != mi {
-            self.sendmon(win, tm)?;
-            self.selmon = tm;
-            self.monitors[tm].sel = Some(win);
-        }
         if floating {
             // A user-placed window keeps its spot across property updates.
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == win) {
                 c.auto_place = false;
             }
+            let tm = self.monitor_at(point.0, point.1);
+            if tm != mi {
+                self.sendmon(win, tm)?;
+                self.selmon = tm;
+                self.monitors[tm].sel = Some(win);
+            }
             return self.arrange();
         }
-        // Remove the dragged window before looking at the layout, just like
-        // Hyprland's onWindowRemovedTiling() before onWindowCreatedTiling().
-        // Otherwise the target is still in its pre-drag half, whose aspect ratio
-        // flips on every drop and makes repeated drops alternate split axes.
-        {
-            let tree = &mut self.monitors[tm].tree;
-            *tree = tree.take().and_then(|t| t.remove(win));
-        }
-        let leaves: Vec<(Window, Rect)> = self.layout_mon(tm).into_iter().collect();
-        let target = leaves
-            .iter()
-            .copied()
-            .find(|(_, r)| r.contains(dx, dy))
-            .or_else(|| Self::nearest_tile(&leaves, (dx, dy)).copied());
-        match target {
-            Some((target, rect)) => {
-                let (new_first, side_by_side) = tree::split_for_drop(rect, (dx, dy));
-                if let Some(t) = self.monitors[tm].tree.as_mut() {
-                    t.insert(target, win, new_first, side_by_side);
-                }
-            }
-            None => {
-                // No tile under the pointer: append beside whatever is left of
-                // the tree. Replacing it with a single leaf would drop the
-                // hidden leaves of other tags and break those tags on return.
-                let area = self.tile_area(tm);
-                let tree = &mut self.monitors[tm].tree;
-                *tree = Some(tree::append(tree.take(), win, area));
-            }
-        }
+        self.tile_at(win, point)?;
         self.arrange()
     }
 
@@ -6020,18 +6686,14 @@ impl Wm {
             return Ok(()); // don't toggle floating while fullscreen
         }
         if c.floating {
+            let point = Self::window_center(c.geom);
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
                 c.floating = false;
             }
-            if !self.monitors[mi]
-                .tree
-                .as_ref()
-                .is_some_and(|t| t.has_leaf(sel))
-            {
-                let area = self.tile_area(mi);
-                let tree = &mut self.monitors[mi].tree;
-                *tree = Some(tree::append(tree.take(), sel, area));
-            }
+            // Insert where the window is currently floating, using the same
+            // split-and-insert as dropping a window in tile mode. Its old leaf
+            // is removed, so it does not pop back into its former tile.
+            self.tile_at(sel, point)?;
         } else {
             let Some(rect) = self.geometry(mi, sel) else {
                 return Ok(());
@@ -6064,7 +6726,9 @@ impl Wm {
         if c.below { atoms.push(self.atoms.net_wm_state_below); }
         if c.is_modal { atoms.push(self.atoms.net_wm_state_modal); }
         if c.demands_attention { atoms.push(self.atoms.net_wm_state_demands_attention); }
-        if c.hidden { atoms.push(self.atoms.net_wm_state_hidden); }
+        // Hidden follows the same rule as WM_STATE: every window the WM keeps
+        // unmapped is hidden, not only one iconified with Super+H.
+        if self.is_iconic(c.win) { atoms.push(self.atoms.net_wm_state_hidden); }
         if c.sticky { atoms.push(self.atoms.net_wm_state_sticky); }
         if c.skip_taskbar { atoms.push(self.atoms.net_wm_state_skip_taskbar); }
         if c.skip_pager { atoms.push(self.atoms.net_wm_state_skip_pager); }
@@ -6563,16 +7227,42 @@ mod tests {
         let now = Instant::now();
         let status_next = now + Duration::from_secs(1);
 
-        let animated = Wm::bar_next_tick(now, status_next, true, false, false, now, None);
+        let animated = Wm::bar_next_tick(now, status_next, true, false, false, false, now, None, false);
         assert_eq!(animated, now + BAR_TICK);
         assert_eq!(BAR_TICK, Duration::from_micros(16_667));
 
-        let idle = Wm::bar_next_tick(now, status_next, false, false, false, now, None);
+        let idle = Wm::bar_next_tick(now, status_next, false, false, false, false, now, None, false);
         assert_eq!(idle, now + IDLE_POLL);
 
         let finder_next = now + Duration::from_millis(10);
-        let finder = Wm::bar_next_tick(now, status_next, true, true, false, now, Some(finder_next));
+        let finder = Wm::bar_next_tick(now, status_next, true, true, false, false, now, Some(finder_next), false);
         assert_eq!(finder, finder_next);
+
+        let notification = Wm::bar_next_tick(now, status_next, true, false, true, false, now, None, false);
+        assert_eq!(notification, now + IDLE_POLL);
+    }
+
+    #[test]
+    fn fullscreen_idle_stops_the_60fps_bar_tick() {
+        let now = Instant::now();
+        let status_next = now + Duration::from_millis(1);
+        let finder_next = now + Duration::from_millis(1);
+
+        // Even every other animation source is due: a fullscreen pointer wins,
+        // so the main loop wakes only at the slow housekeeping cadence.
+        let idle = Wm::bar_next_tick(
+            now,
+            status_next,
+            true,
+            false,
+            false,
+            true,
+            now,
+            Some(finder_next),
+            true,
+        );
+        assert_eq!(idle, now + FULLSCREEN_IDLE_POLL);
+        assert!(FULLSCREEN_IDLE_POLL > BAR_TICK * 10);
     }
 
     #[test]
@@ -6646,7 +7336,7 @@ mod tests {
     fn own_unmaps_are_not_mistaken_for_a_client_withdraw() {
         let mut state = MapTracking {
             mapped: true,
-            pending_unmaps: 0,
+            ..Default::default()
         };
         assert!(state.unmap());
         assert!(!state.consume_unmap());
@@ -6661,7 +7351,7 @@ mod tests {
     fn unmap_notify_in_flight_when_we_remap_still_belongs_to_us() {
         let mut state = MapTracking {
             mapped: true,
-            pending_unmaps: 0,
+            ..Default::default()
         };
         assert!(state.unmap());
         state.map(); // a second arrange before the UnmapNotify was read
@@ -6676,7 +7366,7 @@ mod tests {
     fn client_withdraw_is_recognized_and_not_reported_twice() {
         let mut state = MapTracking {
             mapped: true,
-            pending_unmaps: 0,
+            ..Default::default()
         };
         assert!(state.consume_unmap());
         assert!(!state.mapped);

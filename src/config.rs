@@ -9,6 +9,10 @@ pub const FLOATBAR: bool = true;
 pub const FLOAT_FIXED_SIZE: bool = true;
 /// config.def.h `topbar`.
 pub const TOPBAR: bool = true;
+/// Keep menus and popups opened from a system-tray icon stacked above the bar.
+/// Without this, raising the always-on-top bar layer buries the menu a tray
+/// app just mapped, so its top rows are hidden behind the tray it came from.
+pub const TRAY_MENUS_ABOVE_BAR: bool = true;
 /// Attempt a 32-bit ARGB visual (with an XRender alpha mask) for the center
 /// clock bar window, as dwm does for its finder popup. Set to `false` to force
 /// the default root visual everywhere; the same fallback is used automatically

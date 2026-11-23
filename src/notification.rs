@@ -988,6 +988,8 @@ pub struct NotificationManager {
     history_hover_action: i32,
     history_input: Option<u32>,
     input_focus: bool,
+    history_content_heights: Vec<i32>,
+    history_layout_bh: i32,
     gl: Option<GlState>,
     frame: FrameSurface,
     frame_key: u64,
@@ -1026,6 +1028,8 @@ impl NotificationManager {
             history_hover_action: -1,
             history_input: None,
             input_focus: false,
+            history_content_heights: Vec::new(),
+            history_layout_bh: 0,
             gl: None,
             frame: FrameSurface::new(),
             frame_key: 0,
@@ -1365,9 +1369,9 @@ impl NotificationManager {
         self.update_layout(bar_h);
     }
 
-    fn set_hovered(&mut self, hovered: bool, bar_h: i32) {
+    fn set_hovered(&mut self, hovered: bool, bar_h: i32) -> bool {
         if self.hovered == hovered {
-            return;
+            return false;
         }
         let now = Instant::now();
         if !hovered {
@@ -1380,6 +1384,7 @@ impl NotificationManager {
         self.hovered = hovered;
         self.invalidate_frame();
         self.update_layout(bar_h);
+        true
     }
 
     pub fn arm_hover_grace(&mut self, x: i32, y: i32) {
@@ -1428,17 +1433,15 @@ impl NotificationManager {
         }
         self.clock_hovered = true;
         if self.current.is_some() {
-            self.enter_popup(x, y, bar_h);
-            return true;
+            return self.enter_popup(x, y, bar_h);
         }
         if self.is_history_active() {
-            self.history_motion(x, y, bar_h);
-            return false;
+            return self.history_motion(x, y, bar_h);
         }
         if !self.transition_pending && !self.history.is_empty() {
             self.history_show(bar_h);
-            self.history_motion(x, y, bar_h);
-            return true;
+            let dirty = self.history_motion(x, y, bar_h);
+            return true || dirty;
         }
         false
     }
@@ -1452,12 +1455,12 @@ impl NotificationManager {
         was_active || self.is_active()
     }
 
-    fn enter_popup(&mut self, x: i32, y: i32, bar_h: i32) {
-        self.set_hovered(
+    fn enter_popup(&mut self, x: i32, y: i32, bar_h: i32) -> bool {
+        let dirty = self.set_hovered(
             x >= 0 && x < self.notify_width && y >= 0 && y < self.notify_height,
             bar_h,
         );
-        self.popup_motion(x, y, bar_h);
+        self.popup_motion(x, y, bar_h) || dirty
     }
 
     pub fn motion(&mut self, x: i32, y: i32, root_x: i32, root_y: i32, bar_h: i32) -> bool {
@@ -1471,19 +1474,20 @@ impl NotificationManager {
         // motionnotify(), which sets notify_clock_hovered unconditionally here.
         self.clock_hovered = true;
         if self.current.is_some() {
-            self.popup_motion(x, y, bar_h);
+            self.popup_motion(x, y, bar_h)
         } else if self.is_history_active() {
-            self.history_motion(x, y, bar_h);
+            self.history_motion(x, y, bar_h)
         } else if !self.transition_pending && !self.history.is_empty() {
             self.history_show(bar_h);
-            return true;
+            true
+        } else {
+            false
         }
-        false
     }
 
-    fn popup_motion(&mut self, x: i32, y: i32, bar_h: i32) {
+    fn popup_motion(&mut self, x: i32, y: i32, bar_h: i32) -> bool {
         let inside = x >= 0 && x < self.notify_width && y >= 0 && y < self.notify_height;
-        self.set_hovered(inside, bar_h);
+        let mut dirty = self.set_hovered(inside, bar_h);
         let mut hover = -1;
         if inside && self.hovered {
             if let Some(n) = &self.current {
@@ -1511,12 +1515,14 @@ impl NotificationManager {
         if hover != self.hover {
             self.hover = hover;
             self.invalidate_frame();
+            dirty = true;
         }
+        dirty
     }
 
-    fn history_motion(&mut self, x: i32, y: i32, bar_h: i32) {
+    fn history_motion(&mut self, x: i32, y: i32, bar_h: i32) -> bool {
         if !self.is_history_active() || self.history.is_empty() {
-            return;
+            return false;
         }
         let pad = NOTIFY_PADDING;
         let last = self.history.len().saturating_sub(1);
@@ -1524,9 +1530,8 @@ impl NotificationManager {
         let mut action = -1;
         let mut cursor_y = pad - self.history_scroll;
         for (i, n) in self.history.iter().enumerate() {
-            let entry_h = self.history_entry_height(n, bar_h, i < last);
-            let entry_content_h = self.history_entry_content_height(n, bar_h);
-            let content_h = self.history_content_height(n, bar_h);
+            let (content_h, entry_content_h, entry_h) =
+                self.history_entry_heights_cached(i, n, bar_h, i < last);
             if y >= cursor_y
                 && y < cursor_y + entry_content_h
                 && y >= pad
@@ -1558,6 +1563,9 @@ impl NotificationManager {
             self.history_hover_entry = entry;
             self.history_hover_action = action;
             self.invalidate_frame();
+            true
+        } else {
+            false
         }
     }
 
@@ -1670,11 +1678,10 @@ impl NotificationManager {
         let last = self.history.len().saturating_sub(1);
         let mut cursor_y = pad - self.history_scroll;
         for (i, n) in self.history.iter().enumerate() {
-            let entry_h = self.history_entry_height(n, bar_h, i < last);
+            let (content_h, entry_content_h, entry_h) =
+                self.history_entry_heights_cached(i, n, bar_h, i < last);
             if y >= cursor_y && y < cursor_y + entry_h {
                 let local_y = y - cursor_y;
-                let content_h = self.history_content_height(n, bar_h);
-                let entry_content_h = self.history_entry_content_height(n, bar_h);
                 if local_y >= entry_content_h {
                     return true;
                 }
@@ -1922,7 +1929,11 @@ impl NotificationManager {
     }
 
     fn max_scroll(&self, bar_h: i32) -> i32 {
-        let content = self.history_entries_height(bar_h);
+        let content = if self.history_layout_bh == bar_h && !self.history.is_empty() {
+            self.history_entries_height_cached()
+        } else {
+            self.history_entries_height(bar_h)
+        };
         let viewport = self.notify_height - 2 * NOTIFY_PADDING;
         (content - viewport).max(0)
     }
@@ -2121,6 +2132,41 @@ impl NotificationManager {
             .sum()
     }
 
+    fn rebuild_history_layout_cache(&mut self, bar_h: i32) {
+        self.history_layout_bh = bar_h;
+        self.history_content_heights = self
+            .history
+            .iter()
+            .map(|n| self.history_content_height(n, bar_h))
+            .collect();
+    }
+
+    fn history_content_height_cached(&self, i: usize, n: &Entry, bar_h: i32) -> i32 {
+        if self.history_layout_bh == bar_h && i < self.history_content_heights.len() {
+            self.history_content_heights[i]
+        } else {
+            self.history_content_height(n, bar_h)
+        }
+    }
+
+    fn history_entry_heights_cached(&self, i: usize, n: &Entry, bar_h: i32, has_next: bool) -> (i32, i32, i32) {
+        let content_h = self.history_content_height_cached(i, n, bar_h);
+        let entry_content_h = content_h
+            + if n.data.input_enabled { NOTIFY_INPUT_ROW_H } else { 0 }
+            + if n.data.actions.len() >= 4 { NOTIFY_BUTTON_H } else { 0 };
+        let entry_h = entry_content_h + if has_next { NOTIFY_PADDING } else { 0 };
+        (content_h, entry_content_h, entry_h)
+    }
+
+    fn history_entries_height_cached(&self) -> i32 {
+        let last = self.history.len().saturating_sub(1);
+        self.history
+            .iter()
+            .enumerate()
+            .map(|(i, n)| self.history_entry_heights_cached(i, n, self.history_layout_bh, i < last).2)
+            .sum()
+    }
+
     fn update_layout(&mut self, bar_h: i32) {
         if self.gl.is_none() {
             return;
@@ -2228,7 +2274,8 @@ impl NotificationManager {
             current.action_w = action_cells.into_iter().map(|(_, w)| w).collect();
         } else if self.is_history_active() {
             self.notify_width = NOTIFY_MAX_W;
-            let content = self.history_entries_height(bar_h);
+            self.rebuild_history_layout_cache(bar_h);
+            let content = self.history_entries_height_cached();
             let h = (content + 2 * NOTIFY_PADDING)
                 .max(bar_h)
                 .min(NOTIFY_HISTORY_MAX_H);
@@ -2577,8 +2624,8 @@ impl NotificationManager {
         let mut y = pad;
         let entries: Vec<Entry> = self.history.iter().cloned().collect();
         for (i, n) in entries.iter().enumerate() {
-            let entry_h = self.history_entry_height(n, bar_h, i < last);
-            let content_h = self.history_content_height(n, bar_h);
+            let (content_h, _entry_content_h, entry_h) =
+                self.history_entry_heights_cached(i, n, bar_h, i < last);
             if y + entry_h <= pad {
                 y += entry_h;
                 continue;

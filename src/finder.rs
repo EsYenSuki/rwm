@@ -1325,6 +1325,12 @@ impl Finder {
         if sym > 0x10ffff {
             return None;
         }
+        // The X server's Thai layout uses the legacy X11 Thai keysyms in
+        // 0x0da1..=0x0df9. Their Unicode code points are 0x60 higher, so a raw
+        // `char::from_u32` would insert Sinhala characters instead.
+        if (0x0da1..=0x0df9).contains(&sym) {
+            return char::from_u32(sym + 0x60);
+        }
         if (0x20..=0x7e).contains(&sym) {
             let ch = char::from_u32(sym)?;
             if state & SHIFT == 0 {
@@ -3375,6 +3381,11 @@ mod tests {
         assert_eq!(Finder::key_char('2' as u32, 1), Some('@'));
         assert_eq!(Finder::key_char('a' as u32, 1), Some('A'));
         assert_eq!(Finder::key_char(0x01000e01, 0), Some('ก'));
+        // X11's legacy Thai keysyms (used by the `th` group) are offset by
+        // 0x60 from their Unicode code points.
+        assert_eq!(Finder::key_char(0x0da1, 0), Some('ก'));
+        assert_eq!(Finder::key_char(0x0dbf, 0), Some('ฟ'));
+        assert_eq!(Finder::key_char(0x0de6, 0), Some('ๆ'));
     }
 
     #[test]

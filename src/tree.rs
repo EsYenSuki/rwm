@@ -71,6 +71,16 @@ pub struct Gaps {
     pub iv: i32,
 }
 
+/// Which outer margin of the tiling area a drop landed in. The top margin
+/// includes the bar strip above the work area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 /// The edges a resize drag from `(px, py)` moves, as `(left, right, top, bottom)`.
 /// The press picks a side per axis when it is in that side's outer third, so
 /// an edge's middle moves one edge and a corner moves two. A press in the
@@ -230,6 +240,57 @@ impl Node {
         }
     }
 
+    /// Axis of the split that directly owns `win`'s leaf.
+    fn parent_axis(&self, win: Window) -> Option<bool> {
+        match self {
+            Node::Leaf(_) => None,
+            Node::Split {
+                side_by_side,
+                first,
+                second,
+                ..
+            } => {
+                if matches!(&**first, Node::Leaf(w) if *w == win)
+                    || matches!(&**second, Node::Leaf(w) if *w == win)
+                {
+                    return Some(*side_by_side);
+                }
+                first.parent_axis(win).or_else(|| second.parent_axis(win))
+            }
+        }
+    }
+
+    /// Prepares the tree for dragging `win` out: removes its leaf and makes
+    /// every remaining window on its row/column the same size. Without this,
+    /// a dwindle tree gives all the freed space to the immediate sibling, so
+    /// dragging the middle window of a row leaves the left one untouched and
+    /// makes only the right one grow. `vis` must exclude the dragged window.
+    pub fn prepare_for_drag(
+        &mut self,
+        win: Window,
+        vis: &HashSet<Window>,
+        rect: Rect,
+        gaps: &Gaps,
+    ) -> bool {
+        let Some(axis) = self.parent_axis(win) else {
+            return false;
+        };
+        let old = std::mem::replace(self, Node::Leaf(win));
+        let Some(mut remaining) = old.remove(win) else {
+            return false;
+        };
+        let mut items = Vec::new();
+        axis_items(&remaining, rect, vis, gaps, axis, &mut items);
+        if items.len() > 1 {
+            let total: i32 = items.iter().sum();
+            let each = (total / items.len() as i32).max(1);
+            let sizes = vec![each; items.len()];
+            set_axis_items(&mut remaining, vis, gaps, axis, &mut sizes.into_iter());
+        }
+        *self = remaining;
+        true
+    }
+
     /// Collects every leaf window into `out`, including hidden ones. Used to
     /// reconcile the tree with the current client list.
     pub fn leaves(&self, out: &mut Vec<Window>) {
@@ -338,6 +399,193 @@ impl Node {
         true
     }
 
+    /// Insert `new` into the inner gap strip that contains `point`. The owning
+    /// split becomes a chain of three along the same axis (old first, new, old
+    /// second). The new window gets the average size of the windows in that
+    /// row, and every window there gives up the same fraction of its width so
+    /// the row stays balanced. Returns false when the point is not on an inner
+    /// gap, so callers can fall back to a normal dwindle split of the tile
+    /// under the point.
+    pub fn insert_in_gap(
+        &mut self,
+        rect: Rect,
+        vis: &HashSet<Window>,
+        gaps: &Gaps,
+        (px, py): (i32, i32),
+        new: Window,
+    ) -> bool {
+        let Node::Split {
+            side_by_side,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        let (fv, sv) = (first.any_visible(vis), second.any_visible(vis));
+        if !(fv && sv) {
+            // A split with a hidden child has no gap of its own: the visible
+            // child fills the whole rect. Keep looking inside it.
+            return if fv {
+                first.insert_in_gap(rect, vis, gaps, (px, py), new)
+            } else if sv {
+                second.insert_in_gap(rect, vis, gaps, (px, py), new)
+            } else {
+                false
+            };
+        }
+        let gap = if *side_by_side { gaps.iv } else { gaps.ih }.max(0);
+        let (a, b) = rect.split(*side_by_side, gap, *ratio);
+        let strip = if *side_by_side {
+            Rect {
+                x: a.x + a.w as i32,
+                y: rect.y,
+                w: gap as u32,
+                h: rect.h,
+            }
+        } else {
+            Rect {
+                x: rect.x,
+                y: a.y + a.h as i32,
+                w: rect.w,
+                h: gap as u32,
+            }
+        };
+        if !strip.contains(px, py) {
+            return if a.contains(px, py) {
+                first.insert_in_gap(a, vis, gaps, (px, py), new)
+            } else if b.contains(px, py) {
+                second.insert_in_gap(b, vis, gaps, (px, py), new)
+            } else {
+                false
+            };
+        }
+
+        let axis = *side_by_side;
+        let mut first_items = Vec::new();
+        axis_items(first, a, vis, gaps, axis, &mut first_items);
+        let mut second_items = Vec::new();
+        axis_items(second, b, vis, gaps, axis, &mut second_items);
+        if first_items.is_empty() || second_items.is_empty() {
+            return false;
+        }
+        let count = (first_items.len() + second_items.len()) as i32;
+        let item_sum: i32 = first_items.iter().chain(second_items.iter()).sum();
+        // One more gap is needed for the inserted window. The new window gets
+        // the final average item size, so every window in the row ends up the
+        // same relative size it had before, only slightly smaller.
+        let middle = ((item_sum - gap) / (count + 1)).max(1);
+        let remaining = item_sum - gap - middle;
+        if remaining < count {
+            return false;
+        }
+        let first_target = (remaining as f64 * first_items.iter().sum::<i32>() as f64
+            / item_sum as f64)
+            .round()
+            .max(1.0) as i32;
+        let first_target = first_target.min(remaining - 1);
+        let first_sizes = scale_items(&first_items, first_target);
+        let second_sizes = scale_items(&second_items, remaining - first_target);
+
+        let mut owning = std::mem::replace(self, Node::Leaf(new));
+        if let Node::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = &mut owning
+        {
+            let nf = set_axis_items(first, vis, gaps, axis, &mut first_sizes.into_iter());
+            let ns = set_axis_items(second, vis, gaps, axis, &mut second_sizes.into_iter());
+            // The parent rect still has only one gap, so its split ratio is
+            // measured against the old usable length, not the new three-way
+            // chain's total. The new window's gap is paid for inside `second`.
+            let parent_usable = axis_len(rect, axis) - gap;
+            *ratio = nf as f64 / parent_usable.max(1) as f64;
+            let tail = std::mem::replace(second, Box::new(Node::Leaf(new)));
+            *second = Box::new(Node::Split {
+                side_by_side: axis,
+                ratio: middle as f64 / (middle + ns).max(1) as f64,
+                first: Box::new(Node::Leaf(new)),
+                second: tail,
+            });
+        }
+        *self = owning;
+        true
+    }
+
+    /// Insert `new` through the outer margin containing `point`. `outer` is the
+    /// whole monitor (bar included) and `inner` is `tile_area()`. The tree is
+    /// wrapped in one new split on that edge. The new window matches the
+    /// average size of the windows in that row/column, and all of them give up
+    /// an equal share of the space.
+    pub fn insert_at_edge(
+        &mut self,
+        outer: Rect,
+        inner: Rect,
+        vis: &HashSet<Window>,
+        gaps: &Gaps,
+        (px, py): (i32, i32),
+        new: Window,
+    ) -> bool {
+        let outer_right = outer.x + outer.w as i32;
+        let outer_bottom = outer.y + outer.h as i32;
+        let inner_right = inner.x + inner.w as i32;
+        let inner_bottom = inner.y + inner.h as i32;
+        let top = py >= outer.y && py < inner.y;
+        let bottom = py >= inner_bottom && py < outer_bottom;
+        let left = px >= outer.x && px < inner.x;
+        let right = px >= inner_right && px < outer_right;
+        let edge = if top && px >= outer.x && px < outer_right {
+            Edge::Top
+        } else if bottom && px >= outer.x && px < outer_right {
+            Edge::Bottom
+        } else if left && py >= outer.y && py < outer_bottom {
+            Edge::Left
+        } else if right && py >= outer.y && py < outer_bottom {
+            Edge::Right
+        } else {
+            return false;
+        };
+
+        let axis = matches!(edge, Edge::Left | Edge::Right);
+        let new_first = matches!(edge, Edge::Left | Edge::Top);
+        let gap = if axis { gaps.iv } else { gaps.ih }.max(0);
+        let mut items = Vec::new();
+        axis_items(self, inner, vis, gaps, axis, &mut items);
+        if items.is_empty() {
+            return false;
+        }
+        let count = items.len() as i32;
+        let item_sum: i32 = items.iter().sum();
+        // Make room for one more window and one more gap. The inserted window
+        // ends up the same size as the average of the windows already here.
+        let middle = ((item_sum - gap) / (count + 1)).max(1);
+        let remaining = item_sum - gap - middle;
+        if remaining < count {
+            return false;
+        }
+        let sizes = scale_items(&items, remaining);
+        let old_extent: i32 = sizes.iter().sum::<i32>() + gap * (count - 1);
+
+        let mut old = std::mem::replace(self, Node::Leaf(new));
+        set_axis_items(&mut old, vis, gaps, axis, &mut sizes.into_iter());
+        let parent_extent = axis_len(inner, axis) - gap;
+        let (first, second, ratio) = if new_first {
+            (Node::Leaf(new), old, middle as f64 / parent_extent.max(1) as f64)
+        } else {
+            (old, Node::Leaf(new), old_extent as f64 / parent_extent.max(1) as f64)
+        };
+        *self = Node::Split {
+            side_by_side: axis,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        true
+    }
+
     /// Removes the leaf `target`; its sibling takes over the parent area.
     pub fn remove(self, target: Window) -> Option<Node> {
         match self {
@@ -413,6 +661,113 @@ fn rescale_subtree(
     } else {
         rescale_subtree(first, axis_side_by_side, gaps, old_first, new_first, false);
     }
+}
+
+fn axis_len(rect: Rect, side_by_side: bool) -> i32 {
+    if side_by_side {
+        rect.w as i32
+    } else {
+        rect.h as i32
+    }
+}
+
+/// Collects the lengths of every visible item along `axis`, in layout order.
+/// A subtree split on the other axis is one item because all of its windows
+/// span the full length here. Hidden leaves take no space and are skipped.
+fn axis_items(
+    node: &Node,
+    rect: Rect,
+    vis: &HashSet<Window>,
+    gaps: &Gaps,
+    axis: bool,
+    out: &mut Vec<i32>,
+) {
+    let Node::Split {
+        side_by_side,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        if node.any_visible(vis) {
+            out.push(axis_len(rect, axis));
+        }
+        return;
+    };
+    if *side_by_side != axis {
+        if node.any_visible(vis) {
+            out.push(axis_len(rect, axis));
+        }
+        return;
+    }
+    let gap = if axis { gaps.iv } else { gaps.ih }.max(0);
+    let (a, b) = rect.split(axis, gap, *ratio);
+    match (first.any_visible(vis), second.any_visible(vis)) {
+        (true, true) => {
+            axis_items(first, a, vis, gaps, axis, out);
+            axis_items(second, b, vis, gaps, axis, out);
+        }
+        (true, false) => axis_items(first, rect, vis, gaps, axis, out),
+        (false, true) => axis_items(second, rect, vis, gaps, axis, out),
+        (false, false) => {}
+    }
+}
+
+/// Sets the along-axis sizes of all items in `node` to `sizes`, in layout
+/// order, by adjusting the ratios of same-axis splits. A cross-axis subtree
+/// consumes one size; its own ratios stay as they are. Returns the resulting
+/// extent of `node` on that axis, gaps included.
+fn set_axis_items(
+    node: &mut Node,
+    vis: &HashSet<Window>,
+    gaps: &Gaps,
+    axis: bool,
+    sizes: &mut std::vec::IntoIter<i32>,
+) -> i32 {
+    let Node::Split {
+        side_by_side,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return sizes.next().unwrap_or(1).max(1);
+    };
+    if *side_by_side != axis {
+        return sizes.next().unwrap_or(1).max(1);
+    }
+    let gap = if axis { gaps.iv } else { gaps.ih }.max(0);
+    match (first.any_visible(vis), second.any_visible(vis)) {
+        (true, true) => {
+            let f = set_axis_items(first, vis, gaps, axis, sizes);
+            let s = set_axis_items(second, vis, gaps, axis, sizes);
+            *ratio = f as f64 / (f + s).max(1) as f64;
+            f + gap + s
+        }
+        (true, false) => set_axis_items(first, vis, gaps, axis, sizes),
+        (false, true) => set_axis_items(second, vis, gaps, axis, sizes),
+        (false, false) => 0,
+    }
+}
+
+/// Scales a list of item sizes so it sums to `total`, keeping their relative
+/// sizes and rounding to whole pixels.
+fn scale_items(items: &[i32], total: i32) -> Vec<i32> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let sum: i32 = items.iter().sum();
+    if sum <= 0 {
+        return items.to_vec();
+    }
+    let mut out: Vec<i32> = items
+        .iter()
+        .map(|&v| ((v as f64 * total as f64 / sum as f64).round().max(1.0)) as i32)
+        .collect();
+    let current: i32 = out.iter().sum();
+    let last = out.len() - 1;
+    out[last] = (out[last] + total - current).max(1);
+    out
 }
 
 /// One split on the path from the tree root to the window being resized,
@@ -1158,6 +1513,320 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn drop_in_vertical_gap_inserts_between_neighbours() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 500,
+        };
+        let gaps = Gaps {
+            oh: 0,
+            ov: 0,
+            ih: 14,
+            iv: 14,
+        };
+        let mut tree = Node::Leaf(1);
+        tree.insert(1, 2, false, true);
+        let before: HashSet<Window> = [1, 2].into_iter().collect();
+        assert!(tree.insert_in_gap(screen, &before, &gaps, (500, 250), 3));
+
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(screen, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 3);
+        // Three equal tiles with two gaps: 324*3 + 14*2 = 1000.
+        assert_eq!(rect_of(&out, 1), Rect { x: 0, y: 0, w: 324, h: 500 });
+        assert_eq!(rect_of(&out, 3), Rect { x: 338, y: 0, w: 324, h: 500 });
+        assert_eq!(rect_of(&out, 2), Rect { x: 676, y: 0, w: 324, h: 500 });
+    }
+
+    #[test]
+    fn drop_inside_a_tile_is_not_a_gap_insert() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 500,
+        };
+        let gaps = Gaps {
+            oh: 0,
+            ov: 0,
+            ih: 14,
+            iv: 14,
+        };
+        let mut tree = Node::Leaf(1);
+        tree.insert(1, 2, false, true);
+        let before: HashSet<Window> = [1, 2].into_iter().collect();
+        assert!(!tree.insert_in_gap(screen, &before, &gaps, (100, 250), 3));
+    }
+
+    #[test]
+    fn drop_in_horizontal_gap_inserts_between_neighbours() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 500,
+            h: 1000,
+        };
+        let gaps = Gaps {
+            oh: 0,
+            ov: 0,
+            ih: 14,
+            iv: 14,
+        };
+        let mut tree = Node::Leaf(1);
+        tree.insert(1, 2, false, false);
+        let before: HashSet<Window> = [1, 2].into_iter().collect();
+        assert!(tree.insert_in_gap(screen, &before, &gaps, (250, 500), 3));
+
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(screen, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(rect_of(&out, 1), Rect { x: 0, y: 0, w: 500, h: 324 });
+        assert_eq!(rect_of(&out, 3), Rect { x: 0, y: 338, w: 500, h: 324 });
+        assert_eq!(rect_of(&out, 2), Rect { x: 0, y: 676, w: 500, h: 324 });
+    }
+
+    #[test]
+    fn gap_insert_shrinks_every_window_in_the_row() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 500,
+        };
+        let gaps = Gaps {
+            oh: 0,
+            ov: 0,
+            ih: 14,
+            iv: 14,
+        };
+        // A row pair (1,2) on the left, window 3 on the right: the outer gap
+        // separates the pair from window 3.
+        let mut tree = Node::Split {
+            side_by_side: true,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                side_by_side: true,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }),
+            second: Box::new(Node::Leaf(3)),
+        };
+        let before: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        assert!(tree.insert_in_gap(screen, &before, &gaps, (500, 100), 4));
+
+        let vis: HashSet<Window> = [1, 2, 3, 4].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(screen, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 4);
+        // All three windows in the row give up the same fraction of their
+        // width, so W1 and W2 stay roughly the same size and W3 stays larger.
+        assert_eq!(rect_of(&out, 1).w, 177);
+        assert_eq!(rect_of(&out, 2).w, 177);
+        assert_eq!(rect_of(&out, 3).w, 365);
+        assert_eq!(rect_of(&out, 4).w, 239);
+    }
+
+    /// Monitor with a 100px bar, 14px outer gaps and two side-by-side tiles.
+    fn edge_fixture() -> (Rect, Rect, Gaps, Node) {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 600,
+        };
+        let work = Rect {
+            x: 0,
+            y: 100,
+            w: 1000,
+            h: 500,
+        };
+        let gaps = Gaps {
+            oh: 14,
+            ov: 14,
+            ih: 14,
+            iv: 14,
+        };
+        let area = inset(work, &gaps);
+        let mut tree = Node::Leaf(1);
+        tree.insert(1, 2, false, true);
+        (outer, area, gaps, tree)
+    }
+
+    #[test]
+    fn drop_in_left_edge_gap_adds_a_column() {
+        let (outer, area, gaps, mut tree) = edge_fixture();
+        assert!(tree.insert_at_edge(outer, area, &[1, 2].into_iter().collect(), &gaps, (5, 300), 3));
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(area, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(rect_of(&out, 3).x, area.x);
+        // All three windows end up about the same width.
+        assert_eq!(rect_of(&out, 3).w, 314);
+        assert_eq!(rect_of(&out, 1).w, 315);
+        assert_eq!(rect_of(&out, 2).w, 315);
+    }
+
+    #[test]
+    fn drop_in_right_edge_gap_adds_a_column_on_the_right() {
+        let (outer, area, gaps, mut tree) = edge_fixture();
+        assert!(tree.insert_at_edge(outer, area, &[1, 2].into_iter().collect(), &gaps, (995, 300), 3));
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(area, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 3);
+        let right = rect_of(&out, 3).x + rect_of(&out, 3).w as i32;
+        assert_eq!(right, area.x + area.w as i32);
+        assert_eq!(rect_of(&out, 1).w, 315);
+        assert_eq!(rect_of(&out, 2).w, 315);
+    }
+
+    #[test]
+    fn drop_on_the_topbar_adds_a_row_at_the_top() {
+        let (outer, area, gaps, _) = edge_fixture();
+        let mut tree = Node::Leaf(1);
+        tree.insert(1, 2, false, false);
+        // y=50 is inside the 100px bar strip, above the work area.
+        assert!(tree.insert_at_edge(outer, area, &[1, 2].into_iter().collect(), &gaps, (500, 50), 3));
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(area, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(rect_of(&out, 3).y, area.y);
+        assert_eq!(rect_of(&out, 3).h, 148);
+        assert_eq!(rect_of(&out, 1).h, 148);
+        assert_eq!(rect_of(&out, 2).h, 148);
+    }
+
+    #[test]
+    fn drop_in_bottom_edge_gap_adds_a_row_at_the_bottom() {
+        let (outer, area, gaps, mut tree) = edge_fixture();
+        assert!(tree.insert_at_edge(outer, area, &[1, 2].into_iter().collect(), &gaps, (500, 595), 3));
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(area, &vis, &gaps, &mut out);
+        assert_eq!(out.len(), 3);
+        let bottom = rect_of(&out, 3).y + rect_of(&out, 3).h as i32;
+        assert_eq!(bottom, area.y + area.h as i32);
+        // The old tree is a side-by-side split, so both of its windows form
+        // one item on this axis and shrink together.
+        assert_eq!(rect_of(&out, 3).h, 229);
+        assert_eq!(rect_of(&out, 1).h, 229);
+        assert_eq!(rect_of(&out, 2).h, 229);
+    }
+
+    #[test]
+    fn dragging_the_middle_window_grows_both_neighbours_evenly() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 500,
+        };
+        let gaps = Gaps {
+            oh: 0,
+            ov: 0,
+            ih: 14,
+            iv: 14,
+        };
+        // Both tree shapes for a 3-window row must behave the same way.
+        let shapes: [(&str, Node); 2] = [
+            (
+                "right-leaning",
+                Node::Split {
+                    side_by_side: true,
+                    ratio: 1.0 / 3.0,
+                    first: Box::new(Node::Leaf(1)),
+                    second: Box::new(Node::Split {
+                        side_by_side: true,
+                        ratio: 0.5,
+                        first: Box::new(Node::Leaf(2)),
+                        second: Box::new(Node::Leaf(3)),
+                    }),
+                },
+            ),
+            (
+                "left-leaning",
+                Node::Split {
+                    side_by_side: true,
+                    ratio: 2.0 / 3.0,
+                    first: Box::new(Node::Split {
+                        side_by_side: true,
+                        ratio: 0.5,
+                        first: Box::new(Node::Leaf(1)),
+                        second: Box::new(Node::Leaf(2)),
+                    }),
+                    second: Box::new(Node::Leaf(3)),
+                },
+            ),
+        ];
+        for (name, mut tree) in shapes {
+            let vis: HashSet<Window> = [1, 3].into_iter().collect();
+            assert!(tree.prepare_for_drag(2, &vis, screen, &gaps));
+            let mut out = Vec::new();
+            tree.layout(screen, &vis, &gaps, &mut out);
+            let w1 = rect_of(&out, 1);
+            let w3 = rect_of(&out, 3);
+            assert_eq!(w1.w, w3.w, "{}", name);
+            assert_eq!(w1.x, screen.x, "{}", name);
+            assert_eq!(w3.x + w3.w as i32, screen.x + screen.w as i32, "{}", name);
+        }
+    }
+
+    #[test]
+    fn edge_drop_makes_the_moved_window_match_its_neighbours() {
+        // W1 is twice as wide as W3; W2 is the narrow middle window. Moving W2
+        // to the left edge must give it the average of the surviving windows,
+        // not another narrow slice.
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 500,
+        };
+        let gaps = Gaps {
+            oh: 0,
+            ov: 14,
+            ih: 14,
+            iv: 14,
+        };
+        let area = inset(outer, &gaps);
+        let mut tree = Node::Split {
+            side_by_side: true,
+            ratio: 2.0 / 3.0,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Split {
+                side_by_side: true,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(2)),
+                second: Box::new(Node::Leaf(3)),
+            }),
+        };
+        tree = tree.remove(2).unwrap();
+        assert!(tree.insert_at_edge(outer, area, &[1, 3].into_iter().collect(), &gaps, (5, 250), 2));
+
+        let vis: HashSet<Window> = [1, 2, 3].into_iter().collect();
+        let mut out = Vec::new();
+        tree.layout(area, &vis, &gaps, &mut out);
+        let w1 = rect_of(&out, 1).w as i32;
+        let w2 = rect_of(&out, 2).w as i32;
+        let w3 = rect_of(&out, 3).w as i32;
+        assert!((w2 - (w1 + w3) / 2).abs() <= 1, "{} vs {} and {}", w2, w1, w3);
+        assert!(w2 > 280, "moved window is too narrow: {}", w2);
+    }
+
+    #[test]
+    fn drop_inside_the_tiling_area_is_not_an_edge_insert() {
+        let (outer, area, gaps, mut tree) = edge_fixture();
+        assert!(!tree.insert_at_edge(outer, area, &[1, 2].into_iter().collect(), &gaps, (100, 300), 3));
     }
 
     #[test]
