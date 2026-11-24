@@ -6,6 +6,7 @@ mod finder;
 mod finder_math;
 mod finder_net;
 mod gl;
+mod icon;
 mod keys;
 mod mpris;
 mod notification;

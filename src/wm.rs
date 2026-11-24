@@ -31,9 +31,10 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::bar::{
-    BAR_BACKGROUND_PIXEL, BAR_TRANSPARENT_PIXEL, BARGAP, CLOCKPAD, CursorLoader, HORIZPADBAR,
-    KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL, Metrics, SYSTRAY_SPACING, TAG_LABEL, TAGS,
-    TRAY_ICON_MAX, TRAY_ICON_MIN, VERTPADBAR,
+    BAR_BACKGROUND_PIXEL, BAR_TRANSPARENT_PIXEL, BARGAP, CLIENT_ICON_LEFT_PAD, CLIENT_ICON_SIZE,
+    CLIENT_ICON_SPACING, CLOCKPAD, CursorLoader, HORIZPADBAR, KBLAYOUTPAD, LAUNCHERS,
+    LAYOUT_SYMBOL, Metrics, SYSTRAY_SPACING, TAG_LABEL, TAGS, TRAY_ICON_MAX, TRAY_ICON_MIN,
+    VERTPADBAR,
 };
 use crate::config::{
     self, BORDERPX, FLOATBAR, TOPBAR, TRAY_MENUS_ABOVE_BAR,
@@ -553,6 +554,7 @@ struct Atoms {
     wm_change_state: u32,
     wm_transient_for: u32,
     net_wm_name: u32,
+    net_wm_icon: u32,
     net_wm_window_type: u32,
     net_wm_window_type_dialog: u32,
     net_wm_window_type_utility: u32,
@@ -694,6 +696,11 @@ pub struct Wm {
     center_shown: RefCell<Vec<bool>>,
     /// Last names read from clients, so frame builds don't need round trips.
     name_cache: RefCell<HashMap<Window, String>>,
+    /// Decoded `_NET_WM_ICON` pixels of the title bar's icons. `None` is cached
+    /// too, so clients without the property are not polled every frame.
+    icon_cache: RefCell<HashMap<Window, Option<crate::icon::ClientIcon>>>,
+    /// Monotonic version handed to decoded icons, used in draw keys and caches.
+    icon_seq: Cell<u64>,
     /// Last geometry sent to each managed window, so unchanged layouts cost no
     /// configure requests. The last field is the border width.
     geom_cache: RefCell<HashMap<Window, (i32, i32, u32, u32, u32)>>,
@@ -922,6 +929,7 @@ impl Wm {
             wm_change_state: intern(b"WM_CHANGE_STATE")?,
             wm_transient_for: intern(b"WM_TRANSIENT_FOR")?,
             net_wm_name: intern(b"_NET_WM_NAME")?,
+            net_wm_icon: intern(b"_NET_WM_ICON")?,
             net_wm_window_type: intern(b"_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_dialog: intern(b"_NET_WM_WINDOW_TYPE_DIALOG")?,
             net_wm_window_type_utility: intern(b"_NET_WM_WINDOW_TYPE_UTILITY")?,
@@ -1125,6 +1133,8 @@ impl Wm {
             bar_drawn: RefCell::new(HashMap::new()),
             center_shown: RefCell::new(vec![false; monitor_count]),
             name_cache: RefCell::new(HashMap::new()),
+            icon_cache: RefCell::new(HashMap::new()),
+            icon_seq: Cell::new(0),
             geom_cache: RefCell::new(HashMap::new()),
             mapped_zones: RefCell::new(HashSet::new()),
             status,
@@ -2501,11 +2511,16 @@ impl Wm {
         BORDERPX + w + self.metrics.textw(LAYOUT_SYMBOL)
     }
 
-    /// dwm's `bartitlewidth()`: launchers plus the selected client's name,
-    /// limited to `budget`.
+    /// dwm's `bartitlewidth()`: the focused window's icon (or the launcher
+    /// glyph when it has none) plus the selected client's name, capped at the
+    /// available bar width.
     fn bartitlewidth(&self, mi: usize, budget: i32) -> i32 {
-        let mut w: i32 = LAUNCHERS.iter().map(|name| self.metrics.textw(name)).sum();
-        if let Some(sel) = self.monitors[mi].sel {
+        let sel = self.monitors[mi].sel;
+        let mut w: i32 = match sel.and_then(|win| self.client_icon(win)) {
+            Some(icon) => CLIENT_ICON_LEFT_PAD + icon.width as i32 + CLIENT_ICON_SPACING,
+            None => LAUNCHERS.iter().map(|name| self.metrics.textw(name)).sum(),
+        };
+        if let Some(sel) = sel {
             w += self.metrics.textw(&self.client_name(sel));
         }
         w.min(budget)
@@ -4094,6 +4109,7 @@ impl Wm {
         self.iconified_stack.retain(|&w| w != win);
         self.client_maps.borrow_mut().remove(&win);
         self.name_cache.borrow_mut().remove(&win);
+        self.icon_cache.borrow_mut().remove(&win);
         self.geom_cache.borrow_mut().remove(&win);
         for zone in client.edge_wins {
             self.conn.destroy_window(zone)?;
@@ -4136,6 +4152,48 @@ impl Wm {
         };
         self.name_cache.borrow_mut().insert(win, name.clone());
         name
+    }
+
+    /// AnDWM's `updateicon()` + `geticonprop()` for the bar: decode the
+    /// selected client's `_NET_WM_ICON` once and reuse it until that property
+    /// changes. A missing icon is cached as `None` so idle frames do not keep
+    /// asking clients for a property they never set.
+    fn client_icon(&self, win: Window) -> Option<crate::icon::ClientIcon> {
+        if let Some(cached) = self.icon_cache.borrow().get(&win) {
+            return cached.clone();
+        }
+        let icon = self.read_client_icon(win);
+        self.icon_cache.borrow_mut().insert(win, icon.clone());
+        icon
+    }
+
+    fn read_client_icon(&self, win: Window) -> Option<crate::icon::ClientIcon> {
+        let prop = self
+            .conn
+            .get_property(
+                false,
+                win,
+                self.atoms.net_wm_icon,
+                AtomEnum::ANY,
+                0,
+                u32::MAX,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        if prop.format != 32 || prop.value.len() < 12 {
+            return None;
+        }
+        // 32-bit X11 properties are arrays of native-endian cardinals.
+        let data: Vec<u32> = prop
+            .value
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let id = self.icon_seq.get() + 1;
+        let icon = crate::icon::client_icon(&data, CLIENT_ICON_SIZE, id)?;
+        self.icon_seq.set(id);
+        Some(icon)
     }
 
     /// Redraws every shown bar. Returns true when the clock text changed.
@@ -4780,6 +4838,8 @@ impl Wm {
                 .filter(|c| c.mon == mi)
                 .fold(0, |acc, c| acc | c.tags);
             let title = m.sel.map(|w| self.client_name(w));
+            let icon = m.sel.and_then(|w| self.client_icon(w));
+            let icon_id = icon.as_ref().map_or(0, |i| i.id);
             let focused = mi == self.selmon;
             let b = self.barwidths(mi);
             let (barwin, titlewin, kbwin, rightwin, marker_win) = (
@@ -4809,11 +4869,16 @@ impl Wm {
             }
 
             let tlw = b.tlw.max(1) as u32;
-            let title_key = format!("title:{tlw}:{title:?}:{focused}");
+            let title_key = format!("title:{tlw}:{title:?}:{focused}:{icon_id}");
             if self.section_changed(titlewin, &title_key) {
                 self.drw.resize(tlw, bh as u32);
-                self.drw
-                    .title(&self.metrics, tlw as i32, title.as_deref(), focused);
+                self.drw.title(
+                    &self.metrics,
+                    tlw as i32,
+                    title.as_deref(),
+                    focused,
+                    icon.as_ref(),
+                );
                 self.drw.map(titlewin as x11::xlib::Window, tlw, bh as u32);
                 self.bar_drawn.borrow_mut().insert(titlewin, title_key);
             }
@@ -5834,6 +5899,12 @@ impl Wm {
                 if self.tray.read_info(&self.conn, e.window) {
                     self.relayout_tray()?;
                 }
+            }
+            Event::PropertyNotify(e) if e.atom == self.atoms.net_wm_icon => {
+                // A client changed its app icon; drop the decoded pixels so the
+                // next bar frame reads the new property (AnDWM's `updateicon`).
+                self.icon_cache.borrow_mut().remove(&e.window);
+                self.bar_dirty = true;
             }
             Event::PropertyNotify(e)
                 if e.atom == u32::from(AtomEnum::WM_NAME) || e.atom == self.atoms.net_wm_name =>

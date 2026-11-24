@@ -15,10 +15,10 @@ use x11::xlib::{self, Display, Drawable, GC, Pixmap, Visual, XImage, XRectangle,
 use x11::xrender::{self, Picture, XLinearGradient, XPointFixed, XRenderColor};
 
 use crate::bar::{
-    BORDERPX, CLOCKPAD, CLRBORDER, HORIZPADBAR, KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL,
-    MPRIS_CONTROL_W, MPRIS_SCROLL_PAD, MPRIS_WIDTH, Metrics, Scheme, TAG_LABEL, TAGS, ULINEPAD,
-    ULINESTROKE, VERTPADBAR, col, mpris_slider_span, scheme_layout, scheme_norm, scheme_tag,
-    scheme_title,
+    BORDERPX, CLIENT_ICON_LEFT_PAD, CLIENT_ICON_SPACING, CLOCKPAD, CLRBORDER, HORIZPADBAR,
+    KBLAYOUTPAD, LAUNCHERS, LAYOUT_SYMBOL, MPRIS_CONTROL_W, MPRIS_SCROLL_PAD, MPRIS_WIDTH, Metrics,
+    Scheme, TAG_LABEL, TAGS, ULINEPAD, ULINESTROKE, VERTPADBAR, col, mpris_slider_span,
+    scheme_layout, scheme_norm, scheme_tag, scheme_title,
 };
 use crate::status::{Status, StatusToken};
 use crate::text::Op;
@@ -52,6 +52,16 @@ struct CachedArtwork {
     picture: Picture,
 }
 
+/// The focused client's icon as an XRender picture. `id` is the version of the
+/// decoded `_NET_WM_ICON` pixel data; a changed property uploads a new pixmap.
+struct CachedClientIcon {
+    id: u64,
+    w: u32,
+    h: u32,
+    pixmap: Pixmap,
+    picture: Picture,
+}
+
 /// The drawing context: one display, one offscreen drawable, one GC, one Xft
 /// drawable and one XRender picture, exactly like C's `Drw`.
 pub struct Drw {
@@ -69,6 +79,7 @@ pub struct Drw {
     xft_draw: *mut XftDraw,
     colors: HashMap<u32, XftColor>,
     artwork: Option<CachedArtwork>,
+    client_icon: Option<CachedClientIcon>,
 }
 
 impl Drw {
@@ -116,6 +127,7 @@ impl Drw {
                 xft_draw,
                 colors: HashMap::new(),
                 artwork: None,
+                client_icon: None,
             })
         }
     }
@@ -657,16 +669,42 @@ impl Drw {
         self.text(m, x, 0, lw, bh, lrpad / 2, LAYOUT_SYMBOL, scheme_layout());
     }
 
-    /// Title row of dwm's `drawbar()`.
-    pub fn title(&mut self, m: &Metrics, w: i32, name: Option<&str>, focused: bool) {
+    /// Title row of dwm's `drawbar()`. The focused window's application icon
+    /// takes the place of the Arch launcher; the glyph stays as the fallback
+    /// for windows that publish no `_NET_WM_ICON`.
+    pub fn title(
+        &mut self,
+        m: &Metrics,
+        w: i32,
+        name: Option<&str>,
+        focused: bool,
+        icon: Option<&crate::icon::ClientIcon>,
+    ) {
         let bh = self.h as i32;
         let lrpad = m.lrpad();
         self.rect(0, 0, w, bh, col(CLRBORDER));
         let mut x = BORDERPX;
-        for launcher in LAUNCHERS {
-            let lw = m.textw(launcher);
-            self.text(m, x, 0, lw, bh, lrpad / 2, launcher, scheme_layout());
-            x += lw;
+        // The icon branch already accounts for its own gap; drw_text's lrpad/2
+        // would add another ~8px of empty space before the window name.
+        let mut title_lpad = lrpad / 2;
+        if let Some(icon) = icon
+            && let Some(picture) = self.client_icon_picture(icon)
+        {
+            self.pic(
+                x + CLIENT_ICON_LEFT_PAD,
+                (bh - icon.height as i32) / 2,
+                icon.width,
+                icon.height,
+                picture,
+            );
+            x += CLIENT_ICON_LEFT_PAD + icon.width as i32 + CLIENT_ICON_SPACING;
+            title_lpad = 0;
+        } else {
+            for launcher in LAUNCHERS {
+                let lw = m.textw(launcher);
+                self.text(m, x, 0, lw, bh, lrpad / 2, launcher, scheme_layout());
+                x += lw;
+            }
         }
         if let Some(name) = name {
             let tw = w - x;
@@ -676,7 +714,7 @@ impl Drw {
                 } else {
                     scheme_norm()
                 };
-                self.text(m, x, 0, tw, bh, lrpad / 2, name, scheme);
+                self.text(m, x, 0, tw, bh, title_lpad, name, scheme);
             }
         }
     }
@@ -935,31 +973,21 @@ impl Drw {
         }
     }
 
-    /// Cover-scale artwork into an ARGB32 pixmap and cache the XRender picture.
-    fn artwork_picture(
-        &mut self,
-        art: &std::sync::Arc<crate::mpris::Artwork>,
-        w: u32,
-        h: u32,
-    ) -> Option<Picture> {
-        if let Some(cached) = &self.artwork
-            && std::sync::Arc::ptr_eq(&cached.art, art)
-            && cached.w == w
-            && cached.h == h
-        {
-            return Some(cached.picture);
-        }
-        let (sw, sh) = (art.width.max(1), art.height.max(1));
-        if art.rgba.len() < sw * sh * 4 || w == 0 || h == 0 {
+    /// Upload premultiplied `0xAARRGGBB` pixels into a 32-bit pixmap and wrap
+    /// it in an XRender picture. Shared by MPRIS artwork and window icons.
+    fn argb_picture(&self, pixels: &[u32], w: u32, h: u32) -> Option<(Pixmap, Picture)> {
+        if pixels.len() < (w * h) as usize || w == 0 || h == 0 {
             return None;
         }
-        let mut pixels = cover_pixels(art, w, h);
         unsafe {
+            // XPutImage reads the buffer but needs a mutable pointer; keep the
+            // copy local so the caller's cached icon data stays immutable.
+            let mut data = pixels.to_vec();
             let mut img: XImage = std::mem::zeroed();
             img.width = w as c_int;
             img.height = h as c_int;
             img.format = ZPixmap;
-            img.data = pixels.as_mut_ptr() as *mut c_char;
+            img.data = data.as_mut_ptr() as *mut c_char;
             img.byte_order = xlib::XImageByteOrder(self.dpy);
             img.bitmap_unit = xlib::XBitmapUnit(self.dpy);
             img.bitmap_bit_order = xlib::XBitmapBitOrder(self.dpy);
@@ -986,21 +1014,79 @@ impl Drw {
                 return None;
             }
             let picture = xrender::XRenderCreatePicture(self.dpy, pixmap, format, 0, ptr::null());
-            if let Some(old) = self.artwork.take() {
+            if picture == 0 {
+                xlib::XFreePixmap(self.dpy, pixmap);
+                return None;
+            }
+            Some((pixmap, picture))
+        }
+    }
+
+    /// Cover-scale artwork into an ARGB32 pixmap and cache the XRender picture.
+    fn artwork_picture(
+        &mut self,
+        art: &std::sync::Arc<crate::mpris::Artwork>,
+        w: u32,
+        h: u32,
+    ) -> Option<Picture> {
+        if let Some(cached) = &self.artwork
+            && std::sync::Arc::ptr_eq(&cached.art, art)
+            && cached.w == w
+            && cached.h == h
+        {
+            return Some(cached.picture);
+        }
+        let (sw, sh) = (art.width.max(1), art.height.max(1));
+        if art.rgba.len() < sw * sh * 4 || w == 0 || h == 0 {
+            return None;
+        }
+        let pixels = cover_pixels(art, w, h);
+        let (pixmap, picture) = self.argb_picture(&pixels, w, h)?;
+        if let Some(old) = self.artwork.take() {
+            unsafe {
                 if old.picture != 0 {
                     xrender::XRenderFreePicture(self.dpy, old.picture);
                 }
                 xlib::XFreePixmap(self.dpy, old.pixmap);
             }
-            self.artwork = Some(CachedArtwork {
-                art: art.clone(),
-                w,
-                h,
-                pixmap,
-                picture,
-            });
-            Some(picture)
         }
+        self.artwork = Some(CachedArtwork {
+            art: art.clone(),
+            w,
+            h,
+            pixmap,
+            picture,
+        });
+        Some(picture)
+    }
+
+    /// The focused client's `_NET_WM_ICON` as an XRender picture. Small icons
+    /// are cheap to upload, and `id` changes only when the property changes.
+    fn client_icon_picture(&mut self, icon: &crate::icon::ClientIcon) -> Option<Picture> {
+        if let Some(cached) = &self.client_icon
+            && cached.id == icon.id
+            && cached.w == icon.width
+            && cached.h == icon.height
+        {
+            return Some(cached.picture);
+        }
+        let (pixmap, picture) = self.argb_picture(&icon.argb, icon.width, icon.height)?;
+        if let Some(old) = self.client_icon.take() {
+            unsafe {
+                if old.picture != 0 {
+                    xrender::XRenderFreePicture(self.dpy, old.picture);
+                }
+                xlib::XFreePixmap(self.dpy, old.pixmap);
+            }
+        }
+        self.client_icon = Some(CachedClientIcon {
+            id: icon.id,
+            w: icon.width,
+            h: icon.height,
+            pixmap,
+            picture,
+        });
+        Some(picture)
     }
 }
 
@@ -1045,6 +1131,12 @@ impl Drop for Drw {
                     xrender::XRenderFreePicture(self.dpy, art.picture);
                 }
                 xlib::XFreePixmap(self.dpy, art.pixmap);
+            }
+            if let Some(icon) = self.client_icon.take() {
+                if icon.picture != 0 {
+                    xrender::XRenderFreePicture(self.dpy, icon.picture);
+                }
+                xlib::XFreePixmap(self.dpy, icon.pixmap);
             }
             if self.picture != 0 {
                 xrender::XRenderFreePicture(self.dpy, self.picture);

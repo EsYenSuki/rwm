@@ -241,8 +241,16 @@ pub const BAR_BACKGROUND_PIXEL: u32 = 0xFF00_0000 | CLRBORDER;
 pub const BAR_TRANSPARENT_PIXEL: u32 = 0;
 pub const TAG_LABEL: &str = "\u{f192}";
 pub const LAYOUT_SYMBOL: &str = "[]=";
-/// config.h `launchers`: the Arch logo, U+F303.
+/// config.h `launchers`: the Arch logo, U+F303. Kept as the fallback when the
+/// focused window has no `_NET_WM_ICON`.
 pub const LAUNCHERS: [&str; 1] = ["\u{f303}"];
+/// AnDWM config.h `ICONSIZE`: the cell the focused window's application icon
+/// is scaled into in the title bar.
+pub const CLIENT_ICON_SIZE: u32 = 21;
+/// AnDWM config.h `ICONSPACING`: gap between the application icon and title.
+pub const CLIENT_ICON_SPACING: i32 = 5;
+/// Small inset from the bar's left edge, so the icon isn't flush against it.
+pub const CLIENT_ICON_LEFT_PAD: i32 = 6;
 pub const BARGAP: i32 = 10;
 pub const CLOCKPAD: i32 = 24;
 pub const KBLAYOUTPAD: i32 = 17;
