@@ -18,6 +18,11 @@ pub const TRAY_MENUS_ABOVE_BAR: bool = true;
 /// the default root visual everywhere; the same fallback is used automatically
 /// when the server has no ARGB visual or rejects its creation.
 pub const FINDER_ARGB: bool = true;
+/// Allow the EGL readback fallback when the driver accepts pixmap surfaces but
+/// does not publish their pixels to XRender. `0` forces the zero-copy path so
+/// EGL can be tested on its own; `1` restores the XImage upload fallback for
+/// software drivers such as Mesa on Xvfb.
+pub const EGL_FALLBACK: u8 = 0;
 /// config.h `finder_width`: popup width in pixels.
 pub const FINDER_WIDTH: i32 = 300;
 /// config.h `finder_rows`: maximum number of visible application rows.

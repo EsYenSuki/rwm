@@ -456,7 +456,7 @@ impl Drw {
         }
     }
 
-    /// Composite an ARGB32 source picture (the GL readback surface) onto an
+    /// Composite an ARGB32 source picture (the EGL rendering surface) onto an
     /// ARGB window. `fade == 3` applies dwm's accelerating 12-stop vertical
     /// opacity ramp from `drw_map_alpha`; `fade == 0` is a plain `PictOpSrc`
     /// copy. This is the bridge between the OpenGL finder and the ARGB clock

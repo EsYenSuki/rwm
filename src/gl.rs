@@ -1,17 +1,20 @@
-//! GLX pbuffer context, OpenGL entry-point loading and Kawase bloom for the
-//! finder port.
+//! EGL X11 pixmap surface, OpenGL entry-point loading and Kawase bloom for the
+//! finder and notification renderers.
 //!
 //! Port of AnDWM `dwm.c` 7581-7638 (`notification_gl_init`), 8496-8700
 //! (`finder_gl_proc`, `finder_gl_bloom_load_procs`, shader/program/buffers/quad)
 //! and 11639-11927 (the five-pass blur/composite used by the finder icons,
 //! text and waiting backdrop). The context is a **legacy compatibility** one
-//! created with `glXCreateNewContext(..., GLX_RGBA_TYPE, ...)`: the shaders are
+//! created with `eglCreateContext` and no profile attributes: the shaders are
 //! GLSL v120 and the quads use the fixed-function matrix stack, so a core-only
 //! context must never be requested here.
 //!
-//! The `gl` 0.14 crate intentionally omits deprecated fixed-function symbols,
-//! so `glBegin`/`glVertex2f`/matrix-stack functions are loaded separately via
-//! `glXGetProcAddressARB` and wrapped in [`CompatGl`].
+//! Rendering goes straight into an ARGB32 X pixmap via EGL. XRender composes
+//! that pixmap into the final frame, so there is no GLX pbuffer and no
+//! `glReadPixels`/`XPutImage` copy of the whole popup on every frame. The
+//! `gl` 0.14 crate intentionally omits deprecated fixed-function symbols, so
+//! `glBegin`/`glVertex2f`/matrix-stack functions are loaded separately via
+//! `eglGetProcAddress` and wrapped in [`CompatGl`].
 
 // The context, loader and bloom are consumed by the font/presentation tasks
 // that follow; keep a clean build while this module is still standalone.
@@ -29,9 +32,10 @@ use freetype_sys::{
     FT_UInt, FT_ULong,
 };
 use gl::types::{GLchar, GLdouble, GLenum, GLfloat, GLint, GLsizei, GLuint};
-use x11::glx::{self, GLXContext, GLXFBConfig};
 use x11::xlib;
 use x11::xrender;
+
+use crate::egl;
 
 // These two matrix-stack tokens are missing from the `gl` 0.14 constants even
 // though the compatibility context uses them.
@@ -97,8 +101,8 @@ type FnTranslatef = unsafe extern "C" fn(GLfloat, GLfloat, GLfloat);
 type FnVertex2f = unsafe extern "C" fn(GLfloat, GLfloat);
 
 /// `gl` 0.14 does not generate the OpenGL 1.x fixed-function entry points that
-/// dwm uses directly. They are resolved once, while the pbuffer context is
-/// current, from the same `glXGetProcAddressARB` table as everything else.
+/// dwm uses directly. They are resolved once, while the EGL context is
+/// current, from the same `eglGetProcAddress` table as everything else.
 pub struct CompatGl {
     begin_fn: FnBegin,
     end_fn: FnEnd,
@@ -204,37 +208,19 @@ pub fn compat() -> Result<&'static CompatGl> {
 fn load_fn<T: Copy>(name: &str) -> Result<T> {
     let proc = proc_address(name);
     if proc.is_null() {
-        return Err(format!("GLX is missing compatibility entry point {name}").into());
+        return Err(format!("EGL is missing compatibility entry point {name}").into());
     }
     // Function pointers and data pointers have the same representation on the
     // supported X11/GL platforms; transmute_copy keeps the raw pointer alive
     // for the copy without pretending it is a reference to a function.
-    unsafe { Ok(std::mem::transmute_copy::<*const c_void, T>(&proc)) }
+    unsafe { Ok(std::mem::transmute_copy::<*mut c_void, T>(&proc)) }
 }
 
-/// The offscreen GLX pbuffer that backs finder rendering. Created once and
-/// reused; a size change recreates only the pbuffer, not the context. Dropping
-/// it releases the current binding, pbuffer and context in that order.
-pub struct GlPbuffer {
-    dpy: *mut xlib::Display,
-    fbconfig: GLXFBConfig,
-    ctx: GLXContext,
-    pbuffer: u64,
-    width: u32,
-    height: u32,
-}
-
-/// dwm.c 8496-8498: resolve one GL entry point through `glXGetProcAddressARB`.
-/// `None` (a null pointer) is returned for unknown names so the `gl` crate can
-/// apply its own EXT fallbacks, exactly like dwm's `...EXT` retry list.
-fn proc_address(name: &str) -> *const c_void {
-    let Ok(name) = CString::new(name) else {
-        return ptr::null();
-    };
-    unsafe {
-        glx::glXGetProcAddressARB(name.as_ptr() as *const u8)
-            .map_or(ptr::null(), |f| f as *const c_void)
-    }
+/// dwm.c 8496-8498: resolve one GL entry point through `eglGetProcAddress`.
+/// A null pointer is returned for unknown names so the `gl` crate can apply its
+/// own EXT fallbacks, exactly like dwm's `...EXT` retry list.
+fn proc_address(name: &str) -> *mut c_void {
+    egl::proc_address(name)
 }
 
 /// Every `gl::...` function used by the bloom and presentation paths must be
@@ -274,7 +260,7 @@ fn gl_symbols_loaded() -> bool {
         && gl::BlendFunc::is_loaded()
 }
 
-/// dwm.c 8500-8567: load all GL symbols through `glXGetProcAddressARB` while
+/// dwm.c 8500-8567: load all GL symbols through `eglGetProcAddress` while
 /// the context is current, then require the bloom/shader subset. The loader
 /// retries the `...EXT` spelling for the framebuffer functions, as dwm does at
 /// 8543-8558. The `gl` crate already has most of these fallbacks internally but
@@ -297,7 +283,7 @@ fn load_gl() -> Result {
     });
 
     if !gl_symbols_loaded() {
-        return Err("GLX is missing framebuffer or shader entry points".into());
+        return Err("EGL is missing framebuffer or shader entry points".into());
     }
     // Also resolve the fixed-function symbols that `gl` 0.14 does not expose.
     compat()?;
@@ -321,167 +307,121 @@ fn blend_separate() {
     }
 }
 
-impl GlPbuffer {
-    /// dwm.c 7581-7638: choose a pbuffer-capable FBConfig with an 8-bit alpha
-    /// channel, create the legacy compatibility context and bind a pbuffer of
-    /// `width` x `height`. Any failure returns an error and leaves no GL state
-    /// behind, so the finder can stay inactive without touching the clock bar.
-    pub fn new(dpy: *mut xlib::Display, screen: i32, width: u32, height: u32) -> Result<GlPbuffer> {
-        let width = width.max(1);
-        let height = height.max(1);
+/// The EGL display, config and compatibility context shared by one surface.
+/// Kept separate from [`EglSurface`] so a resize only recreates the X pixmap
+/// and EGL surface; glyph textures and bloom buffers stay bound to the context.
+struct EglContext {
+    dpy: egl::EGLDisplay,
+    config: egl::EGLConfig,
+    ctx: egl::EGLContext,
+}
+
+impl EglContext {
+    /// Create a legacy compatibility OpenGL context on the ARGB32 X visual.
+    /// No profile/version attributes are passed, so GLSL v120 and the
+    /// fixed-function matrix stack remain available.
+    fn new(xdpy: *mut xlib::Display, visual: *mut xlib::Visual) -> Result<EglContext> {
+        if xdpy.is_null() || visual.is_null() {
+            return Err("EGL needs an X display and an ARGB32 visual".into());
+        }
         unsafe {
-            // The terminator is `None`, i.e. 0, as in dwm's attrs[].
-            let attrs: [i32; 15] = [
-                glx::GLX_X_RENDERABLE,
-                xlib::True,
-                glx::GLX_DRAWABLE_TYPE,
-                glx::GLX_PBUFFER_BIT,
-                glx::GLX_RENDER_TYPE,
-                glx::GLX_RGBA_BIT,
-                glx::GLX_RED_SIZE,
+            let visual_id = (*visual).visualid as egl::EGLint;
+            let dpy = egl::platform_display(xdpy.cast());
+            if dpy.is_null() {
+                return Err("cannot open the EGL X11 display".into());
+            }
+            if egl::initialize(dpy) == 0 {
+                let err = egl::error("eglInitialize");
+                egl::terminate(dpy);
+                return Err(format!("cannot initialize EGL: {err}").into());
+            }
+            if egl::bind_api(egl::OPENGL_API) == 0 {
+                let err = egl::error("eglBindAPI");
+                egl::terminate(dpy);
+                return Err(format!("cannot select the EGL OpenGL API: {err}").into());
+            }
+
+            let attrs: [egl::EGLint; 13] = [
+                egl::SURFACE_TYPE,
+                egl::PIXMAP_BIT,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_BIT,
+                egl::RED_SIZE,
                 8,
-                glx::GLX_GREEN_SIZE,
+                egl::GREEN_SIZE,
                 8,
-                glx::GLX_BLUE_SIZE,
+                egl::BLUE_SIZE,
                 8,
-                glx::GLX_ALPHA_SIZE,
+                egl::ALPHA_SIZE,
                 8,
-                0,
+                egl::NONE,
             ];
-            let mut nconfigs = 0;
-            let configs = glx::glXChooseFBConfig(dpy, screen, attrs.as_ptr(), &mut nconfigs);
-            if configs.is_null() || nconfigs == 0 {
-                if !configs.is_null() {
-                    xlib::XFree(configs.cast());
-                }
-                return Err("GLX has no RGBA pbuffer configuration with 8-bit alpha".into());
+            let mut config: egl::EGLConfig = ptr::null_mut();
+            let mut count: egl::EGLint = 0;
+            if egl::choose_config(dpy, attrs.as_ptr(), &mut config, &mut count) == 0
+                || count == 0
+                || config.is_null()
+            {
+                let err = egl::error("eglChooseConfig");
+                egl::terminate(dpy);
+                return Err(format!("EGL has no ARGB32 pixmap config: {err}").into());
             }
-            let fbconfig: GLXFBConfig = *configs;
-            xlib::XFree(configs.cast());
+            // Prefer the exact ARGB32 visual XRender will use. Some drivers do
+            // not report native visual IDs for pixmap configs; in that case the
+            // RGBA8888 config above is still the right pixel layout.
+            let mut matched = config;
+            let mut nmatched: egl::EGLint = 0;
+            let with_visual: [egl::EGLint; 15] = [
+                egl::SURFACE_TYPE,
+                egl::PIXMAP_BIT,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_BIT,
+                egl::RED_SIZE,
+                8,
+                egl::GREEN_SIZE,
+                8,
+                egl::BLUE_SIZE,
+                8,
+                egl::ALPHA_SIZE,
+                8,
+                egl::NATIVE_VISUAL_ID,
+                visual_id,
+                egl::NONE,
+            ];
+            if egl::choose_config(dpy, with_visual.as_ptr(), &mut matched, &mut nmatched) != 0
+                && nmatched > 0
+                && !matched.is_null()
+            {
+                config = matched;
+            }
 
-            // GLX_RGBA_TYPE, not glXCreateContextAttribsARB: GLSL v120 and the
-            // fixed-function quads used by the bloom pipeline need compatibility GL.
-            let ctx = glx::glXCreateNewContext(
-                dpy,
-                fbconfig,
-                glx::GLX_RGBA_TYPE,
-                ptr::null_mut(),
-                xlib::True,
-            );
+            let ctx = egl::create_context(dpy, config);
             if ctx.is_null() {
-                return Err("cannot create GLX context".into());
+                let err = egl::error("eglCreateContext");
+                egl::terminate(dpy);
+                return Err(format!("cannot create EGL compatibility context: {err}").into());
             }
-
-            let pbuffer = match create_pbuffer(dpy, fbconfig, width, height) {
-                Ok(p) => p,
-                Err(e) => {
-                    glx::glXDestroyContext(dpy, ctx);
-                    return Err(e);
-                }
-            };
-
-            if glx::glXMakeCurrent(dpy, pbuffer, ctx) == 0 {
-                glx::glXDestroyPbuffer(dpy, pbuffer);
-                glx::glXDestroyContext(dpy, ctx);
-                return Err("cannot bind GLX pbuffer".into());
-            }
-            if let Err(e) = load_gl() {
-                glx::glXMakeCurrent(dpy, 0, ptr::null_mut());
-                glx::glXDestroyPbuffer(dpy, pbuffer);
-                glx::glXDestroyContext(dpy, ctx);
-                return Err(e);
-            }
-
-            Ok(GlPbuffer {
-                dpy,
-                fbconfig,
-                ctx,
-                pbuffer,
-                width,
-                height,
-            })
+            Ok(EglContext { dpy, config, ctx })
         }
     }
 
-    /// The bound pbuffer, for `glXMakeCurrent` after another drawable takes the
-    /// context. Zero when the context has already been released.
-    pub fn drawable(&self) -> u64 {
-        self.pbuffer
-    }
-
-    /// Current pbuffer dimensions.
-    pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// dwm.c 7610-7629: recreate the pbuffer when the requested size changes.
-    /// The context itself survives, so shader and texture state stay intact.
-    pub fn resize(&mut self, width: u32, height: u32) -> Result {
-        let width = width.max(1);
-        let height = height.max(1);
-        if (width, height) == (self.width, self.height) {
-            return Ok(());
-        }
-        unsafe {
-            glx::glXMakeCurrent(self.dpy, 0, ptr::null_mut());
-            glx::glXDestroyPbuffer(self.dpy, self.pbuffer);
-            self.pbuffer = 0;
-            self.width = 0;
-            self.height = 0;
-
-            let pbuffer = create_pbuffer(self.dpy, self.fbconfig, width, height)?;
-            if glx::glXMakeCurrent(self.dpy, pbuffer, self.ctx) == 0 {
-                glx::glXDestroyPbuffer(self.dpy, pbuffer);
-                return Err("cannot bind resized GLX pbuffer".into());
-            }
-            self.pbuffer = pbuffer;
-            self.width = width;
-            self.height = height;
-        }
-        Ok(())
-    }
-
-    /// Rebind this context after another drawable was made current.
-    pub fn make_current(&self) -> Result {
-        unsafe {
-            if glx::glXMakeCurrent(self.dpy, self.pbuffer, self.ctx) == 0 {
-                return Err("cannot bind GLX pbuffer".into());
-            }
+    fn make_current(&self, surface: egl::EGLSurface) -> Result {
+        if egl::make_current(self.dpy, surface, self.ctx) == 0 {
+            return Err(format!(
+                "cannot bind EGL pixmap surface: {}",
+                egl::error("eglMakeCurrent")
+            )
+            .into());
         }
         Ok(())
     }
 }
 
-/// dwm.c 7616-7626: build the `GLX_PBUFFER_WIDTH`/`HEIGHT` attribute list and
-/// create the offscreen drawable.
-unsafe fn create_pbuffer(
-    dpy: *mut xlib::Display,
-    fbconfig: GLXFBConfig,
-    w: u32,
-    h: u32,
-) -> Result<u64> {
-    let attrs: [i32; 5] = [
-        glx::GLX_PBUFFER_WIDTH,
-        w as i32,
-        glx::GLX_PBUFFER_HEIGHT,
-        h as i32,
-        0,
-    ];
-    unsafe {
-        let pbuffer = glx::glXCreatePbuffer(dpy, fbconfig, attrs.as_ptr());
-        if pbuffer == 0 {
-            return Err("cannot create GLX pbuffer".into());
-        }
-        Ok(pbuffer)
-    }
-}
-
-impl Drop for GlPbuffer {
+impl Drop for EglContext {
     fn drop(&mut self) {
-        // Mesa's software renderer raises BadMatch from X_ShmPutImage when a
-        // resized GLX pbuffer is unbound and destroyed. Finder keeps one
-        // pbuffer for the process lifetime, so leave the context and drawable
-        // for the X server to reclaim when the display connection closes.
+        egl::release_current(self.dpy);
+        egl::destroy_context(self.dpy, self.ctx);
+        egl::terminate(self.dpy);
     }
 }
 
@@ -771,6 +711,7 @@ impl Bloom {
     /// (the caller then draws the source unblurred), matching dwm 11815-11832.
     pub fn render<F>(
         &mut self,
+        target: GLuint,
         width: u32,
         height: u32,
         blur: GLfloat,
@@ -853,7 +794,7 @@ impl Bloom {
             }
 
             gl::UseProgram(0);
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, target);
             // Offscreen passes deliberately ignore the caller's scissor so the
             // FBO is cleared and blurred across its full extent. Restore it
             // before the final composite so callers can clip bloom output (for
@@ -959,42 +900,264 @@ impl Drop for Bloom {
 }
 
 // ---------------------------------------------------------------------------
-// GL -> ARGB32 XImage presentation (dwm.c 9255-9430, 11392-11428)
+// EGL surface -> ARGB32 X pixmap presentation
 // ---------------------------------------------------------------------------
 
-/// Owns the 32-bit ARGB pixmap/picture that receives the GL framebuffer.
-/// `glReadPixels` is done with `GL_BGRA`, which is byte-for-byte `ARGB32` on
-/// little-endian hosts, then the rows are flipped because GL rows start at the
-/// bottom while XImage rows start at the top. The resulting picture is handed
-/// to `Drw::map_picture`, which composites it onto the ARGB clock/finder
-/// window with XRender (XCopyArea would raise `BadMatch`).
-pub struct GlSurface {
+/// Where GL actually renders before XRender sees the frame. The fast path is
+/// an EGL pixmap surface: GL writes directly into the ARGB32 X pixmap and no
+/// pixels cross the GPU/CPU boundary. Some software EGL drivers accept the
+/// pixmap surface but never publish its contents to the X server, so detect
+/// that once and fall back to an offscreen framebuffer + XImage upload.
+enum Presentation {
+    Pixmap,
+    Readback(ReadbackTarget),
+}
+
+/// Offscreen EGL framebuffer used when direct pixmap rendering is unavailable.
+/// This is the old `glReadPixels`/`XPutImage` path, but it no longer needs GLX.
+struct ReadbackTarget {
+    texture: GLuint,
+    fbo: GLuint,
+    image: *mut xlib::XImage,
+}
+
+impl ReadbackTarget {
+    fn new(
+        dpy: *mut xlib::Display,
+        visual: *mut xlib::Visual,
+        width: u32,
+        height: u32,
+    ) -> Result<ReadbackTarget> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let mut texture = 0;
+        let mut fbo = 0;
+        unsafe {
+            gl::GenTextures(1, &mut texture);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as GLint);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as GLint);
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_WRAP_S,
+                gl::CLAMP_TO_EDGE as GLint,
+            );
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_WRAP_T,
+                gl::CLAMP_TO_EDGE as GLint,
+            );
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as GLint,
+                width as GLsizei,
+                height as GLsizei,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                ptr::null(),
+            );
+            if gl::GetError() != gl::NO_ERROR {
+                gl::DeleteTextures(1, &texture);
+                return Err("cannot allocate EGL readback texture".into());
+            }
+
+            gl::GenFramebuffers(1, &mut fbo);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                texture,
+                0,
+            );
+            let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            if status != gl::FRAMEBUFFER_COMPLETE {
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &texture);
+                return Err(format!("EGL readback framebuffer is incomplete: {status:#x}").into());
+            }
+
+            let image = xlib::XCreateImage(
+                dpy,
+                visual,
+                32,
+                xlib::ZPixmap,
+                0,
+                ptr::null_mut(),
+                width,
+                height,
+                32,
+                0,
+            );
+            if image.is_null() {
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &texture);
+                return Err("cannot allocate ARGB32 XImage for EGL readback".into());
+            }
+            // XCreateImage leaves data NULL; calloc matches XDestroyImage's XFree.
+            let bytes = (*image).bytes_per_line as usize * height as usize;
+            let data = libc::calloc(bytes, 1) as *mut c_char;
+            if data.is_null() {
+                xlib::XDestroyImage(image);
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &texture);
+                return Err("cannot allocate ARGB32 XImage data for EGL readback".into());
+            }
+            (*image).data = data;
+            (*image).byte_order = xlib::XImageByteOrder(dpy);
+            (*image).bitmap_unit = xlib::XBitmapUnit(dpy);
+            (*image).bitmap_bit_order = xlib::XBitmapBitOrder(dpy);
+
+            Ok(ReadbackTarget {
+                texture,
+                fbo,
+                image,
+            })
+        }
+    }
+
+    /// Copy the bound framebuffer into the presentation pixmap. GL rows start
+    /// at the bottom and `GL_BGRA` is byte-for-byte ARGB32 on little-endian
+    /// hosts, so only big-endian hosts need a channel swap.
+    fn readback(&mut self, dpy: *mut xlib::Display, pixmap: xlib::Pixmap) -> Result<()> {
+        if self.image.is_null() {
+            return Err("EGL readback surface is not initialized".into());
+        }
+        unsafe {
+            let image = &mut *self.image;
+            let w = image.width as GLsizei;
+            let h = image.height as GLsizei;
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            gl::ReadPixels(
+                0,
+                0,
+                w,
+                h,
+                gl::BGRA,
+                gl::UNSIGNED_BYTE,
+                pixels.as_mut_ptr().cast(),
+            );
+            let err = gl::GetError();
+            if err != gl::NO_ERROR {
+                return Err(format!("EGL GL readback failed: {err:#x}").into());
+            }
+
+            let bpl = image.bytes_per_line as usize;
+            let little_endian = image.byte_order == xlib::LSBFirst;
+            let dst = image.data as *mut u8;
+            for y in 0..h as usize {
+                let src_row = &pixels[(h as usize - 1 - y) * w as usize * 4..];
+                let dst_row = std::slice::from_raw_parts_mut(dst.add(y * bpl), (w * 4) as usize);
+                if little_endian {
+                    dst_row.copy_from_slice(&src_row[..(w * 4) as usize]);
+                } else {
+                    for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+                        d[0] = s[3];
+                        d[1] = s[2];
+                        d[2] = s[1];
+                        d[3] = s[0];
+                    }
+                }
+            }
+
+            let gc = xlib::XCreateGC(dpy, pixmap, 0, ptr::null_mut());
+            if !gc.is_null() {
+                xlib::XPutImage(
+                    dpy,
+                    pixmap,
+                    gc,
+                    image,
+                    0,
+                    0,
+                    0,
+                    0,
+                    image.width as u32,
+                    image.height as u32,
+                );
+                xlib::XFreeGC(dpy, gc);
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires the EGL context to be current; GL objects are context-local.
+    fn destroy(&mut self) {
+        unsafe {
+            if self.fbo != 0 {
+                gl::DeleteFramebuffers(1, &self.fbo);
+            }
+            if self.texture != 0 {
+                gl::DeleteTextures(1, &self.texture);
+            }
+            if !self.image.is_null() {
+                xlib::XDestroyImage(self.image);
+            }
+        }
+        self.texture = 0;
+        self.fbo = 0;
+        self.image = ptr::null_mut();
+    }
+}
+
+/// Owns the EGL context plus the ARGB32 X pixmap that XRender composites. On
+/// drivers that publish EGL pixmap writes to X, GL renders straight into that
+/// pixmap. The fallback renders into [`ReadbackTarget`] and uploads the result
+/// with `XPutImage`, but still uses an EGL context instead of GLX.
+pub struct EglSurface {
     dpy: *mut xlib::Display,
     visual: *mut xlib::Visual,
+    /// Declared after the pixmap/surface but dropped last: glyph textures and
+    /// bloom buffers are deleted while this context is still current.
+    egl: EglContext,
     pixmap: xlib::Pixmap,
     picture: xrender::Picture,
-    image: *mut xlib::XImage,
+    surface: egl::EGLSurface,
+    presentation: Option<Presentation>,
+    direct: bool,
     width: u32,
     height: u32,
 }
 
-impl GlSurface {
+impl EglSurface {
     pub fn new(
         dpy: *mut xlib::Display,
         visual: *mut xlib::Visual,
         width: u32,
         height: u32,
-    ) -> Result<GlSurface> {
-        let mut surface = GlSurface {
+        allow_fallback: bool,
+    ) -> Result<EglSurface> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let egl_ctx = EglContext::new(dpy, visual)?;
+        let mut surface = EglSurface {
             dpy,
             visual,
+            egl: egl_ctx,
             pixmap: 0,
             picture: 0,
-            image: ptr::null_mut(),
+            surface: ptr::null_mut(),
+            presentation: None,
+            direct: true,
             width: 0,
             height: 0,
         };
-        surface.resize(width, height)?;
+        surface.create_pixmap(width, height)?;
+        load_gl()?;
+        surface.direct = surface.probe_direct();
+        if surface.direct {
+            surface.presentation = Some(Presentation::Pixmap);
+        } else if allow_fallback {
+            let target = ReadbackTarget::new(dpy, visual, width, height)?;
+            surface.presentation = Some(Presentation::Readback(target));
+        } else {
+            return Err(
+                "EGL pixmap surface is not visible to XRender and EGL_FALLBACK is disabled".into(),
+            );
+        }
+        surface.make_current()?;
         Ok(surface)
     }
 
@@ -1006,64 +1169,73 @@ impl GlSurface {
         (self.width, self.height)
     }
 
-    /// Overwrites the alpha byte of one readback pixel before it is copied into
-    /// the presentation pixmap. The notification popup uses this to apply
-    /// dwm's vertical opacity ramp directly to its transparent foreground.
-    pub fn set_alpha(&mut self, x: u32, y: u32, alpha: u8) {
-        if x >= self.width || y >= self.height || self.image.is_null() {
-            return;
-        }
-        unsafe {
-            let image = &*self.image;
-            let bpl = image.bytes_per_line as usize;
-            let data = image.data as *mut u8;
-            let offset = y as usize * bpl + x as usize * 4;
-            let alpha_index = if image.byte_order == xlib::LSBFirst {
-                3
-            } else {
-                0
-            };
-            *data.add(offset + alpha_index) = alpha;
+    /// Framebuffer callers must use as their final render target. `0` is the
+    /// EGL pixmap on the zero-copy path; the fallback uses its offscreen FBO.
+    pub fn framebuffer(&self) -> GLuint {
+        match &self.presentation {
+            Some(Presentation::Readback(target)) => target.fbo,
+            _ => 0,
         }
     }
 
+    /// Rebind this context after another GL context was made current.
+    pub fn make_current(&self) -> Result {
+        self.egl.make_current(self.surface)?;
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, self.framebuffer());
+        }
+        Ok(())
+    }
+
+    /// Complete all pending GL work before XRender reads the pixmap. A plain
+    /// `glFlush` is not enough: the X server may composite stale pixmap
+    /// contents while the driver still has commands queued. On the fallback
+    /// path this also performs the `glReadPixels`/`XPutImage` upload.
+    pub fn finish(&mut self) -> Result {
+        unsafe {
+            if let Some(Presentation::Readback(target)) = self.presentation.as_mut() {
+                gl::BindFramebuffer(gl::FRAMEBUFFER, target.fbo);
+            }
+            gl::Finish();
+            let err = gl::GetError();
+            if err != gl::NO_ERROR {
+                return Err(format!("finder GL rendering failed: {err:#x}").into());
+            }
+            if let Some(Presentation::Readback(target)) = self.presentation.as_mut() {
+                target.readback(self.dpy, self.pixmap)?;
+                // Keep the surface bound for the next frame's fixed-function
+                // quads and glyph textures.
+                gl::BindFramebuffer(gl::FRAMEBUFFER, target.fbo);
+            }
+        }
+        Ok(())
+    }
+
+    /// Recreate the drawable when the popup size changes. The EGL context,
+    /// shaders, glyph textures and bloom buffers all survive the resize.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        if self.picture != 0 && (self.width, self.height) == (width, height) {
+        if !self.surface.is_null() && (self.width, self.height) == (width, height) {
             return Ok(());
         }
-        self.destroy();
+        if let Some(Presentation::Readback(target)) = self.presentation.as_mut() {
+            target.destroy();
+        }
+        self.presentation = None;
+        self.destroy_surface();
+        self.create_pixmap(width, height)?;
+        if self.direct {
+            self.presentation = Some(Presentation::Pixmap);
+        } else {
+            let target = ReadbackTarget::new(self.dpy, self.visual, width, height)?;
+            self.presentation = Some(Presentation::Readback(target));
+        }
+        self.make_current()
+    }
+
+    fn create_pixmap(&mut self, width: u32, height: u32) -> Result<()> {
         unsafe {
-            let image = xlib::XCreateImage(
-                self.dpy,
-                self.visual,
-                32,
-                xlib::ZPixmap,
-                0,
-                ptr::null_mut(),
-                width,
-                height,
-                32,
-                0,
-            );
-            if image.is_null() {
-                return Err("cannot allocate ARGB32 XImage for finder GL readback".into());
-            }
-            // XCreateImage does not allocate the pixel buffer when passed a
-            // NULL data pointer; it leaves image->data NULL. dwm assigns an
-            // ecalloc'd buffer here. Use calloc so XDestroyImage's XFree can
-            // release it later without an incompatible allocator.
-            let bytes = (*image).bytes_per_line as usize * height as usize;
-            let data = libc::calloc(bytes, 1) as *mut c_char;
-            if data.is_null() {
-                xlib::XDestroyImage(image);
-                return Err("cannot allocate ARGB32 XImage data for finder GL readback".into());
-            }
-            (*image).data = data;
-            (*image).byte_order = xlib::XImageByteOrder(self.dpy);
-            (*image).bitmap_unit = xlib::XBitmapUnit(self.dpy);
-            (*image).bitmap_bit_order = xlib::XBitmapBitOrder(self.dpy);
             let pixmap = xlib::XCreatePixmap(
                 self.dpy,
                 xlib::XDefaultRootWindow(self.dpy),
@@ -1072,110 +1244,114 @@ impl GlSurface {
                 32,
             );
             if pixmap == 0 {
-                xlib::XDestroyImage(image);
-                return Err("cannot create ARGB32 pixmap for finder GL readback".into());
+                return Err("cannot create ARGB32 pixmap for EGL rendering".into());
             }
             let format = xrender::XRenderFindStandardFormat(self.dpy, xrender::PictStandardARGB32);
             if format.is_null() {
                 xlib::XFreePixmap(self.dpy, pixmap);
-                xlib::XDestroyImage(image);
                 return Err("XRender has no ARGB32 picture format".into());
             }
             let picture = xrender::XRenderCreatePicture(self.dpy, pixmap, format, 0, ptr::null());
             if picture == 0 {
                 xlib::XFreePixmap(self.dpy, pixmap);
-                xlib::XDestroyImage(image);
-                return Err("cannot create XRender picture for finder GL readback".into());
+                return Err("cannot create XRender picture for EGL rendering".into());
             }
-            self.image = image;
+            let surface = egl::create_pixmap_surface(self.egl.dpy, self.egl.config, pixmap);
+            if surface.is_null() {
+                let err = egl::error("eglCreatePixmapSurface");
+                xrender::XRenderFreePicture(self.dpy, picture);
+                xlib::XFreePixmap(self.dpy, pixmap);
+                return Err(format!("cannot create EGL pixmap surface: {err}").into());
+            }
+            if let Err(e) = self.egl.make_current(surface) {
+                egl::destroy_surface(self.egl.dpy, surface);
+                xrender::XRenderFreePicture(self.dpy, picture);
+                xlib::XFreePixmap(self.dpy, pixmap);
+                return Err(e);
+            }
             self.pixmap = pixmap;
             self.picture = picture;
+            self.surface = surface;
             self.width = width;
             self.height = height;
         }
         Ok(())
     }
 
-    /// Reads the currently bound GL drawable into the ARGB32 pixmap. The
-    /// caller must make the pbuffer current first.
-    pub fn readback(&mut self) -> Result<()> {
-        self.readback_with_alpha(|_, _| None)
-    }
-
-    /// Same as [`Self::readback`], but lets the caller replace each pixel's
-    /// alpha before the XImage is committed to the pixmap. dwm applies the
-    /// notification's vertical opacity ramp at this point; applying it after
-    /// `XPutImage` would leave the present pixmap unchanged.
-    pub fn readback_with_alpha<F>(&mut self, mut alpha: F) -> Result<()>
-    where
-        F: FnMut(u32, u32) -> Option<u8>,
-    {
-        if self.image.is_null() {
-            return Err("finder GL surface is not initialized".into());
-        }
+    /// Decide once whether this EGL driver makes pixmap-surface writes visible
+    /// to XRender. Mesa's software rasterizer on Xvfb accepts the surface but
+    /// keeps the pixels private, so a tiny clear/composite/read test is needed.
+    fn probe_direct(&self) -> bool {
         unsafe {
-            let image = &mut *self.image;
-            let w = self.width as GLsizei;
-            let h = self.height as GLsizei;
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            gl::ReadPixels(
-                0,
-                0,
-                w,
-                h,
-                gl::BGRA,
-                gl::UNSIGNED_BYTE,
-                pixels.as_mut_ptr() as *mut c_void,
-            );
-            let err = gl::GetError();
-            if err != gl::NO_ERROR {
-                return Err(format!("finder GL readback failed: {err:#x}").into());
-            }
-            let bpl = image.bytes_per_line as usize;
-            let little_endian = image.byte_order == xlib::LSBFirst;
-            let alpha_index = if little_endian { 3 } else { 0 };
-            let dst = image.data as *mut u8;
-            for y in 0..self.height as usize {
-                let src_row = &pixels[(h as usize - 1 - y) * w as usize * 4..];
-                let dst_row = std::slice::from_raw_parts_mut(dst.add(y * bpl), (w * 4) as usize);
-                if little_endian {
-                    // BGRA in memory is 0xAARRGGBB on little-endian hosts.
-                    dst_row.copy_from_slice(&src_row[..(w * 4) as usize]);
-                } else {
-                    for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
-                        d[0] = s[3];
-                        d[1] = s[2];
-                        d[2] = s[1];
-                        d[3] = s[0];
-                    }
-                }
-                for x in 0..self.width {
-                    if let Some(value) = alpha(x, y as u32) {
-                        dst_row[x as usize * 4 + alpha_index] = value;
-                    }
-                }
-            }
-            let gc = xlib::XCreateGC(self.dpy, self.pixmap, 0, ptr::null_mut());
-            if !gc.is_null() {
-                xlib::XPutImage(
-                    self.dpy,
-                    self.pixmap,
-                    gc,
-                    image,
-                    0,
-                    0,
-                    0,
-                    0,
-                    self.width,
-                    self.height,
-                );
-                xlib::XFreeGC(self.dpy, gc);
-            }
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::Viewport(0, 0, self.width as GLsizei, self.height as GLsizei);
+            gl::ClearColor(1.0, 0.0, 0.0, 0.5);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+            gl::Finish();
+
+            let visible = self.pixmap_has_pixel(0x80ff_0000);
+            gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+            gl::Finish();
+            while gl::GetError() != gl::NO_ERROR {}
+            visible
         }
-        Ok(())
     }
 
-    fn destroy(&mut self) {
+    fn pixmap_has_pixel(&self, expected: u32) -> bool {
+        unsafe {
+            let format = xrender::XRenderFindStandardFormat(self.dpy, xrender::PictStandardARGB32);
+            if format.is_null() {
+                return false;
+            }
+            let out = xlib::XCreatePixmap(
+                self.dpy,
+                xlib::XDefaultRootWindow(self.dpy),
+                self.width,
+                self.height,
+                32,
+            );
+            if out == 0 {
+                return false;
+            }
+            let dst = xrender::XRenderCreatePicture(self.dpy, out, format, 0, ptr::null());
+            if dst == 0 {
+                xlib::XFreePixmap(self.dpy, out);
+                return false;
+            }
+            xrender::XRenderComposite(
+                self.dpy,
+                xrender::PictOpSrc,
+                self.picture,
+                0,
+                dst,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                self.width,
+                self.height,
+            );
+            xlib::XSync(self.dpy, xlib::False);
+            let x = (self.width / 2).min(self.width - 1) as i32;
+            let y = (self.height / 2).min(self.height - 1) as i32;
+            let image =
+                xlib::XGetImage(self.dpy, out, x, y, 1, 1, xlib::XAllPlanes(), xlib::ZPixmap);
+            let found = !image.is_null() && xlib::XGetPixel(image, 0, 0) as u32 == expected;
+            if !image.is_null() {
+                xlib::XDestroyImage(image);
+            }
+            xrender::XRenderFreePicture(self.dpy, dst);
+            xlib::XFreePixmap(self.dpy, out);
+            found
+        }
+    }
+
+    fn destroy_surface(&mut self) {
+        egl::release_current(self.egl.dpy);
+        egl::destroy_surface(self.egl.dpy, self.surface);
         unsafe {
             if self.picture != 0 {
                 xrender::XRenderFreePicture(self.dpy, self.picture);
@@ -1183,21 +1359,21 @@ impl GlSurface {
             if self.pixmap != 0 {
                 xlib::XFreePixmap(self.dpy, self.pixmap);
             }
-            if !self.image.is_null() {
-                xlib::XDestroyImage(self.image);
-            }
         }
-        self.picture = 0;
         self.pixmap = 0;
-        self.image = ptr::null_mut();
+        self.picture = 0;
+        self.surface = ptr::null_mut();
         self.width = 0;
         self.height = 0;
     }
 }
 
-impl Drop for GlSurface {
+impl Drop for EglSurface {
     fn drop(&mut self) {
-        self.destroy();
+        if let Some(Presentation::Readback(target)) = self.presentation.as_mut() {
+            target.destroy();
+        }
+        self.destroy_surface();
     }
 }
 
@@ -1771,64 +1947,171 @@ impl Drop for GlFont {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
-    /// Exercises the real GLX path when a display is available. Headless builds
-    /// skip it: Xvfb is not installed in the development environment, but the
-    /// live `:0` display is used for this one focused check.
-    #[test]
-    fn creates_binds_resizes_and_releases_legacy_pbuffer() {
-        if std::env::var_os("DISPLAY").is_none() {
-            return;
+    // All tests share the global `gl` loader and a single X display.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 32-bit TrueColor visual, i.e. the same kind of ARGB visual the window
+    /// manager picks for the finder and notification windows.
+    unsafe fn argb_visual(dpy: *mut xlib::Display) -> *mut xlib::Visual {
+        unsafe {
+            let screen = xlib::XDefaultScreen(dpy);
+            let mut template: xlib::XVisualInfo = std::mem::zeroed();
+            template.screen = screen;
+            template.depth = 32;
+            template.class = xlib::TrueColor;
+            let mut count = 0;
+            let visuals = xlib::XGetVisualInfo(
+                dpy,
+                xlib::VisualScreenMask | xlib::VisualDepthMask | xlib::VisualClassMask,
+                &mut template,
+                &mut count,
+            );
+            if visuals.is_null() || count == 0 {
+                return ptr::null_mut();
+            }
+            let visual = (*visuals).visual;
+            xlib::XFree(visuals.cast());
+            visual
         }
+    }
+
+    unsafe fn open_surface(width: u32, height: u32) -> Option<(*mut xlib::Display, EglSurface)> {
+        unsafe {
+            let dpy = xlib::XOpenDisplay(ptr::null());
+            if dpy.is_null() {
+                return None;
+            }
+            let visual = argb_visual(dpy);
+            if visual.is_null() {
+                xlib::XCloseDisplay(dpy);
+                return None;
+            }
+            // Tests exercise both paths, so allow the fallback explicitly
+            // regardless of the production EGL_FALLBACK setting.
+            match EglSurface::new(dpy, visual, width, height, true) {
+                Ok(surface) => Some((dpy, surface)),
+                Err(e) => {
+                    eprintln!("skipping EGL test: {e}");
+                    xlib::XCloseDisplay(dpy);
+                    None
+                }
+            }
+        }
+    }
+
+    /// With the fallback disabled, initialization must either use the direct
+    /// pixmap path or fail loudly. It must never silently select the XImage
+    /// readback target.
+    #[test]
+    fn fallback_can_be_disabled() {
+        let _guard = TEST_LOCK.lock().unwrap();
         unsafe {
             let dpy = xlib::XOpenDisplay(ptr::null());
             if dpy.is_null() {
                 return;
             }
-            let screen = xlib::XDefaultScreen(dpy);
-            let mut gl = GlPbuffer::new(dpy, screen, 300, 40)
-                .unwrap_or_else(|e| panic!("GLX pbuffer init failed: {e}"));
+            let visual = argb_visual(dpy);
+            if visual.is_null() {
+                xlib::XCloseDisplay(dpy);
+                return;
+            }
+            match EglSurface::new(dpy, visual, 16, 16, false) {
+                Ok(gl) => assert_eq!(gl.framebuffer(), 0),
+                Err(e) => assert!(
+                    e.to_string().contains("EGL_FALLBACK is disabled"),
+                    "unexpected EGL error: {e}"
+                ),
+            }
+            xlib::XCloseDisplay(dpy);
+        }
+    }
+
+    /// Exercises the real EGL path when a display and an ARGB32 visual exist.
+    #[test]
+    fn creates_binds_and_resizes_egl_surface() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Some((dpy, mut gl)) = open_surface(300, 40) else {
+                return;
+            };
             assert_eq!(gl.size(), (300, 40));
-            assert_ne!(gl.drawable(), 0);
-            assert!(!gl.ctx.is_null());
-            assert_eq!(glx::glXGetCurrentContext(), gl.ctx);
+            assert_ne!(gl.picture(), 0);
+            gl.make_current().expect("rebind EGL surface");
 
-            gl.resize(320, 48).expect("resize pbuffer");
+            gl.resize(320, 48).expect("resize EGL surface");
             assert_eq!(gl.size(), (320, 48));
-            assert_eq!(glx::glXGetCurrentContext(), gl.ctx);
-            gl.make_current().expect("rebind pbuffer");
+            gl.make_current().expect("rebind resized EGL surface");
+            gl.finish().expect("finish GL work");
 
-            // Finder deliberately leaves its single GLX pbuffer alive until
-            // the display closes, because Mesa's software renderer raises
-            // BadMatch when a resized pbuffer is unbound. The test releases it
-            // explicitly after checking that Drop honors that policy.
-            let ctx = gl.ctx;
-            let pbuffer = gl.drawable();
             drop(gl);
-            assert_eq!(glx::glXGetCurrentContext(), ctx);
-            glx::glXMakeCurrent(dpy, 0, ptr::null_mut());
-            glx::glXDestroyPbuffer(dpy, pbuffer);
-            glx::glXDestroyContext(dpy, ctx);
+            xlib::XCloseDisplay(dpy);
+        }
+    }
+
+    /// Core invariant of both presentation paths: after `finish()`, XRender
+    /// composites ARGB32 pixels from the surface picture.
+    #[test]
+    fn egl_surface_is_visible_to_xrender() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Some((dpy, mut gl)) = open_surface(64, 64) else {
+                return;
+            };
+            gl.make_current().expect("EGL surface is current");
+            gl::Viewport(0, 0, 64, 64);
+            gl::ClearColor(1.0, 0.0, 0.0, 0.5);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+            gl.finish().expect("flush GL into the pixmap");
+
+            let format = xrender::XRenderFindStandardFormat(dpy, xrender::PictStandardARGB32);
+            assert!(!format.is_null());
+            let out = xlib::XCreatePixmap(dpy, xlib::XDefaultRootWindow(dpy), 64, 64, 32);
+            let dst = xrender::XRenderCreatePicture(dpy, out, format, 0, ptr::null());
+            xrender::XRenderComposite(
+                dpy,
+                xrender::PictOpSrc,
+                gl.picture(),
+                0,
+                dst,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                64,
+                64,
+            );
+            xlib::XSync(dpy, xlib::False);
+            let image = xlib::XGetImage(dpy, out, 32, 32, 1, 1, xlib::XAllPlanes(), xlib::ZPixmap);
+            assert!(!image.is_null());
+            let pixel = xlib::XGetPixel(image, 0, 0);
+            assert_eq!(
+                pixel & 0xffff_ffff,
+                0x80ff_0000,
+                "EGL surface did not render as ARGB32"
+            );
+            xlib::XDestroyImage(image);
+            xrender::XRenderFreePicture(dpy, dst);
+            xlib::XFreePixmap(dpy, out);
+            drop(gl);
             xlib::XCloseDisplay(dpy);
         }
     }
 
     /// FreeType + HarfBuzz text measurement and glyph texture upload through
-    /// the same legacy pbuffer context used by the finder.
+    /// the same compatibility context used by the finder.
     #[test]
     fn glfont_measures_and_draws_text() {
-        if std::env::var_os("DISPLAY").is_none() {
-            return;
-        }
+        let _guard = TEST_LOCK.lock().unwrap();
         unsafe {
-            let dpy = xlib::XOpenDisplay(ptr::null());
-            if dpy.is_null() {
+            let Some((dpy, gl)) = open_surface(320, 40) else {
                 return;
-            }
-            let screen = xlib::XDefaultScreen(dpy);
-            let gl = GlPbuffer::new(dpy, screen, 320, 40)
-                .unwrap_or_else(|e| panic!("GLX pbuffer init failed: {e}"));
+            };
             let matched = std::process::Command::new("fc-match")
                 .args(["-f", "%{file}", "sans-serif"])
                 .output()
@@ -1840,7 +2123,7 @@ mod tests {
                 index: 0,
                 pixel_size: 12.0,
             }];
-            let mut font =
+            let font =
                 GlFont::new(&specs, 20, 0).unwrap_or_else(|e| panic!("GLFont init failed: {e}"));
             assert!(font.height > 0);
             assert!(font.text_width("Finder") > 0);
@@ -1879,20 +2162,14 @@ mod tests {
     }
 
     /// Compiles the v120 shaders, validates the FBO, runs all five blur passes
-    /// and reads back a visible pixel from the default pbuffer framebuffer.
+    /// and reads back a visible pixel from the default EGL pixmap framebuffer.
     #[test]
     fn bloom_compiles_blurs_and_composites() {
-        if std::env::var_os("DISPLAY").is_none() {
-            return;
-        }
+        let _guard = TEST_LOCK.lock().unwrap();
         unsafe {
-            let dpy = xlib::XOpenDisplay(ptr::null());
-            if dpy.is_null() {
+            let Some((dpy, gl)) = open_surface(300, 40) else {
                 return;
-            }
-            let screen = xlib::XDefaultScreen(dpy);
-            let gl = GlPbuffer::new(dpy, screen, 300, 40)
-                .unwrap_or_else(|e| panic!("GLX pbuffer init failed: {e}"));
+            };
             let mut bloom = Bloom::new().unwrap_or_else(|e| panic!("bloom init failed: {e}"));
             assert!(bloom.ready());
             bloom.ensure_buffers(300, 40).expect("bloom buffers");
@@ -1911,7 +2188,7 @@ mod tests {
 
             let c = compat().expect("fixed-function GL entry points");
             let drew = bloom
-                .render(300, 40, 2.0, 1.0, None, || {
+                .render(gl.framebuffer(), 300, 40, 2.0, 1.0, None, || {
                     gl::Disable(gl::TEXTURE_2D);
                     c.color4f(1.0, 1.0, 1.0, 1.0);
                     c.begin(gl::QUADS);
@@ -1948,7 +2225,7 @@ mod tests {
                 gl::Scissor(0, 0, 100, 40);
             }
             let clipped = bloom
-                .render(300, 40, 2.0, 1.0, None, || {
+                .render(gl.framebuffer(), 300, 40, 2.0, 1.0, None, || {
                     gl::Disable(gl::TEXTURE_2D);
                     c.color4f(1.0, 1.0, 1.0, 1.0);
                     c.begin(gl::QUADS);

@@ -1,6 +1,7 @@
 mod bar;
 mod config;
 mod drw;
+mod egl;
 mod finder;
 mod finder_math;
 mod finder_net;

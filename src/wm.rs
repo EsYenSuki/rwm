@@ -350,6 +350,15 @@ fn wants_floating(
         || has_fixed_size(hints)
 }
 
+/// Whether an automatic property update may change a client's floating mode.
+/// A manual Super+W toggle takes precedence for the rest of the window's
+/// lifetime: GTK4 clients in particular refresh `WM_NORMAL_HINTS` right after
+/// a resize, and re-running the policy on that notification would immediately
+/// undo the user's choice. Without a manual choice, only apply a real change.
+fn should_apply_float_policy(user_choice: Option<bool>, policy: bool, current: bool) -> bool {
+    user_choice.is_none() && policy != current
+}
+
 /// The map state we last told X to put a client in. `pending_unmaps` counts
 /// UnmapNotify events from our own UnmapWindow requests that have not arrived
 /// yet; an UnmapNotify with no such event outstanding came from the client.
@@ -401,6 +410,13 @@ pub struct Client {
     pub mon: usize,
     /// dwm's `isfloating`: a floating window is outside the tiling tree.
     pub floating: bool,
+    /// Set by Super+W. An explicit user choice outranks the automatic
+    /// floating policy, so a later property update cannot undo it.
+    float_override: Option<bool>,
+    /// Monotonic stacking token. Adoption and fullscreen/floating changes take
+    /// a new token, so an overlay opened after a fullscreen request stays on
+    /// top of it while the next fullscreen request covers the overlay again.
+    stack_seq: u64,
     /// Temporarily outside the tiling tree while Super+drag moves it. Its tree
     /// leaf stays in place, so siblings expand until the drop reinserts it.
     dragging: bool,
@@ -598,6 +614,8 @@ pub struct Wm {
     pub monitors: Vec<Monitor>,
     /// Newest first, like dwm's client list. Its order is the focus and move order.
     pub clients: Vec<Client>,
+    /// Last stacking token handed out by `next_stack_seq`.
+    stack_seq: u64,
     /// Iconified clients in the order they were unmapped. `Deiconify` pops the
     /// newest, so any number of windows can be hidden and restored one by one.
     iconified_stack: Vec<Window>,
@@ -1072,6 +1090,7 @@ impl Wm {
             root,
             monitors,
             clients: Vec::new(),
+            stack_seq: 0,
             iconified_stack: Vec::new(),
             client_maps: RefCell::new(HashMap::new()),
             selmon: 0,
@@ -1605,23 +1624,32 @@ impl Wm {
             .collect()
     }
 
-    /// First visible fullscreen client on `mi`, if any. `apply_layout()` picks
-    /// the per-monitor owner with the same rule, so callers that need to mirror
-    /// its map decision (e.g. Alt+Tab) use this helper.
-    fn fullscreen_owner(&self, mi: usize) -> Option<(usize, Window)> {
+    /// Hand out the next stacking token. Called when a client is adopted or
+    /// changes floating/fullscreen state, so the token records when it last
+    /// asked to be on top rather than just when it was created.
+    fn next_stack_seq(&mut self) -> u64 {
+        self.stack_seq = self.stack_seq.wrapping_add(1);
+        self.stack_seq
+    }
+
+    /// All visible fullscreen clients on `mi`, newest first: `clients` is
+    /// newest-first because adoption inserts at index 0. `apply_layout()` keeps
+    /// every one of them mapped and covers the monitor with each, so a new
+    /// fullscreen window sits above an older one instead of unmapping it.
+    fn fullscreen_windows(&self, mi: usize) -> Vec<(usize, Window)> {
         self.clients
             .iter()
             .enumerate()
-            .find(|(_, c)| c.fullscreen && c.mon == mi && self.is_visible(c))
+            .filter(|(_, c)| c.fullscreen && c.mon == mi && self.is_visible(c))
             .map(|(idx, c)| (idx, c.win))
+            .collect()
     }
 
-    /// Whether `win` may be mapped while `fs_owner` owns its monitor. The
-    /// fullscreen client itself and floating windows (dialogs spawned after
-    /// fullscreen, overlays brought up with Alt+Tab) are allowed; tiled windows
-    /// stay hidden behind the fullscreen client.
-    fn map_allowed(win: Window, floating: bool, fs_owner: Option<Window>) -> bool {
-        fs_owner.is_none_or(|owner| owner == win || floating)
+    /// Whether `win` may be mapped while `fs_owner` owns its monitor. Every
+    /// fullscreen client stays mapped (they form a stack, newest on top), as
+    /// do floating overlays; tiled windows stay hidden behind the stack.
+    fn map_allowed(win: Window, floating: bool, fullscreen: bool, fs_owner: Option<Window>) -> bool {
+        fs_owner.is_none_or(|owner| owner == win || fullscreen || floating)
     }
 
     fn is_managed(&self, win: Window) -> bool {
@@ -3179,6 +3207,39 @@ impl Wm {
         }
     }
 
+    /// Whether an EnterNotify on `win` should leave the current selection
+    /// alone. Tiled clients behind a fullscreen stack are unmapped, so the
+    /// pointer can only ever cross the fullscreen window on top. Letting that
+    /// crossing reset the selection would undo an explicit focus (Alt+Tab or
+    /// the just-mapped client we are about to fullscreen). A mapped floating
+    /// overlay is above the stack, though, so moving onto the fullscreen
+    /// client from one should still select it.
+    fn keep_selection_entering_fullscreen(&self, win: Window, mon: usize) -> bool {
+        if self.selmon != mon
+            || !self
+                .clients
+                .iter()
+                .any(|c| c.win == win && c.fullscreen && c.mon == mon)
+        {
+            return false;
+        }
+        let Some(sel) = self.monitors[mon].sel else {
+            return false;
+        };
+        let Some(sel_client) = self.clients.iter().find(|c| c.win == sel) else {
+            return false;
+        };
+        if sel_client.mon != mon || !self.is_visible(sel_client) {
+            return false;
+        }
+        let mapped = self
+            .client_maps
+            .borrow()
+            .get(&sel)
+            .is_some_and(|state| state.mapped);
+        sel_client.fullscreen || !mapped
+    }
+
     /// Selects the monitor currently under the pointer, as requested for
     /// workspace-changing keybinds in multi-monitor setups.
     fn sync_selmon_to_pointer(&mut self) -> Result {
@@ -3628,22 +3689,25 @@ impl Wm {
 
     fn apply_layout(&mut self) -> Result {
         let mut boxes: Vec<(Window, Rect, bool)> = Vec::new();
-        // A fullscreen client covers its own monitor, not the whole screen
-        // array. Pick the topmost visible fullscreen client per monitor so
-        // monitor 1 and monitor 2 can both be fullscreen at the same time.
-        let fullscreen: Vec<Option<(usize, Window)>> = (0..self.monitors.len())
-            .map(|mi| self.fullscreen_owner(mi))
+        // Every visible fullscreen client covers its own monitor. They form a
+        // per-monitor stack, not a single owner: a second fullscreen request
+        // must not unmap the older one. Monitors are independent, so monitor 1
+        // and monitor 2 can each have their own fullscreen stack.
+        let fullscreen: Vec<Vec<(usize, Window)>> = (0..self.monitors.len())
+            .map(|mi| self.fullscreen_windows(mi))
             .collect();
-        let fs_on = |mi: usize| fullscreen.get(mi).copied().flatten();
+        let fs_on = |mi: usize| fullscreen.get(mi).is_some_and(|v| !v.is_empty());
 
         for mi in 0..self.monitors.len() {
             self.resize_bar_win(mi)?;
-            if let Some((fidx, fwin)) = fs_on(mi) {
+            if fs_on(mi) {
                 let mrect = self.monitors[mi].rect;
                 let frect = Rect { x: mrect.x, y: mrect.y, w: mrect.w, h: mrect.h };
-                let (rect, changed) = self.place_client(&self.clients[fidx], frect)?;
-                self.clients[fidx].geom = rect;
-                boxes.push((fwin, rect, changed));
+                for &(fidx, fwin) in &fullscreen[mi] {
+                    let (rect, changed) = self.place_client(&self.clients[fidx], frect)?;
+                    self.clients[fidx].geom = rect;
+                    boxes.push((fwin, rect, changed));
+                }
                 continue;
             }
             for (win, r) in self.layout_mon(mi) {
@@ -3657,8 +3721,8 @@ impl Wm {
         }
 
         // Oldest first, so the newest floating window ends up on top. Floating
-        // windows are placed on fullscreen monitors too, so a dialog spawned
-        // over a fullscreen client still gets configured and stacked above it.
+        // windows are placed on fullscreen monitors too: an overlay opened
+        // after the last fullscreen request must stay above it.
         let floating: Vec<(usize, Rect)> = self
             .clients
             .iter()
@@ -3670,10 +3734,6 @@ impl Wm {
         for (idx, geom) in floating {
             let (rect, changed) = self.place_client(&self.clients[idx], geom)?;
             self.clients[idx].geom = rect;
-            self.conn.configure_window(
-                self.clients[idx].win,
-                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-            )?;
             boxes.push((self.clients[idx].win, rect, changed));
         }
         // A tiled client being moved is visible, but its leaf is hidden from
@@ -3682,19 +3742,22 @@ impl Wm {
         for c in self
             .clients
             .iter()
-            .filter(|c| c.dragging && self.is_visible(c) && fs_on(c.mon).is_none())
+            .filter(|c| c.dragging && self.is_visible(c) && !fs_on(c.mon))
         {
             boxes.push((c.win, c.geom, false));
         }
 
-        // On a fullscreen monitor only its owner and floating windows are
-        // mapped; tiled windows stay hidden behind it. `view()` changes the tag
-        // set before `arrange()` runs, so windows from the tag we just switched
-        // away from are no longer "visible" here and must not be left mapped on
-        // top of the fullscreen window.
+        // On a fullscreen monitor every fullscreen client and every floating
+        // window is mapped; tiled windows stay hidden behind the stack.
+        // `view()` changes the tag set before `arrange()` runs, so windows from
+        // the tag we just switched away from are no longer "visible" here and
+        // must not be left mapped on top of the fullscreen stack.
         for c in &self.clients {
+            let owner = fullscreen
+                .get(c.mon)
+                .and_then(|stack| stack.first().map(|(_, w)| *w));
             let shown = self.is_visible(c)
-                && Self::map_allowed(c.win, c.floating, fs_on(c.mon).map(|(_, w)| w));
+                && Self::map_allowed(c.win, c.floating, c.fullscreen, owner);
             if shown {
                 self.wm_map(c.win)?;
             } else {
@@ -3717,6 +3780,32 @@ impl Wm {
                         self.geom_cache.borrow_mut().remove(&zone);
                     }
                 }
+            }
+        }
+        // Restack overlay clients in the order they last asked to be on top:
+        // adoption, Super+W or a fullscreen request all take a new token. A
+        // dialog opened while a window is fullscreen sits above it; the next
+        // fullscreen request covers the dialog again. Older fullscreen clients
+        // stay mapped underneath at monitor size, so no client is unmapped just
+        // because another one went fullscreen.
+        let mut raised: Vec<(u64, Window)> = self
+            .clients
+            .iter()
+            .filter(|c| (c.floating || c.fullscreen) && self.is_visible(c))
+            .map(|c| (c.stack_seq, c.win))
+            .collect();
+        raised.sort_unstable_by_key(|(seq, _)| *seq);
+        for (_, win) in raised {
+            self.conn.configure_window(
+                win,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        // The pass above puts floating clients above their own resize zones,
+        // so put the zones back directly over them.
+        for c in self.clients.iter().filter(|c| c.floating && self.is_visible(c)) {
+            if let Some((_, r, _)) = boxes.iter().find(|(w, _, _)| *w == c.win) {
+                self.place_edge_zones(c.edge_wins, c.win, *r, true)?;
             }
         }
         // Floating windows, drag zones and mapped clients are all raised into
@@ -3912,6 +4001,7 @@ impl Wm {
             geom = floating_geometry(&hints, self.work(mi), parent, BORDERPX);
         }
 
+        let stack_seq = self.next_stack_seq();
         let mut edge_wins = [NONE; 8];
         for (i, slot) in edge_wins.iter_mut().enumerate() {
             let zone = self.conn.generate_id()?;
@@ -3939,6 +4029,8 @@ impl Wm {
                 tags,
                 mon: mi,
                 floating: should_float || is_dock_or_desktop,
+                float_override: None,
+                stack_seq,
                 dragging: false,
                 geom,
                 auto_place: true,
@@ -5600,6 +5692,9 @@ impl Wm {
                     .find(|c| c.win == e.event && self.is_visible(c))
                     .map(|c| (c.win, c.mon));
                 if let Some((win, mon)) = found {
+                    if self.keep_selection_entering_fullscreen(win, mon) {
+                        return Ok(());
+                    }
                     let selection_changed =
                         self.selmon != mon || self.monitors[mon].sel != Some(win);
                     self.selmon = mon;
@@ -5769,7 +5864,7 @@ impl Wm {
             Event::PropertyNotify(e) if e.atom == u32::from(AtomEnum::WM_NORMAL_HINTS) => {
                 if let Some(idx) = self.clients.iter().position(|c| c.win == e.window) {
                     let hints = self.read_size_hints(e.window).unwrap_or_default();
-                    let (mon, transient, win_type, is_modal, auto_place, fullscreen) = {
+                    let (mon, transient, win_type, is_modal, auto_place, fullscreen, old_hints) = {
                         let c = &self.clients[idx];
                         (
                             c.mon,
@@ -5778,18 +5873,20 @@ impl Wm {
                             c.is_modal,
                             c.auto_place,
                             c.fullscreen,
+                            c.hints,
                         )
                     };
+                    let old_float = wants_floating(win_type, transient, is_modal, &old_hints);
+                    let new_float = wants_floating(win_type, transient, is_modal, &hints);
                     self.clients[idx].hints = hints;
                     // A client may publish its fixed size only after mapping;
-                    // move it out of (or back into) the tiling tree then.
-                    let changed = if fullscreen {
+                    // move it out of (or back into) the tiling tree then. A
+                    // hint refresh that leaves the policy unchanged must not
+                    // re-evaluate it at all (that used to undo Super+W).
+                    let changed = if fullscreen || old_float == new_float {
                         false
                     } else {
-                        self.set_client_floating(
-                            idx,
-                            wants_floating(win_type, transient, is_modal, &hints),
-                        )
+                        self.set_client_floating(idx, new_float)
                     };
                     // Toolkits often publish size hints after mapping. Resize
                     // and re-center a still auto-placed floating window around
@@ -6642,11 +6739,16 @@ impl Wm {
     /// example when a client publishes `_NET_WM_WINDOW_TYPE` or fixed size
     /// hints only after mapping. Returns true if its state changed.
     fn set_client_floating(&mut self, idx: usize, float: bool) -> bool {
-        if self.clients[idx].floating == float {
+        if !should_apply_float_policy(
+            self.clients[idx].float_override,
+            float,
+            self.clients[idx].floating,
+        ) {
             return false;
         }
         let win = self.clients[idx].win;
         let mi = self.clients[idx].mon;
+        let stack_seq = self.next_stack_seq();
         if float {
             let geom = if self.clients[idx].auto_place {
                 let hints = self.clients[idx].hints;
@@ -6657,8 +6759,10 @@ impl Wm {
             };
             self.clients[idx].floating = true;
             self.clients[idx].geom = geom;
+            self.clients[idx].stack_seq = stack_seq;
         } else {
             self.clients[idx].floating = false;
+            self.clients[idx].stack_seq = stack_seq;
             // Windows that were floating from the start never had a tile.
             // Put one back so the layout has a box to draw them in.
             if !self.monitors[mi]
@@ -6679,16 +6783,24 @@ impl Wm {
         let Some(sel) = self.monitors[mi].sel else {
             return Ok(());
         };
-        let Some(c) = self.clients.iter().find(|c| c.win == sel) else {
+        let Some((fullscreen, floating, geom)) = self
+            .clients
+            .iter()
+            .find(|c| c.win == sel)
+            .map(|c| (c.fullscreen, c.floating, c.geom))
+        else {
             return Ok(());
         };
-        if c.fullscreen {
+        if fullscreen {
             return Ok(()); // don't toggle floating while fullscreen
         }
-        if c.floating {
-            let point = Self::window_center(c.geom);
+        let stack_seq = self.next_stack_seq();
+        if floating {
+            let point = Self::window_center(geom);
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
                 c.floating = false;
+                c.float_override = Some(false);
+                c.stack_seq = stack_seq;
             }
             // Insert where the window is currently floating, using the same
             // split-and-insert as dropping a window in tile mode. Its old leaf
@@ -6700,6 +6812,8 @@ impl Wm {
             };
             if let Some(c) = self.clients.iter_mut().find(|c| c.win == sel) {
                 c.floating = true;
+                c.float_override = Some(true);
+                c.stack_seq = stack_seq;
                 c.geom = rect;
                 // The user chose this geometry; property updates must not
                 // recenter it behind their back.
@@ -6751,11 +6865,15 @@ impl Wm {
             return Ok(());
         };
         let mi = self.clients[idx].mon;
+        // A fullscreen request is an explicit "on top" request, even if the
+        // window was created earlier and dialogs have opened over it since.
+        let stack_seq = self.next_stack_seq();
         if self.clients[idx].fullscreen {
             // exit fullscreen: restore
             let saved_geom = self.clients[idx].saved_geom.take();
             let saved_floating = self.clients[idx].saved_floating;
             self.clients[idx].fullscreen = false;
+            self.clients[idx].stack_seq = stack_seq;
             self.clients[idx].floating = saved_floating;
             if let Some(g) = saved_geom {
                 self.clients[idx].geom = g;
@@ -6776,6 +6894,7 @@ impl Wm {
             self.clients[idx].saved_geom = Some(cur_geom);
             self.clients[idx].saved_floating = was_floating;
             self.clients[idx].fullscreen = true;
+            self.clients[idx].stack_seq = stack_seq;
             // Do NOT force floating; keep layout state. Just make it cover monitor.
             let mrect = self.monitors[mi].rect;
             self.clients[idx].geom = Rect {
@@ -6895,15 +7014,14 @@ impl Wm {
         let Some(sel) = self.monitors[mi].sel else {
             return Ok(());
         };
-        let fs_owner = self.fullscreen_owner(mi).map(|(_, win)| win);
-        // Tiled windows are unmapped behind a fullscreen client, so Alt+Tab
-        // only offers the fullscreen window and floating overlays there.
-        let order: Vec<Window> = if fs_owner.is_some() {
+        let has_fullscreen = !self.fullscreen_windows(mi).is_empty();
+        // Tiled windows are unmapped behind the fullscreen stack, so Alt+Tab
+        // cycles through every fullscreen window (newest first) and floating
+        // overlays. Older fullscreen clients stay mapped underneath.
+        let order: Vec<Window> = if has_fullscreen {
             self.clients
                 .iter()
-                .filter(|c| {
-                    c.mon == mi && self.is_visible(c) && (Some(c.win) == fs_owner || c.floating)
-                })
+                .filter(|c| c.mon == mi && self.is_visible(c) && (c.fullscreen || c.floating))
                 .map(|c| c.win)
                 .collect()
         } else {
@@ -6922,10 +7040,10 @@ impl Wm {
         };
         let c = order[next];
         self.monitors[mi].sel = Some(c);
-        if fs_owner.is_some() {
-            // Re-run the fullscreen map/stack gate so a floating window picked
-            // with Alt+Tab gets raised above the fullscreen client. Tiled
-            // windows are never in `order` here and stay unmapped.
+        if has_fullscreen {
+            // Re-run the fullscreen map/stack gate so an overlay picked with
+            // Alt+Tab gets raised. Tiled windows are never in `order` here and
+            // stay unmapped behind the fullscreen stack.
             self.apply_layout()?;
         }
         self.focus()?;
@@ -7322,14 +7440,16 @@ mod tests {
     }
 
     #[test]
-    fn map_allowed_respects_fullscreen_owner_and_floating() {
+    fn map_allowed_keeps_every_fullscreen_window_and_floating_overlays() {
         // No fullscreen client: every visible window may map.
-        assert!(Wm::map_allowed(1, false, None));
-        assert!(Wm::map_allowed(2, true, None));
-        // With a fullscreen owner, only it and floating windows may map.
-        assert!(Wm::map_allowed(1, false, Some(1)));
-        assert!(!Wm::map_allowed(2, false, Some(1)));
-        assert!(Wm::map_allowed(2, true, Some(1)));
+        assert!(Wm::map_allowed(1, false, false, None));
+        assert!(Wm::map_allowed(2, true, false, None));
+        // With a fullscreen stack, all fullscreen clients stay mapped (the
+        // newest one is the owner), plus floating overlays. Tiled windows do not.
+        assert!(Wm::map_allowed(1, false, true, Some(1)));
+        assert!(Wm::map_allowed(2, false, true, Some(1)));
+        assert!(Wm::map_allowed(2, true, false, Some(1)));
+        assert!(!Wm::map_allowed(2, false, false, Some(1)));
     }
 
     #[test]
@@ -7432,6 +7552,20 @@ mod tests {
         }));
         // Zero means "unspecified" in ICCCM, not a fixed size.
         assert!(!has_fixed_size(&SizeHints::default()));
+    }
+
+    #[test]
+    fn manual_float_toggle_outranks_automatic_policy_updates() {
+        // No manual choice: an automatic policy change is applied, a no-op is not.
+        assert!(should_apply_float_policy(None, true, false));
+        assert!(should_apply_float_policy(None, false, true));
+        assert!(!should_apply_float_policy(None, true, true));
+        assert!(!should_apply_float_policy(None, false, false));
+
+        // The user pressed Super+W: later WM_NORMAL_HINTS / _NET_WM_STATE
+        // notifications must not flip the window back, in either direction.
+        assert!(!should_apply_float_policy(Some(true), false, true));
+        assert!(!should_apply_float_policy(Some(false), true, false));
     }
 
     #[test]

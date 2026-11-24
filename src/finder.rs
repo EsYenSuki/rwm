@@ -27,13 +27,13 @@ use x11::xlib;
 use x11::xrender;
 
 use crate::bar::{CLOCKPAD, CLRBORDER, scheme_norm, scheme_title};
-use crate::config::{FINDER_APP_DIRS, FINDER_MARKER_WIDTH, FINDER_ROWS, FINDER_WIDTH};
+use crate::config::{
+    EGL_FALLBACK, FINDER_APP_DIRS, FINDER_MARKER_WIDTH, FINDER_ROWS, FINDER_WIDTH,
+};
 use crate::drw::Drw;
 use crate::finder_math;
 use crate::finder_net::{FinderNet, NetResult};
-use crate::gl::{
-    Bloom, BloomTransform, GlFont, GlFontSpec, GlPbuffer, GlSurface, Result as GlResult,
-};
+use crate::gl::{Bloom, BloomTransform, EglSurface, GlFont, GlFontSpec, Result as GlResult};
 use crate::text::FONTS;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -42,12 +42,6 @@ const MAX_APPS: usize = 512;
 const MAX_QUERY: usize = 2048;
 const EDGE: i32 = 15;
 
-/// GLX pbuffers are recreated by Mesa's software renderer with an internal
-/// SHM image whenever their size changes, which raises BadMatch on the second
-/// size. Keep one pbuffer large enough for every popup layout and drive the
-/// current layout with the viewport instead, as the GL surface does.
-const GL_PBUFFER_MAX_WIDTH: u32 = 550;
-const GL_PBUFFER_MAX_HEIGHT: u32 = 2048;
 const ICON_GAP: i32 = 8;
 const ICON_SIZE: i32 = 22;
 /// AnDWM `scheme[SchemeTitle][ColFg]` (#f8f8f2).
@@ -160,8 +154,8 @@ struct FontBundle {
     lcd_order: u8,
 }
 
-// Field order is drop order: textures need a current context, so the font is
-// released before the pbuffer that owns it.
+// Field order is drop order: glyph and bloom textures need a current context,
+// so they are released before the EGL surface that owns it.
 struct GlState {
     font: GlFont,
     query_font: GlFont,
@@ -170,9 +164,8 @@ struct GlState {
     /// estimate before GL text is actually drawn.
     query_char_width: u32,
     result_char_width: u32,
-    surface: GlSurface,
     bloom: Bloom,
-    pbuffer: GlPbuffer,
+    surface: EglSurface,
 }
 
 /// The two-layer offscreen frame used by dwm: an opaque background that
@@ -999,7 +992,7 @@ impl Finder {
         let Some(gl) = self.gl.as_mut() else {
             return true;
         };
-        gl.pbuffer.make_current().ok();
+        gl.surface.make_current().ok();
         let first = self.scroll_visual.max(0.0) as usize;
         let last = (self.scroll_visual + FINDER_ROWS as f64 + 1.0).ceil() as usize;
         for i in first..last.min(self.visible) {
@@ -1054,7 +1047,7 @@ impl Finder {
         let has_textures = self.apps.iter().any(|app| app.icon_tex != 0);
         if has_textures
             && let Some(gl) = self.gl.as_mut()
-            && gl.pbuffer.make_current().is_ok()
+            && gl.surface.make_current().is_ok()
         {
             unsafe {
                 for app in &self.apps {
@@ -1902,7 +1895,7 @@ impl Finder {
                 }
             } else {
                 // The first tick after open can happen before draw() creates
-                // the GL pbuffer. Keep the load pending so the first visible
+                // the GL surface. Keep the load pending so the first visible
                 // frame still gets its icons instead of waiting for a scroll.
                 self.dirty = true;
             }
@@ -2278,9 +2271,8 @@ impl Finder {
     ) -> Result<()> {
         let need_new = self.gl.is_none();
         if need_new {
-            let pbuffer = GlPbuffer::new(dpy, screen, GL_PBUFFER_MAX_WIDTH, GL_PBUFFER_MAX_HEIGHT)?;
+            let surface = EglSurface::new(dpy, visual, w, h, EGL_FALLBACK != 0)?;
             let bloom = Bloom::new()?;
-            let surface = GlSurface::new(dpy, visual, w, h)?;
             let main = Self::font_bundle(dpy, screen, None, 1.0)?;
             let query = Self::font_bundle(dpy, screen, None, 1.15)?;
             let result = Self::font_bundle(dpy, screen, Some(16.0), 1.0)?;
@@ -2295,15 +2287,14 @@ impl Finder {
                 result_font,
                 query_char_width,
                 result_char_width,
-                surface,
                 bloom,
-                pbuffer,
+                surface,
             });
             self.frame_cache_valid = false;
         }
         let gl = self.gl.as_mut().ok_or("finder GL state is unavailable")?;
-        gl.pbuffer.make_current()?;
         gl.surface.resize(w, h)?;
+        gl.surface.make_current()?;
         Ok(())
     }
 
@@ -2650,6 +2641,7 @@ impl Finder {
         };
         if blur > 0.001 && gl.bloom.ready() {
             let _: GlResult<bool> = gl.bloom.render(
+                gl.surface.framebuffer(),
                 w,
                 h,
                 blur * (FILTER_IMAGE_BLUR / FILTER_TEXT_BLUR),
@@ -2666,11 +2658,19 @@ impl Finder {
                     )
                 },
             );
-            let _: GlResult<bool> = gl.bloom.render(w, h, blur, alpha, Some(transform), || {
-                let _ = gl
-                    .font
-                    .draw_text(name, text_x, baseline, text_w, color, 1.0);
-            });
+            let _: GlResult<bool> = gl.bloom.render(
+                gl.surface.framebuffer(),
+                w,
+                h,
+                blur,
+                alpha,
+                Some(transform),
+                || {
+                    let _ = gl
+                        .font
+                        .draw_text(name, text_x, baseline, text_w, color, 1.0);
+                },
+            );
             return;
         }
         unsafe {
@@ -2961,7 +2961,7 @@ impl Finder {
         self.ensure_gl(dpy, screen, visual, w, h)?;
         if self.icons_pending && gl_was_none {
             // On a cold start tick() could not touch an icon because the GL
-            // pbuffer did not exist yet. Load the first one here; later rows are
+            // GL surface did not exist yet. Load the first one here; later rows are
             // loaded one per tick so no single frame waits for every icon.
             let more = self.load_next_icon();
             self.icons_pending = more;
@@ -3009,7 +3009,7 @@ impl Finder {
 
         {
             let gl = self.gl.as_mut().ok_or("finder GL state is unavailable")?;
-            gl.pbuffer.make_current()?;
+            gl.surface.make_current()?;
             unsafe {
                 gl::Viewport(0, 0, w as i32, h as i32);
                 c.matrix_mode(0x1701);
@@ -3102,16 +3102,24 @@ impl Finder {
             if pulse > 0.001 {
                 let top = ((bh as f32 - line_h as f32) / 2.0).max(0.0);
                 let transform = Self::query_bloom_transform(bh as f32, query_pose, query_scale);
-                let _: GlResult<bool> = gl.bloom.render(w, h, 8.0, pulse, Some(transform), || {
-                    Self::quad(
-                        c,
-                        query_x as f32,
-                        top,
-                        query_w as f32,
-                        line_h as f32,
-                        (1.0, 1.0, 1.0, 1.0),
-                    );
-                });
+                let _: GlResult<bool> = gl.bloom.render(
+                    gl.surface.framebuffer(),
+                    w,
+                    h,
+                    8.0,
+                    pulse,
+                    Some(transform),
+                    || {
+                        Self::quad(
+                            c,
+                            query_x as f32,
+                            top,
+                            query_w as f32,
+                            line_h as f32,
+                            (1.0, 1.0, 1.0, 1.0),
+                        );
+                    },
+                );
             }
 
             let query_font = if use_query_font {
@@ -3254,7 +3262,9 @@ impl Finder {
                     gl::Disable(gl::SCISSOR_TEST);
                 }
             }
-            gl.surface.readback()?;
+            // GL rendered straight into the ARGB32 pixmap. Make the pixels
+            // visible to XRender before it composites the picture below.
+            gl.surface.finish()?;
         }
 
         self.view_start = new_view_start;
@@ -3358,7 +3368,7 @@ mod tests {
 
         finder.tick().unwrap();
 
-        // A cold start creates the GL pbuffer in draw(), so tick() must not
+        // A cold start creates the GL surface in draw(), so tick() must not
         // consume the pending icon load before that context is available.
         assert!(finder.icons_pending);
         assert!(finder.dirty);

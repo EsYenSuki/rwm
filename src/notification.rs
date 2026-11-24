@@ -28,8 +28,9 @@ use zbus::zvariant::{
 };
 
 use crate::bar::CLOCKPAD;
+use crate::config::EGL_FALLBACK;
 use crate::drw::Drw;
-use crate::gl::{GlFont, GlFontSpec, GlPbuffer, GlSurface, compat};
+use crate::gl::{EglSurface, GlFont, GlFontSpec, compat};
 use crate::text::FONTS;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -61,9 +62,6 @@ const NOTIFY_HISTORY_MAX_H: i32 = 400;
 const NOTIFY_HISTORY_FPS: Duration = Duration::from_millis(10);
 const HISTORY_SCROLL_TIME: f64 = 0.055;
 const HISTORY_SCROLL_STEP: i32 = 60;
-
-const GL_PBUFFER_MAX_WIDTH: u32 = 550;
-const GL_PBUFFER_MAX_HEIGHT: u32 = 2048;
 
 /// dwm's `notification_history_background_create()` color (dwm.c 9744). Both
 /// the popup and history composite their foreground over this through the same
@@ -656,13 +654,12 @@ fn font_bundle(dpy: *mut xlib::Display, screen: i32, scale: f64) -> Result<FontB
     })
 }
 
-// Field order is drop order: glyph textures need a current context, so both
-// fonts and the readback surface are dropped before the pbuffer that owns it.
+// Field order is drop order: glyph textures need a current context, so the
+// fonts are dropped before the EGL surface that owns it.
 struct GlState {
     font: GlFont,
     time_font: GlFont,
-    surface: GlSurface,
-    pbuffer: GlPbuffer,
+    surface: EglSurface,
 }
 
 struct FrameSurface {
@@ -1116,17 +1113,17 @@ impl NotificationManager {
         if self.gl.is_some() || visual.is_null() || self.dbus.is_none() {
             return Ok(());
         }
-        let pbuffer = GlPbuffer::new(dpy, screen, GL_PBUFFER_MAX_WIDTH, GL_PBUFFER_MAX_HEIGHT)?;
+        // Create the EGL surface first: `GlFont` uploads glyph textures and
+        // needs this compatibility context to be current.
+        let surface = EglSurface::new(dpy, visual, 1, 1, EGL_FALLBACK != 0)?;
         let main = font_bundle(dpy, screen, 1.0)?;
         let time = font_bundle(dpy, screen, NOTIFY_HISTORY_TIME_SCALE)?;
         let font = GlFont::new(&main.specs, main.height, main.lcd_order)?;
         let time_font = GlFont::new(&time.specs, time.height, time.lcd_order)?;
-        let surface = GlSurface::new(dpy, visual, 1, 1)?;
         self.gl = Some(GlState {
             font,
             time_font,
             surface,
-            pbuffer,
         });
         self.frame_valid = false;
         Ok(())
@@ -2370,7 +2367,6 @@ impl NotificationManager {
                 .gl
                 .as_mut()
                 .ok_or("notification GL state is unavailable")?;
-            gl.pbuffer.make_current()?;
             gl.surface.resize(w, surface_h)?;
         }
         let c = compat()?;
@@ -2402,7 +2398,7 @@ impl NotificationManager {
                 .gl
                 .as_mut()
                 .ok_or("notification GL state is unavailable")?;
-            gl.surface.readback()?;
+            gl.surface.finish()?;
             self.frame.composite_history(
                 gl.surface.picture(),
                 self.history_scroll,
@@ -2415,7 +2411,7 @@ impl NotificationManager {
                 .gl
                 .as_mut()
                 .ok_or("notification GL state is unavailable")?;
-            gl.surface.readback()?;
+            gl.surface.finish()?;
             self.frame.composite_popup(gl.surface.picture());
         }
         self.frame_key = key;
