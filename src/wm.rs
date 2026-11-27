@@ -4719,12 +4719,12 @@ impl Wm {
     /// `resizebarwin()` instead of an XTranslateCoordinates round trip.
     fn finder_marker(&self) -> Result {
         for mi in 0..self.monitors.len() {
-            let row = if self.finder.is_active() && mi == self.selmon {
-                self.finder.marker_row()
+            let offset = if self.finder.is_active() && mi == self.selmon {
+                self.finder.marker_px()
             } else {
-                0
+                -1
             };
-            if row <= 0 || !self.monitors[mi].showbar {
+            if offset < 0 || !self.monitors[mi].showbar {
                 self.unmap_finder_marker(mi)?;
                 continue;
             }
@@ -4734,7 +4734,7 @@ impl Wm {
             };
             let m = &self.monitors[mi];
             let mx = x + (w as i32 - crate::config::FINDER_MARKER_WIDTH) / 2;
-            let my = y + row * self.bar_h();
+            let my = y + offset;
             if m.finder_marker_pos.get() != Some((mx, my)) {
                 self.conn.configure_window(
                     m.finder_markerwin,

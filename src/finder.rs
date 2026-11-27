@@ -447,7 +447,9 @@ pub struct Finder {
     /// Placeholder text from the last painted frame. Bar-only redraws (MPRIS
     /// title scrolling, status samples) must not repaint the Finder popup.
     last_clock_text: String,
-    marker_row: i32,
+    /// Pixel offset from the popup top to the selected app row. Negative means
+    /// the marker is hidden, so the WM can place it without row-size assumptions.
+    marker_px: i32,
 }
 
 impl Finder {
@@ -515,7 +517,7 @@ impl Finder {
             gl: None,
             presented: (0, 0, 0, 0, 0),
             last_clock_text: String::new(),
-            marker_row: 0,
+            marker_px: -1,
         }
     }
 
@@ -542,8 +544,18 @@ impl Finder {
         self.frame_content_epoch = self.frame_content_epoch.wrapping_add(1);
     }
 
-    pub fn marker_row(&self) -> i32 {
-        self.marker_row
+    /// Pixel position of the selection marker relative to the popup top.
+    /// Negative means no app row is selected and the marker must be hidden.
+    pub fn marker_px(&self) -> i32 {
+        self.marker_px
+    }
+
+    fn marker_offset(&self, bh: i32, w: u32) -> i32 {
+        if self.selected >= self.visible {
+            return -1;
+        }
+        bh + self.translation_header_px(bh, w)
+            + (self.selected.saturating_sub(self.scroll) as i32) * bh
     }
 
     // -----------------------------------------------------------------------
@@ -1042,6 +1054,7 @@ impl Finder {
         self.initial_background_presented = false;
         self.presented = (0, 0, 0, 0, 0);
         self.last_clock_text.clear();
+        self.marker_px = -1;
         self.frame_cache_valid = false;
         self.cached_caret = None;
         self.dirty = true;
@@ -1081,7 +1094,7 @@ impl Finder {
         self.filter_animating = false;
         self.visible = 0;
         self.ocr_mode = false;
-        self.marker_row = 0;
+        self.marker_px = -1;
         self.frame_cache_valid = false;
         self.cached_caret = None;
         self.dirty = true;
@@ -1174,6 +1187,8 @@ impl Finder {
         self.glow_started = None;
     }
 
+    /// Every non-empty search gets the same debounced translation; the result
+    /// is drawn above the matching apps instead of replacing them.
     fn translation_update(&mut self) {
         self.translation_cancel();
         if !self.active
@@ -1181,7 +1196,6 @@ impl Finder {
             || self.math_help
             || finder_math::is_math_expression(self.query.trim())
             || self.query.is_empty()
-            || (!self.ocr_mode && self.visible != 0)
         {
             return;
         }
@@ -1454,6 +1468,22 @@ impl Finder {
         let _ = max_scroll;
     }
 
+    /// Converts a popup-relative Y into an app-list row, skipping the query
+    /// band and any translation result header above the list.
+    fn app_row_from_pointer(&self, rel_y: i32, bh: i32) -> Option<usize> {
+        let bh = bh.max(1);
+        let header = self.translation_header_px(bh, self.popup_width());
+        let first = bh + header;
+        if rel_y < first {
+            return None;
+        }
+        let row = (rel_y - first).div_euclid(bh);
+        if row as usize >= self.app_rows() {
+            return None;
+        }
+        Some(row as usize)
+    }
+
     pub fn buttonpress(&mut self, detail: u8, y: i32, bh: i32) -> bool {
         if !self.active {
             return false;
@@ -1473,9 +1503,8 @@ impl Finder {
                 self.icons_pending = true;
             }
             1 => {
-                let row = y.div_euclid(bh.max(1));
-                if row > 0 && row < self.display_rows() as i32 {
-                    self.selected = (self.scroll_visual + row as f64 - 1.0).max(0.0) as usize;
+                if let Some(row) = self.app_row_from_pointer(y, bh) {
+                    self.selected = (self.scroll_visual + row as f64).max(0.0) as usize;
                     self.launch();
                 }
             }
@@ -1488,11 +1517,10 @@ impl Finder {
         if !self.active || self.math_result.is_some() || self.math_help {
             return false;
         }
-        let row = (root_y - bar_y).div_euclid(bh.max(1));
-        if row <= 0 || row >= self.display_rows() as i32 {
+        let Some(row) = self.app_row_from_pointer(root_y - bar_y, bh) else {
             return false;
-        }
-        let target = (self.scroll_visual + row as f64 - 1.0).max(0.0) as usize;
+        };
+        let target = (self.scroll_visual + row as f64).max(0.0) as usize;
         if target != self.selected {
             self.selected = target;
             self.dirty = true;
@@ -1975,22 +2003,33 @@ impl Finder {
         if self.math_help {
             return 1 + HELP.len();
         }
-        let rows = self.visible.saturating_sub(self.scroll);
-        let mut app_rows = if self.translate_active {
-            0
-        } else {
-            rows.min(FINDER_ROWS)
-        };
-        if self.translate_active {
-            let width = self.popup_width();
-            app_rows = app_rows
-                .max(self.result_line_count(&self.translate_result, width))
-                .max(self.result_line_count(&self.translate_outgoing, width));
+        // Translation keeps the same tight result rows as translate-only mode,
+        // but it now sits above the app list instead of replacing it.
+        1 + self.translation_rows(self.popup_width()) + self.app_rows()
+    }
+
+    /// Wrapped result lines used by the translation header. During the outgoing
+    /// fade the old and new strings overlap, so they share this row count.
+    fn translation_rows(&self, width: u32) -> usize {
+        if !self.translate_active {
+            return 0;
         }
+        self.result_line_count(&self.translate_result, width)
+            .max(self.result_line_count(&self.translate_outgoing, width))
+    }
+
+    fn translation_header_px(&self, bh: i32, width: u32) -> i32 {
+        self.translation_rows(width) as i32 * self.result_line_height(bh.max(1) as u32) as i32
+    }
+
+    /// App-list rows only: the query row and translation header are excluded.
+    fn app_rows(&self) -> usize {
+        let rows = self.visible.saturating_sub(self.scroll);
+        let mut app_rows = rows.min(FINDER_ROWS);
         if self.filter_animating {
             app_rows = app_rows.max(self.filter_display_rows);
         }
-        1 + app_rows
+        app_rows
     }
 
     fn math_result_text(result: &str) -> String {
@@ -2033,13 +2072,14 @@ impl Finder {
         let w = self.popup_width().max(1);
         let bh = bh.max(1);
         let line_h = self.result_line_height(bh);
-        // Math and translation both draw one settled query row followed by
-        // tight result-font lines, so they must share this height formula.
-        let result_mode = self.translate_active || self.math_result.is_some();
-        let h = if result_mode {
+        // Math keeps its original all-result-row height. Translation uses
+        // result-font rows for its header and bar-height rows for the apps.
+        let h = if self.math_result.is_some() {
             bh + line_h * rows.saturating_sub(1) as u32
         } else {
-            bh * rows as u32
+            let translation_rows = self.translation_rows(w);
+            let app_rows = rows.saturating_sub(1).saturating_sub(translation_rows);
+            bh + line_h * translation_rows as u32 + bh * app_rows as u32
         } + EDGE as u32;
         (w, h)
     }
@@ -2685,6 +2725,8 @@ impl Finder {
         self.translate_pending.hash(&mut hasher);
         self.translate_result.hash(&mut hasher);
         self.translate_outgoing.hash(&mut hasher);
+        // The header height decides how far the app list shifts down.
+        self.translation_rows(w).hash(&mut hasher);
         Self::anim_step(self.translate_started, FILTER_ANIM).hash(&mut hasher);
         Self::anim_step(self.translate_outgoing_started, FILTER_ANIM).hash(&mut hasher);
         self.glow_started.is_some().hash(&mut hasher);
@@ -2816,10 +2858,10 @@ impl Finder {
     }
 
     /// GL scissor rectangle (bottom-left origin) for the app list. The popup
-    /// projection is top-left, so the list must start at `bh` in screen space;
-    /// otherwise scrolling rows paint over the clock/query band on top.
-    fn list_scissor(w: i32, h: i32, bh: i32) -> (i32, i32, i32, i32) {
-        (0, EDGE, w, (h - bh - EDGE).max(0))
+    /// projection is top-left, so the list must start below the query band and
+    /// any translation header; otherwise rows paint over the result on top.
+    fn list_scissor(w: i32, h: i32, bh: i32, header_px: i32) -> (i32, i32, i32, i32) {
+        (0, EDGE, w, (h - bh - header_px - EDGE).max(0))
     }
 
     /// Atomically moves/resizes and presents the cached frame. Shared by the
@@ -2843,11 +2885,7 @@ impl Finder {
         self.presented = (w, h, x, y, bh);
         self.last_clock_text = clock_text.to_string();
         self.dirty = false;
-        self.marker_row = if self.selected < self.visible {
-            (self.selected.saturating_sub(self.scroll) + 1) as i32
-        } else {
-            0
-        };
+        self.marker_px = self.marker_offset(bh, w);
         Ok(())
     }
 
@@ -2938,7 +2976,13 @@ impl Finder {
         let view_start = self.view_start;
         let mut new_view_start = view_start;
         let pulse = self.glow_pulse(now);
-        let result_max_lines = self.display_rows().saturating_sub(1);
+        let translation_rows = self.translation_rows(w);
+        let header_px = translation_rows as i32 * self.result_line_height(bh as u32) as i32;
+        let result_max_lines = if self.translate_active {
+            translation_rows
+        } else {
+            self.display_rows().saturating_sub(1)
+        };
         let placeholder = if query.is_empty() {
             clock_text.to_string()
         } else {
@@ -3127,39 +3171,42 @@ impl Finder {
                         1.0,
                     );
                 }
-            } else if translate_active {
-                if !outgoing.is_empty() {
-                    Self::draw_result(
-                        c,
-                        &mut gl.result_font,
-                        &outgoing,
-                        outgoing_started,
-                        true,
-                        (1.0, 1.0, 1.0),
-                        w,
-                        h,
-                        bh as u32,
-                        result_max_lines,
-                    );
-                }
-                if !translation.is_empty() {
-                    Self::draw_result(
-                        c,
-                        &mut gl.result_font,
-                        &translation,
-                        self.translate_started,
-                        false,
-                        (1.0, 1.0, 1.0),
-                        w,
-                        h,
-                        bh as u32,
-                        result_max_lines,
-                    );
-                }
             } else {
+                // Translation uses the exact same result renderer and position
+                // as translate-only mode; it simply no longer hides the list.
+                if translate_active {
+                    if !outgoing.is_empty() {
+                        Self::draw_result(
+                            c,
+                            &mut gl.result_font,
+                            &outgoing,
+                            outgoing_started,
+                            true,
+                            (1.0, 1.0, 1.0),
+                            w,
+                            h,
+                            bh as u32,
+                            result_max_lines,
+                        );
+                    }
+                    if !translation.is_empty() {
+                        Self::draw_result(
+                            c,
+                            &mut gl.result_font,
+                            &translation,
+                            self.translate_started,
+                            false,
+                            (1.0, 1.0, 1.0),
+                            w,
+                            h,
+                            bh as u32,
+                            result_max_lines,
+                        );
+                    }
+                }
                 unsafe {
                     gl::Enable(gl::SCISSOR_TEST);
-                    let (sx, sy, sw, sh) = Self::list_scissor(w as i32, h as i32, bh);
+                    let (sx, sy, sw, sh) = Self::list_scissor(w as i32, h as i32, bh, header_px);
                     gl::Scissor(sx, sy, sw, sh);
                 }
                 if filter_animating {
@@ -3183,7 +3230,7 @@ impl Finder {
                                 index,
                                 &name,
                                 tex,
-                                bh as f64 + y as f64 * bh as f64,
+                                bh as f64 + header_px as f64 + y as f64 * bh as f64,
                                 alpha,
                                 scale_x,
                                 scale_y,
@@ -3198,7 +3245,9 @@ impl Finder {
                 } else {
                     let first = scroll_visual.max(0.0) as usize;
                     for rank in first..self.visible.min(order.len()) {
-                        let row_y = bh as f64 + (rank as f64 - scroll_visual) * bh as f64;
+                        let row_y = bh as f64
+                            + header_px as f64
+                            + (rank as f64 - scroll_visual) * bh as f64;
                         if row_y >= h as f64 - EDGE as f64 {
                             break;
                         }
@@ -3442,6 +3491,67 @@ mod tests {
         assert!(width <= 550);
         assert!(height > short_height);
         assert!(f.display_rows() > 2);
+    }
+
+    #[test]
+    fn translation_starts_even_when_apps_match() {
+        let mut f = Finder::new();
+        f.active = true;
+        f.query = "fire".to_string();
+        f.visible = 3;
+
+        f.translation_update();
+
+        assert!(f.translate_active);
+        assert!(f.translate_pending);
+        assert!(f.translate_due.is_some());
+    }
+
+    #[test]
+    fn translation_header_and_apps_share_one_popup() {
+        let mut f = Finder::new();
+        f.active = true;
+        f.translate_active = true;
+        f.translate_result = "hello".to_string();
+        f.visible = 3;
+        let bh = 38;
+        let rows = f.translation_rows(f.popup_width());
+        let header = rows as u32 * f.result_line_height(bh);
+
+        assert_eq!(rows, 1);
+        assert_eq!(f.display_rows(), 1 + rows + 3);
+        assert_eq!(f.popup_size(bh).1, bh + header + 3 * bh + EDGE as u32);
+    }
+
+    #[test]
+    fn pointer_rows_skip_the_translation_header() {
+        let mut f = Finder::new();
+        f.active = true;
+        f.translate_active = true;
+        f.translate_result = "hello".to_string();
+        f.visible = 3;
+        let bh = 38;
+        let first = bh as i32 + f.translation_header_px(bh, f.popup_width());
+
+        assert_eq!(f.app_row_from_pointer(first - 1, bh), None);
+        assert_eq!(f.app_row_from_pointer(first, bh), Some(0));
+        assert_eq!(f.app_row_from_pointer(first + bh, bh), Some(1));
+    }
+
+    #[test]
+    fn marker_offset_shifts_past_the_translation_header() {
+        let mut f = Finder::new();
+        f.active = true;
+        f.translate_active = true;
+        f.translate_result = "hello".to_string();
+        f.visible = 3;
+        f.selected = 1;
+        let bh = 38;
+        let header = f.translation_header_px(bh, f.popup_width());
+
+        assert_eq!(f.marker_offset(bh, f.popup_width()), bh + header + bh);
+        f.selected = 3;
+        assert_eq!(f.marker_offset(bh, f.popup_width()), -1);
     }
 
     #[test]
@@ -3779,12 +3889,21 @@ mod tests {
     fn list_scissor_clips_at_clock_row() {
         let bh = 38;
         let h = bh * (1 + FINDER_ROWS) as i32 + EDGE;
-        let (x, y, w, height) = Finder::list_scissor(300, h, bh);
+        let (x, y, w, height) = Finder::list_scissor(300, h, bh, 0);
         assert_eq!((x, y, w), (0, EDGE, 300));
         // GL y is bottom-left; the top edge in screen space must be `bh`, not
         // EDGE, so a scrolling row is masked before it enters the clock band.
         assert_eq!(h - (y + height), bh);
         assert_eq!(y + height, h - bh);
+    }
+
+    #[test]
+    fn list_scissor_clips_below_translation_header() {
+        let bh = 38;
+        let header = 24;
+        let h = bh * (2 + FINDER_ROWS) as i32 + EDGE;
+        let (_, y, _, height) = Finder::list_scissor(300, h, bh, header);
+        assert_eq!(h - (y + height), bh + header);
     }
 
     fn icon_test_root(tag: &str) -> PathBuf {
