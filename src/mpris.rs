@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
+
+use image::imageops::{FilterType, crop_imm, resize};
 
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::OwnedValue;
@@ -167,8 +170,15 @@ fn publish(
 ) -> bool {
     let mut snapshot = read_player(caller);
     if snapshot.art_url != *art_url {
-        art_url.clone_from(&snapshot.art_url);
-        *artwork = load_artwork(art_url).map(Arc::new);
+        if let Some(art) = load_artwork(&snapshot.art_url) {
+            *artwork = Some(Arc::new(art));
+            art_url.clone_from(&snapshot.art_url);
+        } else {
+            // Some players publish the path before the file is written. Keep
+            // the cache key empty so the next signal retries the same URL.
+            *artwork = None;
+            art_url.clear();
+        }
     }
     snapshot.artwork = artwork.clone();
     match sender.try_send(snapshot) {
@@ -352,40 +362,104 @@ fn busctl_dict_number(fields: &[String], key: &str) -> Option<f64> {
     fields.get(index + 2)?.parse().ok()
 }
 
+/// Decode an MPRIS cover into the square RGBA buffer the bar expects. Local
+/// files are read directly; remote URLs are fetched with a bounded curl call.
+/// This deliberately uses the `image` crate instead of an external ffmpeg: a
+/// broken/updated ffmpeg otherwise silently leaves every snapshot without
+/// artwork, and the expanded panel paints only its background.
 fn load_artwork(url: &str) -> Option<Artwork> {
-    let path = if let Some(path) = url.strip_prefix("file://") {
-        decode_file_url(path)?
-    } else if url.starts_with('/') {
-        url.to_string()
+    let source = if let Some(path) = artwork_file(url) {
+        match image::open(&path) {
+            Ok(image) => image.into_rgba8(),
+            Err(err) => {
+                eprintln!("rwm: cannot decode MPRIS artwork {}: {err}", path.display());
+                return None;
+            }
+        }
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        let bytes = fetch_remote_art(url)?;
+        match image::load_from_memory(&bytes) {
+            Ok(image) => image.into_rgba8(),
+            Err(err) => {
+                eprintln!("rwm: cannot decode MPRIS artwork {url}: {err}");
+                return None;
+            }
+        }
     } else {
         return None;
     };
-    let output = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            &path,
-            "-vf",
-            "scale=512:512:force_original_aspect_ratio=increase,crop=512:512",
-            "-frames:v",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .output()
-        .ok()?;
-    let expected = ART_SIZE * ART_SIZE * 4;
-    (output.status.success() && output.stdout.len() == expected).then_some(Artwork {
-        rgba: output.stdout,
+    let art = square_artwork(source)?;
+    eprintln!(
+        "rwm: loaded MPRIS artwork from {url} ({}x{})",
+        art.width, art.height
+    );
+    Some(art)
+}
+
+/// The AnDWM reference scales the source to cover the panel and centre-crops
+/// the excess. The bar does the cover-fit to its own size, so here the source
+/// is centre-cropped to a square and then scaled to the fixed artwork size.
+fn square_artwork(source: image::RgbaImage) -> Option<Artwork> {
+    let (w, h) = source.dimensions();
+    let side = w.min(h);
+    if side == 0 {
+        return None;
+    }
+    let crop = crop_imm(&source, (w - side) / 2, (h - side) / 2, side, side);
+    let square = if side as usize == ART_SIZE {
+        crop.to_image()
+    } else {
+        resize(
+            &crop.to_image(),
+            ART_SIZE as u32,
+            ART_SIZE as u32,
+            FilterType::Lanczos3,
+        )
+    };
+    Some(Artwork {
+        rgba: square.into_raw(),
         width: ART_SIZE,
         height: ART_SIZE,
     })
+}
+
+/// Remote covers are fetched on the MPRIS monitor thread, so keep both the
+/// timeout and the size bound small: a slow or huge URL must not stall the bar.
+fn fetch_remote_art(url: &str) -> Option<Vec<u8>> {
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--location",
+            "--max-time",
+            "3",
+            "--max-filesize",
+            "8388608",
+            url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Local covers: `file://` URLs (including `file://localhost/...`) and plain
+/// absolute paths. Remote `http(s)` URLs are handled by `fetch_remote_art`.
+fn artwork_file(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost/").unwrap_or(rest);
+        let rest = if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        };
+        decode_file_url(&rest).map(PathBuf::from)
+    } else if url.starts_with('/') {
+        Some(PathBuf::from(url))
+    } else {
+        None
+    }
 }
 
 fn decode_file_url(path: &str) -> Option<String> {
@@ -497,6 +571,7 @@ fn run_busctl<const N: usize>(args: [&str; N]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Rgba;
     use std::time::Duration;
 
     #[test]
@@ -526,6 +601,37 @@ mod tests {
     fn decodes_busctl_octal_utf8_escapes() {
         let fields = busctl_tokens(r#"s "\345\210\235\351\237\263\343\203\237\343\202\257""#);
         assert_eq!(fields[1], "初音ミク");
+    }
+
+    #[test]
+    fn loads_local_cover_from_percent_encoded_file_url() {
+        let path = std::env::temp_dir().join(format!("rwm mpris art {}.png", std::process::id()));
+        let color = Rgba([200, 100, 50, 255]);
+        image::RgbaImage::from_pixel(8, 4, color)
+            .save(&path)
+            .expect("write test cover");
+        let url = format!("file://{}", path.display()).replace(' ', "%20");
+
+        let art = load_artwork(&url).expect("decode test cover");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!((art.width, art.height), (ART_SIZE, ART_SIZE));
+        assert_eq!(art.rgba.len(), ART_SIZE * ART_SIZE * 4);
+        for pixel in art.rgba.chunks_exact(4) {
+            assert!(pixel[0].abs_diff(color.0[0]) <= 2);
+            assert!(pixel[1].abs_diff(color.0[1]) <= 2);
+            assert!(pixel[2].abs_diff(color.0[2]) <= 2);
+            assert_eq!(pixel[3], 255);
+        }
+    }
+
+    #[test]
+    fn parses_local_art_urls() {
+        assert_eq!(
+            artwork_file("file://localhost/tmp/cover%20art.png"),
+            Some(PathBuf::from("/tmp/cover art.png"))
+        );
+        assert_eq!(artwork_file("https://example.org/cover.png"), None);
     }
 
     #[test]

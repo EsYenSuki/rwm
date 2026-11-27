@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
 use std::sync::OnceLock;
 
@@ -1383,6 +1383,14 @@ impl Drop for EglSurface {
 
 const GL_FONT_MAX_FACES: usize = 32;
 const GL_FONT_MAX_GLYPHS: usize = 2048;
+const GL_FONT_FALLBACK_FILES: &[&str] = &[
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+];
 
 // Texture environment tokens omitted from `gl` 0.14.
 const GL_TEXTURE_ENV: GLenum = 0x2300;
@@ -1429,6 +1437,202 @@ unsafe extern "C" {
         buffer: *mut c_void,
         count: *mut c_uint,
     ) -> *mut HbGlyphPosition;
+}
+
+type FcCharSet = c_void;
+type FcPattern = c_void;
+type FcBool = c_int;
+type FcResult = c_int;
+
+const FcMatchPattern: c_int = 0;
+const FcResultMatch: c_int = 0;
+
+#[link(name = "fontconfig")]
+unsafe extern "C" {
+    fn FcCharSetCreate() -> *mut FcCharSet;
+    fn FcCharSetDestroy(cs: *mut FcCharSet);
+    fn FcCharSetAddChar(cs: *mut FcCharSet, cp: u32) -> FcBool;
+    fn FcPatternCreate() -> *mut FcPattern;
+    fn FcPatternDestroy(p: *mut FcPattern);
+    fn FcPatternAddInteger(
+        p: *mut FcPattern,
+        object: *const c_char,
+        value: c_int,
+    ) -> FcBool;
+    fn FcPatternAddCharSet(p: *mut FcPattern, object: *const c_char, cs: *const FcCharSet) -> FcBool;
+    fn FcPatternAddBool(p: *mut FcPattern, object: *const c_char, value: FcBool) -> FcBool;
+    fn FcPatternGetString(
+        p: *const FcPattern,
+        object: *const c_char,
+        n: c_int,
+        value: *mut *mut u8,
+    ) -> FcResult;
+    fn FcPatternGetInteger(
+        p: *const FcPattern,
+        object: *const c_char,
+        n: c_int,
+        value: *mut c_int,
+    ) -> FcResult;
+    fn FcPatternGetBool(
+        p: *const FcPattern,
+        object: *const c_char,
+        n: c_int,
+        value: *mut FcBool,
+    ) -> FcBool;
+    fn FcConfigSubstitute(config: *mut c_void, p: *mut FcPattern, kind: c_int) -> FcBool;
+    fn FcDefaultSubstitute(p: *mut FcPattern);
+    fn FcFontMatch(config: *mut c_void, p: *mut FcPattern, result: *mut FcResult) -> *mut FcPattern;
+}
+
+const FC_TRUE: FcBool = 1;
+
+// Fontconfig property values (fontconfig.h).
+const FC_HINT_NONE: c_int = 0;
+const FC_HINT_SLIGHT: c_int = 1;
+const FC_HINT_MEDIUM: c_int = 2;
+const FC_HINT_FULL: c_int = 3;
+const FC_RGBA_UNKNOWN: c_int = 0;
+const FC_RGBA_RGB: c_int = 1;
+const FC_RGBA_BGR: c_int = 2;
+const FC_RGBA_VRGB: c_int = 3;
+const FC_RGBA_VBGR: c_int = 4;
+const FC_RGBA_NONE: c_int = 5;
+const FC_LCD_NONE: c_int = 0;
+const FC_LCD_DEFAULT: c_int = 1;
+const FC_LCD_LIGHT: c_int = 2;
+const FC_LCD_LEGACY: c_int = 3;
+
+// The C header values. freetype-sys 0.20 exposes FT_LCD_FILTER_LIGHT as 3,
+// which is actually FT_LCD_FILTER_LEGACY1, so use the C values explicitly.
+const FT_LCD_LIGHT: freetype_sys::FT_LcdFilter = 2;
+const FT_LCD_LEGACY: freetype_sys::FT_LcdFilter = 16;
+
+unsafe fn fc_bool(pattern: *const FcPattern, object: &str) -> Option<bool> {
+    let object = CString::new(object).ok()?;
+    let mut value: FcBool = 0;
+    (unsafe { FcPatternGetBool(pattern, object.as_ptr(), 0, &mut value) } != 0)
+        .then(|| value != 0)
+}
+
+unsafe fn fc_int(pattern: *const FcPattern, object: &str) -> Option<c_int> {
+    let object = CString::new(object).ok()?;
+    let mut value = 0;
+    (unsafe { FcPatternGetInteger(pattern, object.as_ptr(), 0, &mut value) } == FcResultMatch)
+        .then_some(value)
+}
+
+/// Hinting settings for every GL text face in the finder and notifications.
+///
+/// These come from the Xft pattern Xft resolved for the configured font, so
+/// X11 resources such as `Xft.hinting`, `Xft.hintstyle`, `Xft.rgba` and
+/// `Xft.lcdfilter` are honored the same way as for X11-drawn text. Sizes are
+/// deliberately not read from the pattern: callers keep their own pixel sizes.
+#[derive(Clone, Copy, Debug)]
+pub struct FontHinting {
+    load_flags: freetype_sys::FT_Int32,
+    /// The hintstyle target without any LCD subpixel target, used if FreeType
+    /// cannot support the configured LCD filter.
+    grayscale_target: freetype_sys::FT_Int32,
+    lcd_order: u8,
+    lcd_filter: freetype_sys::FT_LcdFilter,
+}
+
+impl Default for FontHinting {
+    fn default() -> Self {
+        Self {
+            // Matches `Xft.hintstyle: hintslight`, the fallback when Xft has no
+            // hinting information at all.
+            load_flags: freetype_sys::FT_LOAD_DEFAULT | freetype_sys::FT_LOAD_TARGET_LIGHT,
+            grayscale_target: freetype_sys::FT_LOAD_TARGET_LIGHT,
+            lcd_order: 0,
+            lcd_filter: freetype_sys::FT_LCD_FILTER_DEFAULT,
+        }
+    }
+}
+
+impl FontHinting {
+    /// Read the hinting properties from a resolved Xft pattern. Xft merges the
+    /// X resources into the pattern before returning it from `XftFontOpenName`,
+    /// so this is the same configuration the X11 text renderer sees.
+    pub fn from_xft_pattern(
+        dpy: *mut xlib::Display,
+        screen: c_int,
+        pattern: *const c_void,
+    ) -> Self {
+        let mut hinting = Self::default();
+        // XRender's subpixel order is the fallback, as it was before Xft
+        // properties were consulted. Values match fontconfig's FcRGBA_*.
+        if !dpy.is_null() {
+            let order = unsafe { xrender::XRenderQuerySubpixelOrder(dpy, screen) };
+            hinting.lcd_order = match order {
+                1..=4 => order as u8,
+                _ => 0,
+            };
+        }
+        if pattern.is_null() {
+            return hinting;
+        }
+        let pattern = pattern as *const FcPattern;
+        unsafe {
+            let enabled = fc_bool(pattern, "hinting").unwrap_or(true);
+            let style = fc_int(pattern, "hintstyle").unwrap_or(FC_HINT_SLIGHT);
+            hinting.grayscale_target = match style {
+                FC_HINT_MEDIUM | FC_HINT_FULL => freetype_sys::FT_LOAD_TARGET_NORMAL,
+                _ => freetype_sys::FT_LOAD_TARGET_LIGHT,
+            };
+            let target = match fc_int(pattern, "rgba") {
+                Some(FC_RGBA_RGB) => {
+                    hinting.lcd_order = 1;
+                    freetype_sys::FT_LOAD_TARGET_LCD
+                }
+                Some(FC_RGBA_BGR) => {
+                    hinting.lcd_order = 2;
+                    freetype_sys::FT_LOAD_TARGET_LCD
+                }
+                Some(FC_RGBA_VRGB) => {
+                    hinting.lcd_order = 3;
+                    freetype_sys::FT_LOAD_TARGET_LCD_V
+                }
+                Some(FC_RGBA_VBGR) => {
+                    hinting.lcd_order = 4;
+                    freetype_sys::FT_LOAD_TARGET_LCD_V
+                }
+                Some(FC_RGBA_UNKNOWN) | Some(FC_RGBA_NONE) => {
+                    hinting.lcd_order = 0;
+                    hinting.grayscale_target
+                }
+                // No rgba in the pattern: keep XRender's subpixel order and
+                // load hints that match it.
+                None => match hinting.lcd_order {
+                    1 | 2 => freetype_sys::FT_LOAD_TARGET_LCD,
+                    3 | 4 => freetype_sys::FT_LOAD_TARGET_LCD_V,
+                    _ => hinting.grayscale_target,
+                },
+                _ => hinting.grayscale_target,
+            };
+            let mut flags = freetype_sys::FT_LOAD_DEFAULT;
+            if !enabled || style == FC_HINT_NONE {
+                flags |= freetype_sys::FT_LOAD_NO_HINTING;
+            }
+            hinting.load_flags = flags | target;
+            hinting.lcd_filter = match fc_int(pattern, "lcdfilter") {
+                Some(FC_LCD_NONE) => freetype_sys::FT_LCD_FILTER_NONE,
+                Some(FC_LCD_LIGHT) => FT_LCD_LIGHT,
+                Some(FC_LCD_LEGACY) => FT_LCD_LEGACY,
+                _ => freetype_sys::FT_LCD_FILTER_DEFAULT,
+            };
+        }
+        hinting
+    }
+
+    /// Used when FreeType has no LCD filter support: fall back to grayscale
+    /// rasterization with the configured hint style, not to full LCD without a
+    /// filter.
+    fn without_lcd(mut self) -> Self {
+        self.lcd_order = 0;
+        self.load_flags = (self.load_flags & !(0xf << 16)) | self.grayscale_target;
+        self
+    }
 }
 
 static FT_LIB: OnceLock<usize> = OnceLock::new();
@@ -1479,10 +1683,11 @@ pub struct GlFontSpec {
 }
 
 /// One texture per glyph, one FreeType face per file (up to 32), and HarfBuzz
-/// shaping per face run. This mirrors dwm's `GLFont` exactly: no glyph atlas,
-/// `GL_RGBA`/`GL_UNSIGNED_BYTE` upload and `GL_NEAREST` filtering.
+/// shaping per face run. This mirrors dwm's `GLFont` layout, but also loads
+/// fontconfig fallbacks for codepoints missing from the configured faces and
+/// evicts glyph textures when the cache fills.
 pub struct GlFont {
-    faces: Vec<GlFontFace>,
+    faces: RefCell<Vec<GlFontFace>>,
     /// Rasterized glyph cache. Text measuring needs glyph shaping but callers
     /// often only hold a shared reference during layout, so the cache uses
     /// interior mutability instead of forcing `&mut self` on every method.
@@ -1491,24 +1696,34 @@ pub struct GlFont {
     pub height: i32,
     pub pixel_size: f64,
     pub lcd_order: u8,
+    /// Xft-configured flags shared by HarfBuzz shaping and glyph rasterization.
+    load_flags: freetype_sys::FT_Int32,
+    dpy: *mut xlib::Display,
+    screen: i32,
 }
 
 impl GlFont {
     /// dwm.c 8707-8846: load up to 32 Xft-resolved faces at their own pixel
     /// sizes, set a 72 dpi char size so one pixel maps to one font unit, and
-    /// create a HarfBuzz font with light hinting for each one.
-    pub fn new(specs: &[GlFontSpec], height: i32, lcd_order: u8) -> Result<GlFont> {
+    /// create a HarfBuzz font with the hinting Xft was configured to use.
+    pub fn new(
+        specs: &[GlFontSpec],
+        height: i32,
+        hinting: FontHinting,
+        dpy: *mut xlib::Display,
+        screen: i32,
+    ) -> Result<GlFont> {
         let library = ft_library()?;
-        let mut lcd_order = lcd_order;
-        if lcd_order != 0 {
+        let mut hinting = hinting;
+        if hinting.lcd_order != 0 {
             let err = unsafe {
                 freetype_sys::FT_Library_SetLcdFilter(
                     library as freetype_sys::FT_Library,
-                    freetype_sys::FT_LCD_FILTER_DEFAULT,
+                    hinting.lcd_filter,
                 )
             };
             if err != 0 {
-                lcd_order = 0;
+                hinting = hinting.without_lcd();
             }
         }
         let base_size = specs
@@ -1528,17 +1743,15 @@ impl GlFont {
             }) {
                 continue;
             }
-            if let Ok(face) = Self::add_face(library, &spec.file, spec.index, pixel_size) {
+            if let Ok(face) =
+                Self::add_face(library, &spec.file, spec.index, pixel_size, hinting.load_flags)
+            {
                 faces.push(face);
             }
         }
         if faces.is_empty() {
-            for file in [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-            ] {
-                if let Ok(face) = Self::add_face(library, file, 0, base_size) {
+            for file in GL_FONT_FALLBACK_FILES {
+                if let Ok(face) = Self::add_face(library, file, 0, base_size, hinting.load_flags) {
                     faces.push(face);
                     break;
                 }
@@ -1560,16 +1773,25 @@ impl GlFont {
             }
         };
         Ok(GlFont {
-            faces,
+            faces: RefCell::new(faces),
             glyphs: RefCell::new(Vec::new()),
             glyph_index: RefCell::new(HashMap::new()),
             height,
             pixel_size: base_size,
-            lcd_order,
+            lcd_order: hinting.lcd_order,
+            load_flags: hinting.load_flags,
+            dpy,
+            screen,
         })
     }
 
-    fn add_face(library: FT_Face, file: &str, index: i32, pixel_size: f64) -> Result<GlFontFace> {
+    fn add_face(
+        library: FT_Face,
+        file: &str,
+        index: i32,
+        pixel_size: f64,
+        load_flags: freetype_sys::FT_Int32,
+    ) -> Result<GlFontFace> {
         let cfile = CString::new(file)?;
         let mut face: FT_Face = ptr::null_mut();
         let err: FT_Error = unsafe {
@@ -1594,12 +1816,7 @@ impl GlFont {
             unsafe { freetype_sys::FT_Done_Face(face) };
             return Err(format!("cannot create HarfBuzz font for {file}").into());
         }
-        unsafe {
-            hb_ft_font_set_load_flags(
-                hb_font,
-                freetype_sys::FT_LOAD_DEFAULT | freetype_sys::FT_LOAD_TARGET_LIGHT,
-            );
-        }
+        unsafe { hb_ft_font_set_load_flags(hb_font, load_flags) };
         Ok(GlFontFace {
             face,
             hb_font,
@@ -1610,8 +1827,12 @@ impl GlFont {
     }
 
     pub fn ascender(&self) -> i32 {
+        let faces = self.faces.borrow();
+        let Some(face) = faces.first() else {
+            return self.height.max(1);
+        };
         unsafe {
-            let a = (*(*self.faces[0].face).size).metrics.ascender >> 6;
+            let a = (*(*face.face).size).metrics.ascender >> 6;
             a.max(1) as i32
         }
     }
@@ -1619,32 +1840,154 @@ impl GlFont {
     /// FreeType's descender in whole pixels. Used by the notification layout,
     /// which sizes its text blocks from the same metrics as dwm's GL font.
     pub fn descender(&self) -> i32 {
+        let faces = self.faces.borrow();
+        let Some(face) = faces.first() else {
+            return 0;
+        };
         unsafe {
-            let d = -((*(*self.faces[0].face).size).metrics.descender >> 6);
+            let d = -((*(*face.face).size).metrics.descender >> 6);
             d.max(0) as i32
         }
     }
 
     fn face_for(&self, ch: char) -> usize {
-        let cp = ch as FT_ULong;
-        for (i, f) in self.faces.iter().enumerate() {
-            if unsafe { freetype_sys::FT_Get_Char_Index(f.face, cp) } != 0 {
+        let cp = ch as u32;
+        let faces = self.faces.borrow();
+        for (i, f) in faces.iter().enumerate() {
+            if unsafe { freetype_sys::FT_Get_Char_Index(f.face, cp as FT_ULong) } != 0 {
                 return i;
             }
         }
-        0
+        drop(faces);
+        self.fallback_face(cp).unwrap_or(0)
+    }
+
+    fn fallback_face(&self, cp: u32) -> Option<usize> {
+        if cp == 0 {
+            return None;
+        }
+        let faces = self.faces.borrow();
+        if faces.is_empty() || faces.len() >= GL_FONT_MAX_FACES {
+            return None;
+        }
+        let base = &faces[0];
+        let base_file = base.file.clone();
+        let base_index = base.index;
+        let base_size = if base.pixel_size > 0.0 {
+            base.pixel_size
+        } else {
+            self.pixel_size
+        };
+        drop(faces);
+
+        let library = ft_library().ok()?;
+        if let Some((file, index)) = self.fc_match_file(cp) {
+            let file = if file.is_empty() { base_file.clone() } else { file };
+            let index = if index < 0 { base_index } else { index };
+            if let Some(face_index) = self.try_load_fallback_face(library, &file, index, base_size, cp)
+            {
+                return Some(face_index);
+            }
+        }
+
+        for file in GL_FONT_FALLBACK_FILES {
+            if let Some(face_index) = self.try_load_fallback_face(library, file, 0, base_size, cp) {
+                return Some(face_index);
+            }
+        }
+        None
+    }
+
+    fn fc_match_file(&self, cp: u32) -> Option<(String, i32)> {
+        if self.dpy.is_null() {
+            return None;
+        }
+        unsafe {
+            let charset = FcCharSetCreate();
+            if charset.is_null() {
+                return None;
+            }
+            FcCharSetAddChar(charset, cp);
+            let pat = FcPatternCreate();
+            if pat.is_null() {
+                FcCharSetDestroy(charset);
+                return None;
+            }
+            let file_key = CString::new("file").ok()?;
+            let idx_key = CString::new("index").ok()?;
+            let charset_key = CString::new("charset").ok()?;
+            let scalable_key = CString::new("scalable").ok()?;
+            FcPatternAddBool(pat, scalable_key.as_ptr(), FC_TRUE);
+            FcPatternAddCharSet(pat, charset_key.as_ptr(), charset);
+            FcConfigSubstitute(ptr::null_mut(), pat, FcMatchPattern);
+            FcDefaultSubstitute(pat);
+            let mut result: FcResult = 1;
+            let matched = FcFontMatch(ptr::null_mut(), pat, &mut result);
+            FcCharSetDestroy(charset);
+            FcPatternDestroy(pat);
+            if matched.is_null() {
+                return None;
+            }
+            let mut file_ptr: *mut u8 = ptr::null_mut();
+            let mut idx = 0;
+            let has_file =
+                FcPatternGetString(matched, file_key.as_ptr(), 0, &mut file_ptr) == FcResultMatch
+                    && !file_ptr.is_null();
+            let _ = FcPatternGetInteger(matched, idx_key.as_ptr(), 0, &mut idx);
+            let out = has_file.then(|| {
+                (
+                    CStr::from_ptr(file_ptr as *const c_char)
+                        .to_string_lossy()
+                        .into_owned(),
+                    idx,
+                )
+            });
+            FcPatternDestroy(matched);
+            out
+        }
+    }
+
+    fn try_load_fallback_face(
+        &self,
+        library: FT_Face,
+        file: &str,
+        index: i32,
+        pixel_size: f64,
+        cp: u32,
+    ) -> Option<usize> {
+        let mut faces = self.faces.borrow_mut();
+        if faces.len() >= GL_FONT_MAX_FACES {
+            return None;
+        }
+        if let Some((i, _)) = faces
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.file == file && f.index == index && f.pixel_size == pixel_size)
+        {
+            let has = unsafe { freetype_sys::FT_Get_Char_Index(faces[i].face, cp as FT_ULong) } != 0;
+            return has.then_some(i);
+        }
+        let face = Self::add_face(library, file, index, pixel_size, self.load_flags).ok()?;
+        let has = unsafe { freetype_sys::FT_Get_Char_Index(face.face, cp as FT_ULong) } != 0;
+        if !has {
+            unsafe {
+                if !face.hb_font.is_null() {
+                    hb_font_destroy(face.hb_font);
+                }
+                if !face.face.is_null() {
+                    freetype_sys::FT_Done_Face(face.face);
+                }
+            }
+            return None;
+        }
+        faces.push(face);
+        Some(faces.len() - 1)
     }
 
     /// Groups consecutive characters by the face that can render them and
     /// shapes each run with HarfBuzz, as dwm's two helper loops do.
     fn shaped_glyphs(&self, text: &str) -> Vec<(usize, u32, HbGlyphPosition)> {
-        let chars: Vec<(char, usize)> = text
-            .chars()
-            .map(|ch| {
-                let face = self.face_for(ch);
-                (ch, face)
-            })
-            .collect();
+        let chars: Vec<(char, usize)> = text.chars().map(|ch| (ch, self.face_for(ch))).collect();
         let mut out = Vec::new();
         let mut start = 0;
         while start < chars.len() {
@@ -1667,7 +2010,11 @@ impl GlFont {
         face_index: usize,
         run: &str,
     ) -> Option<Vec<(usize, u32, HbGlyphPosition)>> {
-        if face_index >= self.faces.len() {
+        let hb_font = {
+            let faces = self.faces.borrow();
+            faces.get(face_index)?.hb_font
+        };
+        if hb_font.is_null() {
             return None;
         }
         unsafe {
@@ -1683,18 +2030,38 @@ impl GlFont {
                 run.len() as c_int,
             );
             hb_buffer_guess_segment_properties(buffer);
-            hb_shape(self.faces[face_index].hb_font, buffer, ptr::null(), 0);
+            hb_shape(hb_font, buffer, ptr::null(), 0);
             let mut count: c_uint = 0;
             let infos = hb_buffer_get_glyph_infos(buffer, &mut count);
             let positions = hb_buffer_get_glyph_positions(buffer, &mut count);
             let mut out = Vec::with_capacity(count as usize);
-            if !infos.is_null() && !positions.is_null() {
-                for i in 0..count as usize {
-                    out.push((face_index, (*infos.add(i)).codepoint, *positions.add(i)));
+        if !infos.is_null() && !positions.is_null() {
+            for i in 0..count as usize {
+                let gid = (*infos.add(i)).codepoint;
+                let pos = *positions.add(i);
+                if gid == 0 {
+                    // .notdef: try to render the corresponding character from a
+                    // fallback face. HarfBuzz cluster is a byte offset into run.
+                    let cluster = (*infos.add(i)).cluster as usize;
+                    if let Some(ch) = run[cluster..].chars().next() {
+                        let alt_face = self.face_for(ch);
+                        if alt_face != face_index {
+                            let alt_gid = freetype_sys::FT_Get_Char_Index(
+                                self.faces.borrow()[alt_face].face,
+                                ch as FT_ULong,
+                            );
+                            if alt_gid != 0 {
+                                out.push((alt_face, alt_gid, pos));
+                                continue;
+                            }
+                        }
+                    }
                 }
+                out.push((face_index, gid, pos));
             }
-            hb_buffer_destroy(buffer);
-            Some(out)
+        }
+        hb_buffer_destroy(buffer);
+        Some(out)
         }
     }
 
@@ -1715,18 +2082,20 @@ impl GlFont {
                 return Some(glyph);
             }
         }
-        let font = self.faces.get(face_index as usize)?;
-        let face = font.face;
-        let load_flags = freetype_sys::FT_LOAD_DEFAULT | freetype_sys::FT_LOAD_TARGET_LIGHT;
-        let err: FT_Error = unsafe { FT_Load_Glyph(face, glyph_index as FT_UInt, load_flags) };
+        let face = {
+            let faces = self.faces.borrow();
+            faces.get(face_index as usize)?.face
+        };
+        let err: FT_Error =
+            unsafe { FT_Load_Glyph(face, glyph_index as FT_UInt, self.load_flags) };
         if err != 0 {
             return None;
         }
         let lcd = self.lcd_order != 0;
-        let mut mode: FT_Render_Mode = if lcd {
-            freetype_sys::FT_RENDER_MODE_LCD
-        } else {
-            freetype_sys::FT_RENDER_MODE_NORMAL
+        let mut mode: FT_Render_Mode = match self.lcd_order {
+            1 | 2 => freetype_sys::FT_RENDER_MODE_LCD,
+            3 | 4 => freetype_sys::FT_RENDER_MODE_LCD_V,
+            _ => freetype_sys::FT_RENDER_MODE_NORMAL,
         };
         let mut err: FT_Error = unsafe { FT_Render_Glyph((*face).glyph, mode) };
         if err != 0 && lcd {
@@ -1741,13 +2110,16 @@ impl GlFont {
             return None;
         }
         let bitmap: &FT_Bitmap = unsafe { &(*slot).bitmap };
-        let is_lcd = bitmap.pixel_mode as u32 == freetype_sys::FT_PIXEL_MODE_LCD;
-        let w = if is_lcd {
-            bitmap.width / 3
+        let pixel_mode = bitmap.pixel_mode as u32;
+        let is_lcd = pixel_mode == freetype_sys::FT_PIXEL_MODE_LCD;
+        let is_lcd_v = pixel_mode == freetype_sys::FT_PIXEL_MODE_LCD_V;
+        let (w, h) = if is_lcd {
+            (bitmap.width / 3, bitmap.rows)
+        } else if is_lcd_v {
+            (bitmap.width, bitmap.rows / 3)
         } else {
-            bitmap.width
+            (bitmap.width, bitmap.rows)
         };
-        let h = bitmap.rows;
         let mut glyph = GlGlyph {
             face_index,
             glyph_index,
@@ -1760,36 +2132,52 @@ impl GlFont {
         };
         if w > 0 && h > 0 && !bitmap.buffer.is_null() {
             let mut pixels = vec![0u8; (w * h * 4) as usize];
-            for y in 0..h {
-                let row = if bitmap.pitch >= 0 {
-                    unsafe { bitmap.buffer.add(y as usize * bitmap.pitch as usize) }
+            let total_rows = bitmap.rows as usize;
+            let row_ptr = |row: usize| -> *mut u8 {
+                if bitmap.pitch >= 0 {
+                    unsafe { bitmap.buffer.add(row * bitmap.pitch as usize) }
                 } else {
-                    // Negative pitch: row 0 is stored last in memory.
                     unsafe {
                         bitmap
                             .buffer
-                            .add((h - 1 - y) as usize * (-bitmap.pitch) as usize)
+                            .add((total_rows - 1 - row) * (-bitmap.pitch) as usize)
                     }
-                };
+                }
+            };
+            for y in 0..h {
                 for x in 0..w {
-                    let (r, g, b, a) = if is_lcd {
-                        let rgb = unsafe { std::slice::from_raw_parts(row.add(x as usize * 3), 3) };
-                        let (r, g, b) = if self.lcd_order == 2 {
-                            (rgb[2], rgb[1], rgb[0])
-                        } else {
-                            (rgb[0], rgb[1], rgb[2])
+                    let (r, g, b, a) = if is_lcd || is_lcd_v {
+                        let (p0, p1, p2) = unsafe {
+                            if is_lcd {
+                                let row = row_ptr(y as usize);
+                                (
+                                    row.add(x as usize * 3),
+                                    row.add(x as usize * 3 + 1),
+                                    row.add(x as usize * 3 + 2),
+                                )
+                            } else {
+                                (
+                                    row_ptr(y as usize * 3).add(x as usize),
+                                    row_ptr(y as usize * 3 + 1).add(x as usize),
+                                    row_ptr(y as usize * 3 + 2).add(x as usize),
+                                )
+                            }
                         };
-                        (r, g, b, r.max(g).max(b))
-                    } else if bitmap.pixel_mode as u32 == freetype_sys::FT_PIXEL_MODE_MONO {
-                        let byte = unsafe { *row.add(x as usize / 8) };
-                        let bit = if byte & (0x80 >> (x as usize % 8)) != 0 {
-                            255
-                        } else {
-                            0
-                        };
+                        let (mut r, g, mut b) = unsafe { (*p0, *p1, *p2) };
+                        // fontconfig uses RGB=1, BGR=2, VRGB=3, VBGR=4.
+                        if self.lcd_order == 2 || self.lcd_order == 4 {
+                            std::mem::swap(&mut r, &mut b);
+                        }
+                        let a = r.max(g).max(b);
+                        // Premultiply for the renderer's ONE,ONE_MINUS_SRC_ALPHA blend.
+                        let pm = |c: u8| ((c as u16 * a as u16 + 127) / 255) as u8;
+                        (pm(r), pm(g), pm(b), a)
+                    } else if pixel_mode == freetype_sys::FT_PIXEL_MODE_MONO {
+                        let byte = unsafe { *row_ptr(y as usize).add(x as usize / 8) };
+                        let bit = if byte & (0x80 >> (x as usize % 8)) != 0 { 255 } else { 0 };
                         (bit, bit, bit, bit)
                     } else {
-                        let coverage = unsafe { *row.add(x as usize) };
+                        let coverage = unsafe { *row_ptr(y as usize).add(x as usize) };
                         (coverage, coverage, coverage, coverage)
                     };
                     let p = ((y * w + x) * 4) as usize;
@@ -1805,16 +2193,8 @@ impl GlFont {
                     gl::BindTexture(gl::TEXTURE_2D, glyph.tex_id);
                     gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as GLint);
                     gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as GLint);
-                    gl::TexParameteri(
-                        gl::TEXTURE_2D,
-                        gl::TEXTURE_WRAP_S,
-                        gl::CLAMP_TO_EDGE as GLint,
-                    );
-                    gl::TexParameteri(
-                        gl::TEXTURE_2D,
-                        gl::TEXTURE_WRAP_T,
-                        gl::CLAMP_TO_EDGE as GLint,
-                    );
+                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as GLint);
+                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as GLint);
                     gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
                     gl::TexImage2D(
                         gl::TEXTURE_2D,
@@ -1832,14 +2212,27 @@ impl GlFont {
             }
         }
         let mut glyphs = self.glyphs.borrow_mut();
-        if glyphs.len() < GL_FONT_MAX_GLYPHS {
-            let slot = glyphs.len();
-            glyphs.push(glyph);
-            self.glyph_index.borrow_mut().insert(key, slot);
-            Some(glyph)
-        } else {
-            Some(glyph)
+        if glyphs.len() >= GL_FONT_MAX_GLYPHS {
+            // Evict half the cache to avoid unbounded texture leaks.
+            let keep_from = glyphs.len() / 2;
+            let removed: Vec<GlGlyph> = glyphs.drain(..keep_from).collect();
+            unsafe {
+                for g in &removed {
+                    if g.tex_id != 0 {
+                        gl::DeleteTextures(1, &g.tex_id);
+                    }
+                }
+            }
+            let mut index = self.glyph_index.borrow_mut();
+            index.clear();
+            for (slot, g) in glyphs.iter().enumerate() {
+                index.insert((g.face_index, g.glyph_index), slot);
+            }
         }
+        let slot = glyphs.len();
+        glyphs.push(glyph);
+        self.glyph_index.borrow_mut().insert(key, slot);
+        Some(glyph)
     }
 
     /// dwm.c 9083-9177. `x` is the pen start, `baseline` the glyph baseline,
@@ -1933,7 +2326,7 @@ impl Drop for GlFont {
                     gl::DeleteTextures(1, &g.tex_id);
                 }
             }
-            for face in &self.faces {
+            for face in self.faces.borrow().iter() {
                 if !face.hb_font.is_null() {
                     hb_font_destroy(face.hb_font);
                 }
@@ -1953,6 +2346,45 @@ mod tests {
 
     // All tests share the global `gl` loader and a single X display.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn font_hinting_uses_xft_properties() {
+        unsafe {
+            let pattern = FcPatternCreate();
+            assert!(!pattern.is_null());
+            FcPatternAddBool(pattern, c"hinting".as_ptr(), FC_TRUE);
+            FcPatternAddInteger(pattern, c"hintstyle".as_ptr(), FC_HINT_MEDIUM);
+            FcPatternAddInteger(pattern, c"rgba".as_ptr(), FC_RGBA_BGR);
+            FcPatternAddInteger(pattern, c"lcdfilter".as_ptr(), FC_LCD_LIGHT);
+            let hinting = FontHinting::from_xft_pattern(ptr::null_mut(), 0, pattern);
+            assert_eq!(hinting.lcd_order, 2);
+            assert_eq!(
+                hinting.load_flags & (0xf << 16),
+                freetype_sys::FT_LOAD_TARGET_LCD
+            );
+            assert_eq!(
+                hinting.load_flags & freetype_sys::FT_LOAD_NO_HINTING,
+                0
+            );
+            assert_eq!(hinting.lcd_filter, FT_LCD_LIGHT);
+            FcPatternDestroy(pattern);
+
+            let pattern = FcPatternCreate();
+            assert!(!pattern.is_null());
+            FcPatternAddBool(pattern, c"hinting".as_ptr(), 0);
+            FcPatternAddInteger(pattern, c"hintstyle".as_ptr(), FC_HINT_NONE);
+            FcPatternAddInteger(pattern, c"rgba".as_ptr(), 5);
+            FcPatternAddInteger(pattern, c"lcdfilter".as_ptr(), FC_LCD_NONE);
+            let hinting = FontHinting::from_xft_pattern(ptr::null_mut(), 0, pattern);
+            assert_eq!(hinting.lcd_order, 0);
+            assert_ne!(
+                hinting.load_flags & freetype_sys::FT_LOAD_NO_HINTING,
+                0
+            );
+            assert_eq!(hinting.lcd_filter, freetype_sys::FT_LCD_FILTER_NONE);
+            FcPatternDestroy(pattern);
+        }
+    }
 
     /// 32-bit TrueColor visual, i.e. the same kind of ARGB visual the window
     /// manager picks for the finder and notification windows.
@@ -2123,8 +2555,9 @@ mod tests {
                 index: 0,
                 pixel_size: 12.0,
             }];
-            let font =
-                GlFont::new(&specs, 20, 0).unwrap_or_else(|e| panic!("GLFont init failed: {e}"));
+            let hinting = FontHinting::from_xft_pattern(dpy, xlib::XDefaultScreen(dpy), ptr::null());
+            let font = GlFont::new(&specs, 20, hinting, dpy, xlib::XDefaultScreen(dpy))
+                .unwrap_or_else(|e| panic!("GLFont init failed: {e}"));
             assert!(font.height > 0);
             assert!(font.text_width("Finder") > 0);
             assert_eq!(font.text_width(""), 0);

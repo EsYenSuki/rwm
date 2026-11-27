@@ -131,7 +131,7 @@ pub fn bindings() -> Vec<Key> {
         Key {
             mods: MOD_4,
             keysym: XK_Return,
-            action: Spawn("kitty"),
+            action: Spawn("kitty -1"),
         },
         Key {
             mods: MOD_4,

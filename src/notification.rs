@@ -30,7 +30,7 @@ use zbus::zvariant::{
 use crate::bar::CLOCKPAD;
 use crate::config::EGL_FALLBACK;
 use crate::drw::Drw;
-use crate::gl::{EglSurface, GlFont, GlFontSpec, compat};
+use crate::gl::{EglSurface, FontHinting, GlFont, GlFontSpec, compat};
 use crate::text::FONTS;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -535,7 +535,7 @@ fn ignored(data: &NotificationData) -> bool {
 struct FontBundle {
     specs: Vec<GlFontSpec>,
     height: i32,
-    lcd_order: u8,
+    hinting: FontHinting,
 }
 
 #[link(name = "fontconfig")]
@@ -590,11 +590,7 @@ unsafe fn fc_double(pattern: *mut FcPattern, name: &str) -> Option<f64> {
 
 fn font_bundle(dpy: *mut xlib::Display, screen: i32, scale: f64) -> Result<FontBundle> {
     let scale = if scale > 0.0 { scale } else { 1.0 };
-    let mut lcd_order = match unsafe { xrender::XRenderQuerySubpixelOrder(dpy, screen) } {
-        1 => 1,
-        2 => 2,
-        _ => 0,
-    };
+    let mut hinting = FontHinting::from_xft_pattern(dpy, screen, ptr::null());
     let mut specs = Vec::new();
     let mut height = 0;
     for (i, name) in FONTS.iter().enumerate() {
@@ -609,12 +605,9 @@ fn font_bundle(dpy: *mut xlib::Display, screen: i32, scale: f64) -> Result<FontB
         let unscaled_h = unsafe { (*font).ascent + (*font).descent };
         if i == 0 {
             height = (unscaled_h as f64 * scale).round() as i32;
-            if !pattern.is_null() {
-                lcd_order = unsafe { fc_int(pattern, "rgba") }
-                    .filter(|order| *order == 1 || *order == 2)
-                    .map(|order| order as u8)
-                    .unwrap_or(lcd_order);
-            }
+            // Xft has merged the X11 hinting resources into this pattern.
+            // Only hinting is taken from it; size/scaling stays as it was.
+            hinting = FontHinting::from_xft_pattern(dpy, screen, pattern.cast());
         }
         if let Some(file) = unsafe {
             (!pattern.is_null())
@@ -650,7 +643,7 @@ fn font_bundle(dpy: *mut xlib::Display, screen: i32, scale: f64) -> Result<FontB
     Ok(FontBundle {
         specs,
         height,
-        lcd_order,
+        hinting,
     })
 }
 
@@ -1118,8 +1111,8 @@ impl NotificationManager {
         let surface = EglSurface::new(dpy, visual, 1, 1, EGL_FALLBACK != 0)?;
         let main = font_bundle(dpy, screen, 1.0)?;
         let time = font_bundle(dpy, screen, NOTIFY_HISTORY_TIME_SCALE)?;
-        let font = GlFont::new(&main.specs, main.height, main.lcd_order)?;
-        let time_font = GlFont::new(&time.specs, time.height, time.lcd_order)?;
+        let font = GlFont::new(&main.specs, main.height, main.hinting, dpy, screen)?;
+        let time_font = GlFont::new(&time.specs, time.height, time.hinting, dpy, screen)?;
         self.gl = Some(GlState {
             font,
             time_font,

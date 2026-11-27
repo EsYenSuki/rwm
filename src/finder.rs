@@ -33,7 +33,9 @@ use crate::config::{
 use crate::drw::Drw;
 use crate::finder_math;
 use crate::finder_net::{FinderNet, NetResult};
-use crate::gl::{Bloom, BloomTransform, EglSurface, GlFont, GlFontSpec, Result as GlResult};
+use crate::gl::{
+    Bloom, BloomTransform, EglSurface, FontHinting, GlFont, GlFontSpec, Result as GlResult,
+};
 use crate::text::FONTS;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -151,7 +153,7 @@ impl Default for FilterAnim {
 struct FontBundle {
     specs: Vec<GlFontSpec>,
     height: i32,
-    lcd_order: u8,
+    hinting: FontHinting,
 }
 
 // Field order is drop order: glyph and bloom textures need a current context,
@@ -2175,7 +2177,7 @@ impl Finder {
     }
 
     /// Resolve the configured Xft fontset into the file/index/pixel-size specs
-    /// used by dwm's `gl_font_create_scaled`, plus its Xft height and LCD order.
+    /// used by dwm's `gl_font_create_scaled`, plus its Xft height and hinting.
     fn font_bundle(
         dpy: *mut xlib::Display,
         screen: i32,
@@ -2194,11 +2196,7 @@ impl Finder {
         } else {
             FONTS.iter().map(|name| (*name).to_string()).collect()
         };
-        let mut lcd_order = match unsafe { xrender::XRenderQuerySubpixelOrder(dpy, screen) } {
-            1 => 1,
-            2 => 2,
-            _ => 0,
-        };
+        let mut hinting = FontHinting::from_xft_pattern(dpy, screen, ptr::null());
         let mut specs = Vec::new();
         let mut height = 0;
         for (i, name) in names.iter().enumerate() {
@@ -2213,14 +2211,10 @@ impl Finder {
             let unscaled_h = unsafe { (*xft).ascent + (*xft).descent };
             if i == 0 {
                 height = (unscaled_h as f64 * scale).round() as i32;
-                if !pattern.is_null() {
-                    let order = unsafe { Self::fc_int(pattern, "rgba") }.unwrap_or(0);
-                    lcd_order = match order {
-                        1 | 2 => order as u8,
-                        3 | 4 | 5 => 0,
-                        _ => lcd_order,
-                    };
-                }
+                // Xft has merged the X11 hinting resources into this pattern.
+                // Only the hinting properties are used; size/scaling stays
+                // exactly as it was below.
+                hinting = FontHinting::from_xft_pattern(dpy, screen, pattern.cast());
             }
             let file = if pattern.is_null() {
                 None
@@ -2257,7 +2251,7 @@ impl Finder {
         Ok(FontBundle {
             specs,
             height,
-            lcd_order,
+            hinting,
         })
     }
 
@@ -2276,9 +2270,9 @@ impl Finder {
             let main = Self::font_bundle(dpy, screen, None, 1.0)?;
             let query = Self::font_bundle(dpy, screen, None, 1.15)?;
             let result = Self::font_bundle(dpy, screen, Some(16.0), 1.0)?;
-            let font = GlFont::new(&main.specs, main.height, main.lcd_order)?;
-            let mut query_font = GlFont::new(&query.specs, query.height, query.lcd_order)?;
-            let mut result_font = GlFont::new(&result.specs, result.height, result.lcd_order)?;
+            let font = GlFont::new(&main.specs, main.height, main.hinting, dpy, screen)?;
+            let query_font = GlFont::new(&query.specs, query.height, query.hinting, dpy, screen)?;
+            let result_font = GlFont::new(&result.specs, result.height, result.hinting, dpy, screen)?;
             let query_char_width = query_font.text_width("M").max(1);
             let result_char_width = result_font.text_width("M").max(1);
             self.gl = Some(GlState {

@@ -22,9 +22,9 @@ use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ButtonPressEvent, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux,
     ClientMessageEvent, ClipOrdering, ColormapAlloc, ConfigWindow, ConfigureNotifyEvent,
-    ConfigureWindowAux, ConnectionExt, CreateWindowAux, EnterNotifyEvent, EventMask, GrabMode,
-    GrabStatus, Gravity, InputFocus, KeyPressEvent, LeaveNotifyEvent, ModMask, MotionNotifyEvent,
-    PropMode, StackMode, Window, WindowClass,
+    ConfigureWindowAux, ConnectionExt, CreateWindowAux, EnterNotifyEvent, EventMask, FocusInEvent,
+    GrabMode, GrabStatus, Gravity, InputFocus, KeyPressEvent, LeaveNotifyEvent, ModMask,
+    MotionNotifyEvent, PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -521,6 +521,18 @@ struct BarWidths {
     rw: i32,
 }
 
+/// x of a center window drawn `drawn_w` wide in the gap between the right edge
+/// of the title (`left`) and the left edge of the right bar (`right`). `cw` is
+/// the width the bar reserved for it; the window can be wider while the audio
+/// meter animates. The reserve keeps a `BARGAP` on either side, as in dwm's
+/// `resizebarwin()`.
+fn centered_bar_x(left: i32, right: i32, cw: i32, drawn_w: i32) -> Option<i32> {
+    if right - left < cw + 2 * BARGAP {
+        return None;
+    }
+    Some(left + (right - left) / 2 - drawn_w / 2)
+}
+
 /// Who owns the shared center window. The WM_CLASS differs for each kind,
 /// and Finder takes precedence over an already-open notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,6 +681,13 @@ pub struct Wm {
     /// Both popup windows and full client windows the app opens from the icon
     /// can land here; only the stacking is changed, never their layout.
     tray_menus: RefCell<Vec<Window>>,
+    /// Override-redirect menus, context popups and tooltips opened by ordinary
+    /// clients. They are not managed, so X will not keep them above a client
+    /// that is mapped or raised later. Only stacking is touched here.
+    popup_windows: RefCell<Vec<Window>>,
+    /// Other unmanaged override-redirect root children (hintless popups, OSDs).
+    /// They are kept above clients but below the always-on-top bar layer.
+    overlay_windows: RefCell<Vec<Window>>,
     /// Most recent ButtonPress delivered to a tray icon or the tray container.
     tray_click: RefCell<Option<TrayClick>>,
     /// Typed top-right bar values and `kbstr` (keyboard layout).
@@ -754,6 +773,18 @@ pub struct Wm {
     /// X input focus captured before Finder opened. Finder keeps focus on its
     /// popup while active, then restores this window when it closes.
     finder_saved_focus: Option<Window>,
+    /// Last X input focus rwm deliberately requested. FocusIn on a different
+    /// window means a client (or an X focus revert) moved the keyboard without
+    /// going through the selection, so focus() puts it back. This keeps the
+    /// border colour, _NET_ACTIVE_WINDOW and what picom sees in agreement.
+    intended_focus: Option<Window>,
+    /// True while a pointer grab drives a move/resize. Crossings forwarded
+    /// through handle() must not reselect a window under the dragged client.
+    pointer_grabbed: bool,
+    /// Until this instant an EnterNotify must not change the selection. An
+    /// explicit focus such as Alt+Tab warps the pointer, and that synthetic
+    /// crossing can otherwise select a window stacked over the target.
+    focus_hold_until: Instant,
     /// Keeps the Xlib connection that owns the themed cursor ids alive.
     _cursor_loader: CursorLoader,
     /// EWMH's _NET_SUPPORTING_WM_CHECK window. It is an unmapped child of the
@@ -892,7 +923,8 @@ impl Wm {
                     | EventMask::SUBSTRUCTURE_NOTIFY
                     | EventMask::KEY_PRESS
                     | EventMask::PROPERTY_CHANGE
-                    | EventMask::POINTER_MOTION,
+                    | EventMask::POINTER_MOTION
+                    | EventMask::FOCUS_CHANGE,
             ),
         )?
         .check()?;
@@ -1123,6 +1155,8 @@ impl Wm {
             clock_extra: 0,
             tray,
             tray_menus: RefCell::new(Vec::new()),
+            popup_windows: RefCell::new(Vec::new()),
+            overlay_windows: RefCell::new(Vec::new()),
             tray_click: RefCell::new(None),
             bar_status,
             kbstr: "us".to_string(),
@@ -1161,6 +1195,9 @@ impl Wm {
             center_kind: RefCell::new(vec![CenterKind::Dwm; monitor_count]),
             finder_grabbed: false,
             finder_saved_focus: None,
+            intended_focus: None,
+            pointer_grabbed: false,
+            focus_hold_until: Instant::now(),
             _cursor_loader: cursor_loader,
             supporting_wm_check: NONE,
             restart: false,
@@ -1826,6 +1863,90 @@ impl Wm {
 
     fn raise_tray_menus(&self) {
         for &win in self.tray_menus.borrow().iter() {
+            let _ = self
+                .conn
+                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        }
+    }
+
+    /// Is `win` an override-redirect root child the WM does not manage? Menus
+    /// and tooltips are almost always mapped that way. Nested children of a
+    /// client are excluded: they already follow their parent's place in the
+    /// root stack and cannot be raised above root siblings.
+    fn is_unmanaged_overlay(&self, win: Window) -> bool {
+        if win == 0 || win == self.root || self.is_our_window(win) || self.is_managed(win) {
+            return false;
+        }
+        let Some(attrs) = self
+            .conn
+            .get_window_attributes(win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            return false;
+        };
+        if !attrs.override_redirect || attrs.class == WindowClass::INPUT_ONLY {
+            return false;
+        }
+        let parent = self
+            .conn
+            .query_tree(win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.parent);
+        parent == Some(self.root)
+    }
+
+    /// A popup announces itself with a popup window type or `WM_TRANSIENT_FOR`.
+    /// Such windows belong above the bar layer, like tray menus do.
+    fn is_overlay_popup(&self, win: Window) -> bool {
+        self.is_unmanaged_overlay(win)
+            && (is_popup_win_type(self.read_win_type(win))
+                || self.read_transient_for(win).is_some())
+    }
+
+    /// Remember an unmanaged root child seen on MapNotify and put it in its
+    /// layer. Override-redirect windows never send MapRequest, so this is the
+    /// only chance to see them before a later restack buries them under a newly
+    /// mapped tiled client.
+    fn track_overlay(&self, win: Window) -> Result {
+        if !self.is_unmanaged_overlay(win) {
+            return Ok(());
+        }
+        let popup = self.is_overlay_popup(win);
+        {
+            let mut tracked = if popup {
+                self.popup_windows.borrow_mut()
+            } else {
+                self.overlay_windows.borrow_mut()
+            };
+            if tracked.contains(&win) {
+                return Ok(());
+            }
+            tracked.push(win);
+        }
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        // A generic OSD must not hide the bar that was on top before it mapped.
+        if !popup {
+            self.raise_bars()?;
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Restore the unmanaged overlay layers after clients and bars have been
+    /// restacked. Generic overlays go below the bar, popups above it.
+    fn raise_overlays(&self) {
+        for &win in self.overlay_windows.borrow().iter() {
+            let _ = self
+                .conn
+                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        }
+    }
+
+    fn raise_popups(&self) {
+        for &win in self.popup_windows.borrow().iter() {
             let _ = self
                 .conn
                 .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
@@ -2614,24 +2735,13 @@ impl Wm {
         let m = &self.monitors[mi];
         let b = self.barwidths(mi);
         let lx = if FLOATBAR { m.wx + m.gaps.ov } else { m.wx };
-        let rx = lx + (if FLOATBAR { m.ww - 2 * m.gaps.ov } else { m.ww }) - b.rw;
         let kx = lx + b.tw + BARGAP;
-        let titlex = kx + b.kw + BARGAP;
-        let title_right = titlex + b.tlw;
-        let span = rx - title_right;
-        let cw = b.cw;
-        if span < cw + 2 * BARGAP {
-            return None;
-        }
-        let mut cx = title_right + (span - cw - 2 * BARGAP) / 2;
-        let mut clock_cx = cx + (cw + 2 * BARGAP) / 2;
-        let monitor_center = m.wx + m.ww / 2;
-        if clock_cx < monitor_center {
-            clock_cx = monitor_center;
-            cx = clock_cx - (cw + 2 * BARGAP) / 2;
-        }
-        let dcw = self.clock_window_width(mi, cw);
-        Some((cx + (cw + 2 * BARGAP) / 2 - dcw / 2, dcw))
+        let title_right = kx + b.kw + BARGAP + b.tlw;
+        // rightbar_x() reserves the systray, so the clock follows the right
+        // bar left when tray icons appear instead of staying at the old edge.
+        let rx = self.rightbar_x(mi);
+        let dcw = self.clock_window_width(mi, b.cw);
+        Some((centered_bar_x(title_right, rx, b.cw, dcw)?, dcw))
     }
 
     /// Maps or unmaps a bar window only when its state actually changes. The
@@ -2871,6 +2981,9 @@ impl Wm {
     /// layer and the sections' relative stacking. The transparent center and
     /// the two markers go last so they stay above their neighbouring sections.
     fn raise_bar_layer(&self, mi: usize) -> Result {
+        // Unmanaged OSDs and hintless popups must stay above clients too, but
+        // the bar stays above them. The menu layers are restored at the end.
+        self.raise_overlays();
         let m = &self.monitors[mi];
         for win in [
             m.barwin,
@@ -2890,9 +3003,10 @@ impl Wm {
             }
         }
         // The bar layer is rebuilt on every map, focus change and `_NET_WM_STATE_ABOVE`
-        // client. Put tray menus back on top in the same pass, otherwise a menu
-        // opened from the tray is immediately buried by the bar it came from.
+        // client. Put menus back on top in the same pass, otherwise a menu is
+        // immediately buried by the bar (or client) that caused the restack.
         self.raise_tray_menus();
+        self.raise_popups();
         Ok(())
     }
 
@@ -2908,6 +3022,8 @@ impl Wm {
     fn is_our_window(&self, win: Window) -> bool {
         self.tray.window == win
             || self.tray_menus.borrow().contains(&win)
+            || self.popup_windows.borrow().contains(&win)
+            || self.overlay_windows.borrow().contains(&win)
             || self.supporting_wm_check == win
             || self.monitors.iter().any(|m| {
                 [
@@ -2953,6 +3069,9 @@ impl Wm {
                     .sibling(m.mpris_markerwin)
                     .stack_mode(StackMode::BELOW),
             )?;
+            // An open menu stays on top of the expanded panel as well.
+            self.raise_tray_menus();
+            self.raise_popups();
         } else {
             // Restore the bar's place in the top layer. Lowering with a bare
             // `BELOW` would put the collapsed panel under *all* root children,
@@ -3437,6 +3556,17 @@ impl Wm {
         wa
     }
 
+    /// Sets X input focus and remembers what rwm intended. FocusIn events on
+    /// another window are then a reliable signal that somebody moved the
+    /// keyboard behind our back, instead of being indistinguishable from a
+    /// focus change rwm itself requested.
+    fn set_focus_window(&mut self, win: Window, revert_to: InputFocus) -> Result {
+        self.conn
+            .set_input_focus(revert_to, win, CURRENT_TIME)?;
+        self.intended_focus = Some(win);
+        Ok(())
+    }
+
     /// dwm's `focus()`: gives the selected window of the selected monitor the
     /// focus border colour and every other window the normal one.
     fn focus(&mut self) -> Result {
@@ -3488,8 +3618,12 @@ impl Wm {
         } else {
             focus_target = self.root;
         }
-        self.conn
-            .set_input_focus(InputFocus::POINTER_ROOT, focus_target, CURRENT_TIME)?;
+        // RevertToParent, not PointerRoot: if a client is unmapped while it is
+        // focused, PointerRoot silently hands the keyboard to whatever window
+        // happens to be under the mouse. That leaves the border and
+        // _NET_ACTIVE_WINDOW on the old client while picom sees another window
+        // focused, which is exactly the overlap/Alt+Tab focus-loss symptom.
+        self.set_focus_window(focus_target, InputFocus::PARENT)?;
         // Clear urgency/demands_attention on focused client
         if let Some(win) = sel {
             if let Some(idx) = self.clients.iter().position(|c| c.win == win) {
@@ -3502,6 +3636,68 @@ impl Wm {
         }
         let _ = self.update_active_window();
         self.conn.flush()?;
+        Ok(())
+    }
+
+    /// True when `win` is `ancestor` or one of its descendants. A client is
+    /// allowed to move focus into its own input widget; that is still focus on
+    /// the selected client as far as the WM and compositor are concerned.
+    fn focus_within(&self, win: Window, ancestor: Window) -> Result<bool> {
+        if win == ancestor {
+            return Ok(true);
+        }
+        if win == NONE || ancestor == NONE || ancestor == self.root {
+            return Ok(false);
+        }
+        let mut cur = win;
+        // Bound the walk so a malicious child cannot keep us in the loop.
+        for _ in 0..32 {
+            let Ok(reply) = self.conn.query_tree(cur)?.reply() else {
+                return Ok(false);
+            };
+            let parent = reply.parent;
+            if parent == ancestor {
+                return Ok(true);
+            }
+            if parent == NONE || parent == self.root {
+                return Ok(false);
+            }
+            cur = parent;
+        }
+        Ok(false)
+    }
+
+    /// Reassert the selection when X input focus ends up somewhere rwm did not
+    /// ask for. A client can call XSetInputFocus itself (some toolkits do on a
+    /// pointer crossing) and an obscured window can keep the keyboard while
+    /// rwm's border still claims another window is focused. Listening for
+    /// FocusIn is what makes the visible focus state match the real one.
+    fn focus_in(&mut self, _e: &FocusInEvent) -> Result {
+        if self.finder.is_active() || self.notification.has_input_focus() {
+            return Ok(());
+        }
+        let Some(intended) = self.intended_focus else {
+            return Ok(());
+        };
+        // x11rb's FocusInEvent only carries the ancestor that reported the
+        // crossing; ask the server for the real focus window (including a
+        // child a client focused itself).
+        let actual = self.conn.get_input_focus()?.reply()?.focus;
+        if actual == intended || self.focus_within(actual, intended)? {
+            return Ok(());
+        }
+        // XEMBED tray icons and the notification/Finder bar surface are
+        // legitimate focus owners that do not change the client selection.
+        if self.tray.contains(actual)
+            || self.monitors.iter().any(|m| {
+                m.barcenterwin == actual || m.finder_markerwin == actual || m.barwin == actual
+            })
+        {
+            return Ok(());
+        }
+        if self.monitors[self.selmon].sel.is_some() {
+            self.focus()?;
+        }
         Ok(())
     }
 
@@ -4087,7 +4283,11 @@ impl Wm {
         self.conn.change_window_attributes(
             win,
             &ChangeWindowAttributesAux::new()
-                .event_mask(EventMask::ENTER_WINDOW | EventMask::PROPERTY_CHANGE),
+                .event_mask(
+                    EventMask::ENTER_WINDOW
+                        | EventMask::PROPERTY_CHANGE
+                        | EventMask::FOCUS_CHANGE,
+                ),
         )?;
         self.grab_buttons(win)?;
         // Some clients set _NET_WM_STATE_FULLSCREEN on the window before
@@ -4494,8 +4694,7 @@ impl Wm {
             self.focus()?;
         } else {
             self.selmon = mi;
-            self.conn
-                .set_input_focus(InputFocus::PARENT, self.root, CURRENT_TIME)?;
+            self.set_focus_window(self.root, InputFocus::PARENT)?;
             self.conn.flush()?;
         }
         Ok(())
@@ -4593,8 +4792,7 @@ impl Wm {
             None => false,
         };
         let win = if alive { saved.unwrap() } else { self.root };
-        self.conn
-            .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        self.set_focus_window(win, InputFocus::PARENT)?;
         self.conn.flush()?;
         Ok(())
     }
@@ -4649,8 +4847,7 @@ impl Wm {
             return self.finder_close();
         }
         self.finder_grabbed = true;
-        self.conn
-            .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+        self.set_focus_window(win, InputFocus::PARENT)?;
         self.conn.flush()?;
         self.bar_dirty = true;
         Ok(())
@@ -5004,13 +5201,14 @@ impl Wm {
         let notification_active = self.notification.is_center_active();
         let notification_has_focus = self.notification.has_input_focus();
         if !finder_active && notification_had_focus != notification_has_focus {
-            let win = if notification_has_focus {
-                self.monitors[self.selmon].barcenterwin
+            if notification_has_focus {
+                let win = self.monitors[self.selmon].barcenterwin;
+                self.set_focus_window(win, InputFocus::PARENT)?;
             } else {
-                self.root
-            };
-            self.conn
-                .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+                // Hand the keyboard back to the selected client instead of
+                // leaving focus on root while the border still names a client.
+                self.focus()?;
+            }
         }
         if notification_was_active && !notification_active && !finder_active {
             // A pointer event may have closed history before refresh ran, so
@@ -5306,13 +5504,11 @@ impl Wm {
             .button(e.detail, e.event_x as i32, e.event_y as i32, self.bar_h());
         let has_focus = self.notification.has_input_focus();
         if had_focus != has_focus {
-            let win = if has_focus {
-                self.monitors[mi].barcenterwin
+            if has_focus {
+                self.set_focus_window(self.monitors[mi].barcenterwin, InputFocus::PARENT)?;
             } else {
-                self.root
-            };
-            self.conn
-                .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+                self.focus()?;
+            }
         }
         self.bar_dirty = true;
         self.sync_center_class()?;
@@ -5340,13 +5536,11 @@ impl Wm {
         }
         let has_focus = self.notification.has_input_focus();
         if had_focus != has_focus {
-            let win = if has_focus {
-                self.monitors[self.selmon].barcenterwin
+            if has_focus {
+                self.set_focus_window(self.monitors[self.selmon].barcenterwin, InputFocus::PARENT)?;
             } else {
-                self.root
-            };
-            self.conn
-                .set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+                self.focus()?;
+            }
         }
         self.bar_dirty = true;
         self.sync_center_class()?;
@@ -5423,6 +5617,13 @@ impl Wm {
                 self.track_tray_menu(e.window)?;
                 return Ok(());
             }
+            // Ordinary applications map their right-click menus and tooltips
+            // without a MapRequest. Track them too, so the next arrange() does
+            // not leave them under a newly spawned tiled window.
+            Event::MapNotify(e) if self.is_unmanaged_overlay(e.window) => {
+                self.track_overlay(e.window)?;
+                return Ok(());
+            }
             Event::MapRequest(e) => {
                 if self.is_tray_icon(e.window) {
                     self.tray.set_visible(e.window, true);
@@ -5459,12 +5660,14 @@ impl Wm {
                     if let Some(attrs) = attrs {
                         if attrs.override_redirect || attrs.class == WindowClass::INPUT_ONLY {
                             let _ = self.conn.map_window(e.window);
+                            let _ = self.track_overlay(e.window);
                             // Mapping a root child puts it at the top of the
                             // stack, so restore the bar layer immediately.
                             let _ = self.raise_bars();
                             let _ = self.conn.flush();
                         } else if self.should_ignore_window(e.window) {
                             let _ = self.conn.map_window(e.window);
+                            let _ = self.track_overlay(e.window);
                             // Mapping a root child puts it at the top of the
                             // stack, so restore the bar layer immediately.
                             let _ = self.raise_bars();
@@ -5495,6 +5698,10 @@ impl Wm {
             // withdrawing its own window, e.g. "close to tray" in Electron apps.
             // DestroyNotify is still what removes a client that went away.
             Event::UnmapNotify(e) => {
+                // A popup that closes must leave the tracked layer; MapNotify
+                // will add it again the next time the client opens it.
+                self.popup_windows.borrow_mut().retain(|&w| w != e.window);
+                self.overlay_windows.borrow_mut().retain(|&w| w != e.window);
                 // Reparenting a mapped icon (scan_existing adopting an icon left
                 // mapped by Discord or a previous WM) makes X do an internal
                 // UnmapWindow before the reparent. That UnmapNotify is reported
@@ -5524,6 +5731,8 @@ impl Wm {
             }
             Event::DestroyNotify(e) => {
                 self.tray_menus.borrow_mut().retain(|&w| w != e.window);
+                self.popup_windows.borrow_mut().retain(|&w| w != e.window);
+                self.overlay_windows.borrow_mut().retain(|&w| w != e.window);
                 if self.tray.undock(e.window) {
                     self.relayout_tray()?;
                 } else {
@@ -5704,6 +5913,9 @@ impl Wm {
                     self.conn.flush()?;
                 }
             }
+            Event::FocusIn(e) => {
+                self.focus_in(&e)?;
+            }
             Event::EnterNotify(e) => {
                 // The Finder popup and its marker are separate override-redirect
                 // windows. Crossing between them must not dirty the bars: that
@@ -5715,6 +5927,13 @@ impl Wm {
                         .iter()
                         .any(|m| m.barcenterwin == e.event || m.finder_markerwin == e.event);
                 if finder_crossing {
+                    return Ok(());
+                }
+                // A pointer grab keeps focus on the client being moved or
+                // resized even when the pointer crosses a window stacked over
+                // it. The same hold protects an explicit Alt+Tab focus from the
+                // synthetic crossing generated by its pointer warp.
+                if self.pointer_grabbed || Instant::now() < self.focus_hold_until {
                     return Ok(());
                 }
                 if self.notification_enter(&e)? {
@@ -6128,6 +6347,7 @@ impl Wm {
                 self.selmon = mon;
                 self.monitors[mon].sel = Some(win);
                 self.focus()?;
+                self.focus_hold_until = Instant::now() + Duration::from_millis(120);
                 self.bar_dirty = true;
             }
         } else if e.type_ == self.atoms.net_close_window {
@@ -6404,6 +6624,7 @@ impl Wm {
             return Ok(None);
         }
         self.set_no_animation(win, true)?;
+        self.pointer_grabbed = true;
         let mut last_frame = Instant::now();
         let mut last_bar_tick = Instant::now();
         let mut latest = None;
@@ -6452,6 +6673,7 @@ impl Wm {
                 }
             }
         })();
+        self.pointer_grabbed = false;
         let _ = self.conn.ungrab_pointer(CURRENT_TIME);
         let _ = self.set_no_animation(win, false);
         let _ = self.conn.flush();
@@ -6509,6 +6731,8 @@ impl Wm {
         self.clients.insert(0, client);
         self.conn
             .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        // Raising a floating client must not bury a menu that was already open.
+        self.raise_bars()?;
         self.invalidate_finder_stacking();
         self.place_floating(win)
     }
@@ -7118,6 +7342,11 @@ impl Wm {
             self.apply_layout()?;
         }
         self.focus()?;
+        // Warping generates a synthetic crossing. When another floating
+        // window covers the target's centre, that crossing used to reselect
+        // the covering window and undo this explicit focus. Hold the Alt+Tab
+        // selection briefly; normal focus-follows-mouse resumes afterwards.
+        self.focus_hold_until = Instant::now() + Duration::from_millis(120);
         if let Some(r) = self.geometry(mi, c) {
             self.conn
                 .warp_pointer(NONE, c, 0, 0, 0, 0, (r.w / 2) as i16, (r.h / 2) as i16)?;
@@ -7508,6 +7737,40 @@ mod tests {
         let loud = Wm::clock_extra_from_rms(0.3);
         assert!(quiet < config::CLOCK_ANIM_EXTRA / 2);
         assert!(loud > quiet + config::CLOCK_ANIM_EXTRA / 2);
+    }
+
+    #[test]
+    fn clock_follows_the_right_bar_when_the_tray_takes_space() {
+        let title_right = 200;
+        let cw = 100;
+        let right_bar = 1592; // 1920 - outer gap - right bar width
+        let plain = centered_bar_x(title_right, right_bar, cw, cw).unwrap();
+        assert_eq!(plain + cw / 2, title_right + (right_bar - title_right) / 2);
+
+        // A docked tray pushes the right bar left by its width plus the gap.
+        let tray = 60 + BARGAP;
+        let with_tray = centered_bar_x(title_right, right_bar - tray, cw, cw).unwrap();
+        assert_eq!(
+            with_tray + cw / 2,
+            title_right + (right_bar - tray - title_right) / 2
+        );
+        assert_eq!(plain - with_tray, tray / 2);
+    }
+
+    #[test]
+    fn animated_clock_grows_around_the_same_center() {
+        let cw = 100;
+        let grown = cw + 60;
+        let normal_x = centered_bar_x(200, 1000, cw, cw).unwrap();
+        let grown_x = centered_bar_x(200, 1000, cw, grown).unwrap();
+        assert_eq!(normal_x + cw / 2, grown_x + grown / 2);
+    }
+
+    #[test]
+    fn clock_is_hidden_when_the_bar_gap_cannot_hold_its_reserve() {
+        let cw = 100;
+        assert_eq!(centered_bar_x(200, 200 + cw + 2 * BARGAP - 1, cw, cw), None);
+        assert!(centered_bar_x(200, 200 + cw + 2 * BARGAP, cw, cw).is_some());
     }
 
     #[test]
