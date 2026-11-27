@@ -5,6 +5,7 @@ mod egl;
 mod finder;
 mod finder_math;
 mod finder_net;
+mod finder_search;
 mod gl;
 mod icon;
 mod keys;

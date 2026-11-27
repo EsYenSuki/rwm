@@ -33,6 +33,7 @@ use crate::config::{
 use crate::drw::Drw;
 use crate::finder_math;
 use crate::finder_net::{FinderNet, NetResult};
+use crate::finder_search::{Candidate, SearchEngine};
 use crate::gl::{
     Bloom, BloomTransform, EglSurface, FontHinting, GlFont, GlFontSpec, Result as GlResult,
 };
@@ -56,6 +57,9 @@ const FILTER_ALPHA_DELAY_MS: f32 = 50.0;
 const FILTER_TEXT_BLUR: f32 = 2.0;
 const FILTER_IMAGE_BLUR: f32 = 20.0;
 const SCROLL_TICK: Duration = Duration::from_millis(10);
+/// Icons are decoded one per pass. A fixed deadline keeps them filling in
+/// without input, while still yielding between decodes instead of spinning.
+const ICON_TICK: Duration = Duration::from_millis(16);
 const TRANSLATE_DEBOUNCE: Duration = Duration::from_millis(500);
 const RESULT_FADE: Duration = Duration::from_millis(220);
 const GLOW_FADE: Duration = Duration::from_millis(300);
@@ -109,8 +113,6 @@ struct App {
     icon_loaded: bool,
     /// A lookup or decode failed, so do not retry it on every tick.
     icon_failed: bool,
-    recent: i32,
-    score: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -383,13 +385,18 @@ pub struct Finder {
     cursor_base: Instant,
     cursor_visible: bool,
     dirty: bool,
+    /// Real user input that must be drawn on this loop pass. Animation and
+    /// icon progress only set `dirty`, which `next_tick()` paces.
+    immediate: bool,
     loading: bool,
     /// True once the full-size background-only frame has reached the ARGB
     /// window. Desktop discovery is held back until this happens, so opening
     /// Finder never shows a clock-sized patch while the app list is scanned.
     initial_background_presented: bool,
     icons_pending: bool,
-    recent: Vec<String>,
+    /// Prepared fuzzy-search candidates, rebuilt only when apps are discovered.
+    candidates: Vec<Candidate>,
+    search: SearchEngine,
     net: FinderNet,
     math_result: Option<String>,
     math_help: bool,
@@ -414,6 +421,9 @@ pub struct Finder {
     query_pose_started: Instant,
     ocr_mode: bool,
     filter: Vec<FilterAnim>,
+    /// Indices of the currently active filter animations, in the same order as
+    /// `filter`. Keeps frame-key hashing and drawing off the inactive slots.
+    filter_active: Vec<usize>,
     filter_start_present: Vec<bool>,
     filter_start_y: Vec<f32>,
     filter_start_alpha: Vec<f32>,
@@ -442,7 +452,6 @@ pub struct Finder {
 
 impl Finder {
     pub fn new() -> Self {
-        let recent = Self::load_recent();
         Finder {
             active: false,
             apps: Vec::new(),
@@ -458,10 +467,12 @@ impl Finder {
             cursor_base: Instant::now(),
             cursor_visible: true,
             dirty: false,
+            immediate: false,
             loading: false,
             initial_background_presented: false,
             icons_pending: false,
-            recent,
+            candidates: Vec::new(),
+            search: SearchEngine::new(),
             net: FinderNet::new(),
             math_result: None,
             math_help: false,
@@ -486,6 +497,7 @@ impl Finder {
             query_pose_started: Instant::now(),
             ocr_mode: false,
             filter: Vec::new(),
+            filter_active: Vec::new(),
             filter_start_present: Vec::new(),
             filter_start_y: Vec::new(),
             filter_start_alpha: Vec::new(),
@@ -547,47 +559,6 @@ impl Finder {
         path.to_string()
     }
 
-    fn recent_path() -> Option<PathBuf> {
-        if let Some(dir) = env::var_os("XDG_STATE_HOME") {
-            let p = PathBuf::from(dir);
-            if p.is_absolute() {
-                return Some(p.join("dwm").join("finder-recent"));
-            }
-        }
-        env::var_os("HOME").map(|h| Path::new(&h).join(".local/state/dwm/finder-recent"))
-    }
-
-    fn load_recent() -> Vec<String> {
-        let Some(path) = Self::recent_path() else {
-            return Vec::new();
-        };
-        fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .take(10)
-            .map(|l| l.trim_end_matches(['\r', '\n']).to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
-    }
-
-    fn save_recent(&self) {
-        let Some(path) = Self::recent_path() else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let mut text = String::new();
-        for item in &self.recent {
-            text.push_str(item);
-            text.push('\n');
-        }
-        let tmp = path.with_extension("tmp");
-        if fs::write(&tmp, text).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
-    }
-
     fn strip_field_codes(exec: &str) -> String {
         let bytes = exec.as_bytes();
         let mut out = String::new();
@@ -637,8 +608,6 @@ impl Finder {
                     icon_tex: 0,
                     icon_loaded: false,
                     icon_failed: false,
-                    recent: 0,
-                    score: 0,
                 };
                 let mut hidden = false;
                 for line in text.lines() {
@@ -669,35 +638,27 @@ impl Finder {
                 if app.name.is_empty() || app.exec.is_empty() {
                     continue;
                 }
-                if let Some(pos) = self.recent.iter().position(|r| *r == app.file) {
-                    app.recent = (self.recent.len() - pos) as i32;
-                }
                 self.apps.push(app);
             }
         }
-        self.apps.sort_by(|a, b| {
-            b.recent
-                .cmp(&a.recent)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+        self.candidates = self
+            .apps
+            .iter()
+            .map(|app| {
+                let file_name = Path::new(&app.file)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Candidate {
+                    id: app.file.clone(),
+                    label: app.name.clone(),
+                    search_text: format!("{} {} {}", app.name, app.exec, file_name),
+                }
+            })
+            .collect();
+        self.search.invalidate();
         self.ensure_filter_slots();
         self.rank();
-    }
-
-    fn name_score(name: &str, query: &str) -> i32 {
-        let lower_name = name.to_lowercase();
-        let lower_query = query.to_lowercase();
-        if lower_name == lower_query {
-            return 100_000;
-        }
-        if lower_name.starts_with(&lower_query) {
-            return 90_000;
-        }
-        let Some(pos) = lower_name.find(&lower_query) else {
-            return 0;
-        };
-        let boundary = pos > 0 && !name.as_bytes()[pos - 1].is_ascii_alphanumeric();
-        (if boundary { 70_000 } else { 50_000 }) - (pos as i32) * 10
     }
 
     fn rank(&mut self) {
@@ -706,38 +667,7 @@ impl Finder {
             self.visible = 0;
             return;
         }
-        for (i, app) in self.apps.iter_mut().enumerate() {
-            let name_hit = if self.query.is_empty() {
-                true
-            } else {
-                app.name.to_lowercase().contains(&self.query.to_lowercase())
-                    || app.exec.to_lowercase().contains(&self.query.to_lowercase())
-            };
-            if !name_hit {
-                continue;
-            }
-            app.score = if self.query.is_empty() {
-                0
-            } else {
-                let s = Self::name_score(&app.name, &self.query);
-                if s != 0 {
-                    s
-                } else if app.exec.to_lowercase().contains(&self.query.to_lowercase()) {
-                    10_000
-                } else {
-                    0
-                }
-            };
-            self.order.push(i);
-        }
-        self.order.sort_by(|&a, &b| {
-            let aa = &self.apps[a];
-            let bb = &self.apps[b];
-            bb.score
-                .cmp(&aa.score)
-                .then_with(|| bb.recent.cmp(&aa.recent))
-                .then_with(|| aa.name.to_lowercase().cmp(&bb.name.to_lowercase()))
-        });
+        self.order = self.search.rank(&self.candidates, &self.query);
         self.visible = self.order.len();
         self.bump_content_epoch();
     }
@@ -755,12 +685,7 @@ impl Finder {
         // Launch through the WM's detached spawn path as well: an app opened
         // from Finder must not die when rwm is killed.
         let _ = crate::wm::spawn_command(child).is_ok() || crate::wm::spawn(&exec).is_ok();
-        if let Some(pos) = self.recent.iter().position(|r| *r == file) {
-            self.recent.remove(pos);
-        }
-        self.recent.insert(0, file);
-        self.recent.truncate(10);
-        self.save_recent();
+        self.search.record(&file);
         self.close();
     }
 
@@ -1060,6 +985,8 @@ impl Finder {
             }
         }
         self.apps.clear();
+        self.candidates.clear();
+        self.search.invalidate();
     }
 
     // -----------------------------------------------------------------------
@@ -1103,6 +1030,7 @@ impl Finder {
         self.query_pose_started = Instant::now();
         self.ocr_mode = false;
         self.filter.clear();
+        self.filter_active.clear();
         self.filter_started = None;
         self.filter_display_rows = 0;
         self.filter_animating = false;
@@ -1117,6 +1045,7 @@ impl Finder {
         self.frame_cache_valid = false;
         self.cached_caret = None;
         self.dirty = true;
+        self.immediate = true;
     }
 
     pub fn close(&mut self) {
@@ -1146,6 +1075,7 @@ impl Finder {
         self.math_help = false;
         self.math_started = None;
         self.filter.clear();
+        self.filter_active.clear();
         self.filter_started = None;
         self.filter_display_rows = 0;
         self.filter_animating = false;
@@ -1155,6 +1085,7 @@ impl Finder {
         self.frame_cache_valid = false;
         self.cached_caret = None;
         self.dirty = true;
+        self.immediate = false;
     }
 
     pub fn toggle(&mut self) {
@@ -1396,6 +1327,8 @@ impl Finder {
         if !self.active {
             return false;
         }
+        // Real input is drawn in this loop pass; only the aftermath is paced.
+        self.immediate = true;
         match sym {
             XK_Escape => {
                 self.close();
@@ -1525,6 +1458,7 @@ impl Finder {
         if !self.active {
             return false;
         }
+        self.immediate = true;
         match detail {
             4 => {
                 self.set_scroll(self.scroll.saturating_sub(1));
@@ -1562,6 +1496,10 @@ impl Finder {
         if target != self.selected {
             self.selected = target;
             self.dirty = true;
+            self.immediate = true;
+            // The hovered row may be one whose icon has not filled in yet;
+            // ask for it without waiting for a scroll or keystroke.
+            self.icons_pending = true;
         }
         true
     }
@@ -1579,6 +1517,7 @@ impl Finder {
         if self.filter_animating {
             self.filter_animating = false;
             self.filter.clear();
+            self.filter_active.clear();
         }
         let was_moving = (self.scroll_visual - self.scroll as f64).abs() >= 0.001;
         self.scroll = value;
@@ -1676,6 +1615,7 @@ impl Finder {
         for anim in &mut self.filter {
             *anim = FilterAnim::default();
         }
+        self.filter_active.clear();
         self.filter_started = None;
         self.filter_animating = false;
         self.filter_display_rows = 0;
@@ -1743,6 +1683,14 @@ impl Finder {
                 outgoing: true,
             };
         }
+        // Snapshot the active slots in index order so frame-key hashing and
+        // drawing can skip the hundreds of idle slots without changing layering.
+        self.filter_active.clear();
+        for (index, anim) in self.filter.iter().enumerate() {
+            if anim.active {
+                self.filter_active.push(index);
+            }
+        }
         let mut rows = target_rows;
         for anim in &self.filter {
             if anim.active && anim.outgoing {
@@ -1759,6 +1707,9 @@ impl Finder {
     }
 
     pub fn tick(&mut self) -> Result<bool> {
+        // Input has been handled in this pass. Everything below is progress
+        // that `next_tick()` schedules at a fixed rate instead of 0 ms.
+        self.immediate = false;
         if !self.active {
             // OCR starts while Finder is closed. Poll its worker here so the
             // result can open the modal popup with the recognized text as the
@@ -1812,6 +1763,7 @@ impl Finder {
         if now.duration_since(self.scroll_started) >= SCROLL_TICK
             && (self.scroll_visual - self.scroll as f64).abs() >= 0.001
         {
+            let first_before = self.scroll_visual.max(0.0) as usize;
             let elapsed = now.duration_since(self.scroll_started).as_secs_f64();
             self.scroll_started = now;
             let fraction = 1.0 - (-elapsed / 0.025).exp();
@@ -1820,7 +1772,11 @@ impl Finder {
             if (self.scroll as f64 - self.scroll_visual).abs() < 0.01 {
                 self.scroll_visual = self.scroll as f64;
             }
-            self.icons_pending = true;
+            // Only newly visible rows need icons; do not re-arm the loader on
+            // every easing step or the frame cache is invalidated forever.
+            if self.scroll_visual.max(0.0) as usize != first_before {
+                self.icons_pending = true;
+            }
             self.dirty = true;
         }
         if let Some(started) = self.filter_started {
@@ -1832,6 +1788,7 @@ impl Finder {
                 for anim in &mut self.filter {
                     *anim = FilterAnim::default();
                 }
+                self.filter_active.clear();
             }
             self.dirty = true;
         }
@@ -1892,6 +1849,9 @@ impl Finder {
             if self.gl.is_some() {
                 if self.load_next_icon() {
                     self.dirty = true;
+                    // The texture epoch already changes the frame key; clearing
+                    // here only avoids one stale-frame copy on this pass.
+                    self.frame_cache_valid = false;
                 } else {
                     self.icons_pending = false;
                 }
@@ -1901,7 +1861,6 @@ impl Finder {
                 // frame still gets its icons instead of waiting for a scroll.
                 self.dirty = true;
             }
-            self.frame_cache_valid = false;
         }
         // The pulse is purely time-driven: nothing in the mutable state changes
         // between wakeups, so a start/end step comparison inside this pass can
@@ -1913,14 +1872,16 @@ impl Finder {
         Ok(self.dirty)
     }
 
-    /// Next wakeup needed by Finder's own animations. dwm uses 0 ms while a
-    /// frame or network result is pending, 10 ms for scroll/filter/pose easing,
-    /// 30 ms for the slower glow and result fades, and 500 ms for the caret.
+    /// Next wakeup needed by Finder's own animations. Real input wants 0 ms;
+    /// animation-derived `dirty` is paced at 10 ms for scroll/filter/pose,
+    /// 16 ms for icons, 30 ms for glow and result fades, and 500 ms for caret.
     pub fn next_tick(&self, now: Instant) -> Instant {
         if !self.active {
             return now + CURSOR_BLINK;
         }
-        if self.dirty || self.loading {
+        // Only real input needs a 0 ms wakeup. `dirty` also covers animation
+        // progress from tick(), which must be paced instead of busy-looping.
+        if self.immediate || self.loading {
             return now;
         }
         // Deadlines combine instead of short-circuiting. The old early return
@@ -1935,6 +1896,9 @@ impl Finder {
         }
         if self.glow_animating() {
             next = next.min(now + GLOW_TICK);
+        }
+        if self.icons_pending {
+            next = next.min(now + ICON_TICK);
         }
         let scrolling = (self.scroll_visual - self.scroll as f64).abs() >= 0.001;
         let pose_moving =
@@ -2734,7 +2698,8 @@ impl Finder {
         self.filter_animating.hash(&mut hasher);
         if self.filter_animating {
             Self::anim_step(self.filter_started, FILTER_ANIM).hash(&mut hasher);
-            for anim in &self.filter {
+            for &index in &self.filter_active {
+                let anim = &self.filter[index];
                 for value in [
                     anim.from_y,
                     anim.to_y,
@@ -2929,10 +2894,6 @@ impl Finder {
             return Ok(());
         }
         let now = Instant::now();
-        if self.icons_pending {
-            // A deferred load means the cached frame predates the icons.
-            self.frame_cache_valid = false;
-        }
         let mut key = self.frame_key(now, bh, w, h, clock_text);
         if self.frame_cache_valid && key == self.frame_cache_key {
             // Nothing that affects the GL frame changed. Reuse the composited
@@ -2996,8 +2957,18 @@ impl Finder {
         let translate_pending = self.translate_pending;
         let filter_animating = self.filter_animating;
         let filter_progress = Self::filter_progress(self.filter_started);
-        let filter = self.filter.clone();
-        let order = self.order.clone();
+        // Only the active filter slots change during an animation; cloning the
+        // whole 512-entry table on every frame was pure overhead.
+        let filter_active: Vec<(usize, FilterAnim)> = self
+            .filter_active
+            .iter()
+            .map(|&index| (index, self.filter[index]))
+            .collect();
+        let order = if filter_animating {
+            Vec::new()
+        } else {
+            self.order.clone()
+        };
         let scroll_visual = self.scroll_visual;
         let cursor_visible = self.cursor_visible && !query.is_empty();
 
@@ -3193,12 +3164,12 @@ impl Finder {
                 }
                 if filter_animating {
                     for pass in [true, false] {
-                        for (index, anim) in filter.iter().enumerate() {
-                            if !anim.active || anim.outgoing != pass {
+                        for &(index, anim) in &filter_active {
+                            if anim.outgoing != pass {
                                 continue;
                             }
                             let (y, alpha, scale_x, scale_y, blur) =
-                                Self::filter_eval(anim, filter_progress);
+                                Self::filter_eval(&anim, filter_progress);
                             if !(-1.0..=FINDER_ROWS as f32).contains(&y) {
                                 continue;
                             }
@@ -3336,11 +3307,21 @@ mod tests {
 
     #[test]
     fn ranks_exact_prefix_and_substring() {
-        let q = "fire";
-        assert_eq!(Finder::name_score("Fire", q), 100_000);
-        assert_eq!(Finder::name_score("Firefox", q), 90_000);
-        assert!(Finder::name_score("Mozilla Firefox", q) >= 49_980);
-        assert_eq!(Finder::name_score("Chromium", q), 0);
+        let candidates: Vec<Candidate> = ["Chromium", "Mozilla Firefox", "Firefox", "Fire"]
+            .iter()
+            .map(|label| Candidate {
+                id: (*label).to_string(),
+                label: (*label).to_string(),
+                search_text: (*label).to_string(),
+            })
+            .collect();
+        let mut engine = crate::finder_search::empty_for_tests();
+        let order = engine.rank(&candidates, "fire");
+        let labels: Vec<&str> = order
+            .iter()
+            .map(|&index| candidates[index].label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["Fire", "Firefox", "Mozilla Firefox"]);
     }
 
     #[test]
@@ -3364,9 +3345,11 @@ mod tests {
 
         // A cold start creates the GL surface in draw(), so tick() must not
         // consume the pending icon load before that context is available.
+        // The cached frame stays valid until an icon is actually uploaded;
+        // the content epoch handles the invalidation at that point.
         assert!(finder.icons_pending);
         assert!(finder.dirty);
-        assert!(!finder.frame_cache_valid);
+        assert!(finder.frame_cache_valid);
     }
 
     #[test]
@@ -3651,6 +3634,57 @@ mod tests {
         let next = f.next_tick(now);
         assert!(next <= now + GLOW_TICK);
         assert!(next < f.translate_due.unwrap());
+    }
+
+    #[test]
+    fn next_tick_paces_dirty_without_immediate_input() {
+        let mut f = Finder::new();
+        f.active = true;
+        let now = Instant::now();
+        f.dirty = true;
+        assert!(f.next_tick(now) > now);
+
+        f.immediate = true;
+        assert_eq!(f.next_tick(now), now);
+    }
+
+    #[test]
+    fn next_tick_keeps_icon_loading_alive() {
+        let mut f = Finder::new();
+        f.active = true;
+        f.icons_pending = true;
+        let now = Instant::now();
+        assert!(f.next_tick(now) <= now + ICON_TICK);
+    }
+
+    #[test]
+    fn motion_requests_icon_for_new_hovered_row() {
+        let mut f = Finder::new();
+        f.active = true;
+        f.visible = 2;
+        f.selected = 1;
+        let bh = 38;
+        assert!(f.motion(bh, 0, bh));
+        assert_eq!(f.selected, 0);
+        assert!(f.icons_pending);
+        assert!(f.immediate);
+    }
+
+    #[test]
+    fn frame_key_hashes_only_active_filter_slots() {
+        let mut f = Finder::new();
+        let now = Instant::now();
+        f.filter = vec![FilterAnim::default(); 4];
+        f.filter_active = vec![2];
+        f.filter_animating = true;
+        f.filter_started = Some(now);
+        let key = f.frame_key(now, 38, 300, 93, "12:00");
+
+        f.filter[0].to_y = 9.0;
+        assert_eq!(f.frame_key(now, 38, 300, 93, "12:00"), key);
+
+        f.filter[2].to_y = 9.0;
+        assert_ne!(f.frame_key(now, 38, 300, 93, "12:00"), key);
     }
 
     #[test]
