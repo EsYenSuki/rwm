@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int};
 use std::ptr;
 
+use image::imageops::{FilterType, resize};
+
 use x11::xft::{
     XftColor, XftColorAllocValue, XftColorFree, XftDraw, XftDrawChange, XftDrawCreate,
     XftDrawDestroy, XftDrawSetClip, XftDrawSetClipRectangles, XftDrawStringUtf8,
@@ -1036,11 +1038,7 @@ impl Drw {
         {
             return Some(cached.picture);
         }
-        let (sw, sh) = (art.width.max(1), art.height.max(1));
-        if art.rgba.len() < sw * sh * 4 || w == 0 || h == 0 {
-            return None;
-        }
-        let pixels = cover_pixels(art, w, h);
+        let pixels = cover_pixels(art, w, h)?;
         let (pixmap, picture) = self.argb_picture(&pixels, w, h)?;
         if let Some(old) = self.artwork.take() {
             unsafe {
@@ -1090,37 +1088,53 @@ impl Drw {
     }
 }
 
-/// Cover-scale the artwork the way the GL texture UVs did: crop the longer
-/// axis symmetrically so the panel has no stretched pixels.
-fn cover_pixels(art: &crate::mpris::Artwork, w: u32, h: u32) -> Vec<u32> {
-    let (sw, sh) = (art.width.max(1) as f32, art.height.max(1) as f32);
-    let aspect = w as f32 / h as f32;
-    let (u0, u1, v0, v1) = if aspect >= 1.0 {
-        let visible = 1.0 / aspect;
-        let top = (1.0 - visible) / 2.0;
-        (0.0, 1.0, top, top + visible)
-    } else {
-        let visible = aspect;
-        let left = (1.0 - visible) / 2.0;
-        (left, left + visible, 0.0, 1.0)
-    };
-    let mut out = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
-        let sy = v0 + ((y as f32 + 0.5) / h as f32) * (v1 - v0);
-        let src_y = ((sy * sh) as usize).min(sh as usize - 1);
-        for x in 0..w {
-            let sx = u0 + ((x as f32 + 0.5) / w as f32) * (u1 - u0);
-            let src_x = ((sx * sw) as usize).min(sw as usize - 1);
-            let i = (src_y * sw as usize + src_x) * 4;
-            out.push(
-                u32::from(art.rgba[i + 3]) << 24
-                    | u32::from(art.rgba[i]) << 16
-                    | u32::from(art.rgba[i + 1]) << 8
-                    | u32::from(art.rgba[i + 2]),
-            );
-        }
+/// Cover-fit the artwork into the panel: centre-crop the source to the panel's
+/// aspect, then scale once with Lanczos3. The artwork arrives at its native
+/// resolution, so this is the only resampling step and a small cover never
+/// gets blown up twice.
+fn cover_pixels(art: &crate::mpris::Artwork, w: u32, h: u32) -> Option<Vec<u32>> {
+    let (sw, sh) = (art.width as u32, art.height as u32);
+    if sw == 0 || sh == 0 || w == 0 || h == 0 {
+        return None;
     }
-    out
+    if art.rgba.len() < sw as usize * sh as usize * 4 {
+        return None;
+    }
+    let aspect = w as f64 / h as f64;
+    let (cw, ch) = if sw as f64 > sh as f64 * aspect {
+        (((sh as f64 * aspect).round() as u32).clamp(1, sw), sh)
+    } else {
+        (sw, ((sw as f64 / aspect).round() as u32).clamp(1, sh))
+    };
+    let (x0, y0) = ((sw - cw) / 2, (sh - ch) / 2);
+    let cropped = image::RgbaImage::from_fn(cw, ch, |x, y| {
+        let i = ((y + y0) * sw + x + x0) as usize * 4;
+        image::Rgba([
+            art.rgba[i],
+            art.rgba[i + 1],
+            art.rgba[i + 2],
+            art.rgba[i + 3],
+        ])
+    });
+    let scaled = if cw == w && ch == h {
+        cropped
+    } else {
+        resize(&cropped, w, h, FilterType::Lanczos3)
+    };
+    Some(
+        scaled
+            .into_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| {
+                u32::from(p[3]) << 24
+                    | u32::from(p[0]) << 16
+                    | u32::from(p[1]) << 8
+                    | u32::from(p[2])
+            })
+            .collect(),
+    )
 }
 
 impl Drop for Drw {
@@ -1155,5 +1169,36 @@ impl Drop for Drw {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_pixels_scales_native_art_once_to_panel_size() {
+        let mut rgba = Vec::with_capacity(336 * 188 * 4);
+        for _ in 0..336 * 188 {
+            rgba.extend_from_slice(&[40, 80, 120, 255]);
+        }
+        let art = crate::mpris::Artwork {
+            rgba,
+            width: 336,
+            height: 188,
+        };
+        let pixels = cover_pixels(&art, 600, 60).expect("cover pixels");
+        assert_eq!(pixels.len(), 600 * 60);
+        assert!(pixels.iter().all(|&p| p == 0xff28_5078));
+    }
+
+    #[test]
+    fn cover_pixels_rejects_short_pixel_buffers() {
+        let art = crate::mpris::Artwork {
+            rgba: vec![0; 4],
+            width: 8,
+            height: 8,
+        };
+        assert!(cover_pixels(&art, 60, 60).is_none());
     }
 }

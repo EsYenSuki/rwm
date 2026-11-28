@@ -2,12 +2,21 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::{c_uint, c_ulong};
-use std::os::fd::AsRawFd;
+use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use input::event::gesture::{
+    GestureEndEvent, GestureEventCoordinates, GestureEventTrait, GestureSwipeEvent,
+};
+use input::event::{DeviceEvent, Event as InputEvent, EventTrait as InputEventTrait, GestureEvent};
+use input::{Device, DeviceCapability, Libinput, LibinputInterface};
 
 use x11::keysym::XK_Escape;
 use x11::xlib;
@@ -84,6 +93,80 @@ const FLOAT_MARGIN: i32 = 20;
 /// Default outer size for a floating window that publishes no size hints.
 const DEFAULT_FLOAT_W: i32 = 600;
 const DEFAULT_FLOAT_H: i32 = 400;
+
+/// AnDWM's three-finger workspace swipe constants.
+const TOUCHPAD_SWIPE_SPEED: f64 = 0.20;
+const TOUCHPAD_SWIPE_EPSILON: f64 = 0.5;
+const TOUCHPAD_SWIPE_RETURN_STEPS: usize = 9;
+const TOUCHPAD_SWIPE_RETURN_DELAY: Duration = Duration::from_nanos(16_000_000);
+const TOUCHPAD_DEFAULT_WIDTH_MM: f64 = 100.0;
+
+/// Wrap a tag index exactly like C's `(index + LENGTH(tags)) % LENGTH(tags)`.
+fn wrap_tag(index: i32) -> usize {
+    index.rem_euclid(TAG_COUNT as i32) as usize
+}
+
+/// Pixel distance before clamping, matching AnDWM's progress formula.
+fn swipe_progress_px(direction: i32, dx_mm: f64, width_px: i32, width_mm: f64) -> f64 {
+    if width_mm <= 0.0 {
+        return 0.0;
+    }
+    direction as f64 * dx_mm * width_px as f64 * TOUCHPAD_SWIPE_SPEED / width_mm
+}
+
+/// libinput asks the WM to open device nodes itself. Rust's `OpenOptions`
+/// already sets `O_CLOEXEC`, so only the requested access mode is needed.
+struct TouchpadInterface;
+
+impl LibinputInterface for TouchpadInterface {
+    fn open_restricted(&mut self, path: &Path, flags: i32) -> std::result::Result<OwnedFd, i32> {
+        let access = flags & libc::O_ACCMODE;
+        OpenOptions::new()
+            .custom_flags(flags)
+            .read(access == libc::O_RDONLY || access == libc::O_RDWR)
+            .write(access == libc::O_WRONLY || access == libc::O_RDWR)
+            .open(path)
+            .map(|file| -> OwnedFd { File::from(file).into() })
+            .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))
+    }
+
+    fn close_restricted(&mut self, fd: OwnedFd) {
+        drop(fd);
+    }
+}
+
+/// One client's committed geometry while a workspace slide is in progress.
+/// Incoming windows follow AnDWM's `xmapclient()` path, so their live map and
+/// state properties change during the preview. The selected tag and EWMH
+/// desktop stay on the committed tag the whole time.
+#[derive(Clone, Copy)]
+struct SwipeClient {
+    win: Window,
+    /// Geometry under the committed tag set.
+    geom: Rect,
+    /// Geometry the window will have under the previewed tag.
+    target_geom: Rect,
+    is_current: bool,
+    is_target: bool,
+    /// Map state on the committed tag before the preview changed it.
+    was_mapped: bool,
+    /// True when the preview mapped an incoming window through the WM path.
+    preview_mapped: bool,
+}
+
+#[derive(Default)]
+struct SwipeState {
+    active: bool,
+    monitor: Option<usize>,
+    base: Option<usize>,
+    target: Option<usize>,
+    direction: i32,
+    dx_mm: f64,
+    dy_mm: f64,
+    width_mm: f64,
+    marker_active: bool,
+    saved: Vec<SwipeClient>,
+}
 
 /// The parts of `WM_NORMAL_HINTS` dwm's `updatesizehints()` keeps, plus the
 /// position/size a client asked for. Zero means "not specified", as in the C
@@ -790,6 +873,14 @@ pub struct Wm {
     /// EWMH's _NET_SUPPORTING_WM_CHECK window. It is an unmapped child of the
     /// root, so the startup scan would adopt it as a client without this.
     supporting_wm_check: Window,
+    /// Three-finger touchpad workspace swipes. `Libinput` is not Send/Sync, so
+    /// it stays with the WM on the main thread, like C dwm's static context.
+    touchpad_input: Option<Libinput>,
+    touchpad_device: Option<Device>,
+    /// Consecutive `libinput_dispatch()` failures. A readable fd plus a
+    /// permanent dispatch error would otherwise spin the main loop at 100%.
+    touchpad_failures: u32,
+    swipe: SwipeState,
     pub restart: bool,
 }
 
@@ -1200,6 +1291,10 @@ impl Wm {
             focus_hold_until: Instant::now(),
             _cursor_loader: cursor_loader,
             supporting_wm_check: NONE,
+            touchpad_input: None,
+            touchpad_device: None,
+            touchpad_failures: 0,
+            swipe: SwipeState::default(),
             restart: false,
         };
         // Initialize the notification GL state before the first D-Bus event.
@@ -1226,6 +1321,7 @@ impl Wm {
         wm.init_xkb();
         wm.init_randr();
         wm.setup_ewmh()?;
+        wm.init_touchpad();
         // Apps that started before this WM (or before the last restart) do not
         // resend their one-shot dock request. Adopt their XEMBED windows now,
         // before the normal client scan can mistake them for clients.
@@ -4089,6 +4185,7 @@ impl Wm {
     }
 
     fn arrange(&mut self) -> Result {
+        self.cancel_swipe_for_layout()?;
         for mi in 0..self.monitors.len() {
             self.ensure_sel(mi);
             self.update_bar_pos(mi);
@@ -5046,7 +5143,9 @@ impl Wm {
                 m.barrightwin,
                 m.mpris_markerwin,
             );
-            let selected = self.tags_of(mi);
+            let selected = self
+                .preview_selected_tags(mi)
+                .unwrap_or_else(|| self.tags_of(mi));
             let kbstr = self.kbstr.clone();
             let status = self.bar_status.clone();
             let player = self.mpris.clone();
@@ -6706,6 +6805,674 @@ impl Wm {
         Ok(())
     }
 
+    /// Main-loop wait: X events and libinput gestures share one poll. The
+    /// existing `wait_event` stays X-only for pointer drags so a grab does not
+    /// start a workspace swipe mid-move.
+    pub fn wait_event_with_touchpad(&mut self, timeout: Duration) -> Result {
+        let nanos = timeout.as_nanos();
+        let mut ms = nanos / 1_000_000;
+        if !nanos.is_multiple_of(1_000_000) {
+            ms += 1;
+        }
+        let ms = ms.min(i32::MAX as u128) as i32;
+        let input_fd = self
+            .touchpad_input
+            .as_ref()
+            .map_or(-1, |input| input.as_raw_fd());
+        let mut pfds = [
+            libc::pollfd {
+                fd: self.conn.stream().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: input_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) } < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err.into());
+            }
+        }
+        let input_events = pfds[1].revents;
+        if input_events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            // A broken libinput fd stays readable and would spin the loop.
+            self.disable_touchpad();
+            eprintln!("rwm: disabling touchpad gestures after a libinput fd error");
+        } else if input_events & libc::POLLIN != 0 {
+            self.dispatch_touchpad()?;
+        }
+        Ok(())
+    }
+
+    /// C dwm's `init_touchpad_swipes()`. Failure is non-fatal: keyboard tag
+    /// switching keeps working exactly as before.
+    fn init_touchpad(&mut self) {
+        let mut input = Libinput::new_with_udev(TouchpadInterface);
+        if input.udev_assign_seat("seat0").is_err() {
+            eprintln!("rwm: unable to initialize libinput touchpad gestures");
+            return;
+        }
+        // Like C, ignore the initial dispatch result: the fd stays readable
+        // until a later call can process pending device events.
+        let _ = input.dispatch();
+        self.touchpad_input = Some(input);
+    }
+
+    fn dispatch_touchpad(&mut self) -> Result {
+        let dispatched = match self.touchpad_input.as_mut() {
+            Some(input) => input.dispatch(),
+            None => return Ok(()),
+        };
+        if let Err(err) = dispatched {
+            self.touchpad_failures += 1;
+            // A single transient failure is fine; a readable fd that keeps
+            // failing dispatch would otherwise burn CPU every loop iteration.
+            if self.touchpad_failures >= 3 {
+                eprintln!("rwm: disabling touchpad gestures after libinput errors: {err}");
+                self.disable_touchpad();
+            }
+            return Ok(());
+        }
+        self.touchpad_failures = 0;
+        let events: Vec<InputEvent> = self
+            .touchpad_input
+            .as_mut()
+            .map_or_else(Vec::new, |input| input.collect());
+        for event in events {
+            self.handle_touchpad_event(event)?;
+        }
+        Ok(())
+    }
+
+    fn handle_touchpad_event(&mut self, event: InputEvent) -> Result {
+        // EventTrait works on the top-level event too, so device removal and
+        // gesture events can share the same comparison.
+        let device = event.device();
+        match event {
+            InputEvent::Device(DeviceEvent::Removed(_)) => {
+                if self.touchpad_device.as_ref() == Some(&device) {
+                    self.finish_swipe(true)?;
+                    self.touchpad_device = None;
+                    self.reset_swipe_transient();
+                }
+            }
+            InputEvent::Device(_) => {}
+            InputEvent::Gesture(GestureEvent::Swipe(swipe)) => {
+                let fingers = swipe.finger_count();
+                match swipe {
+                    GestureSwipeEvent::Begin(_) => {
+                        if fingers != 3 || self.touchpad_device.is_some() {
+                            return Ok(());
+                        }
+                        if !device.has_capability(DeviceCapability::Gesture) {
+                            return Ok(());
+                        }
+                        let width = device
+                            .size()
+                            .filter(|(width, _)| *width > 1.0)
+                            .map_or(TOUCHPAD_DEFAULT_WIDTH_MM, |(width, _)| width);
+                        self.touchpad_device = Some(device);
+                        self.swipe.monitor = Some(self.selmon);
+                        self.swipe.dx_mm = 0.0;
+                        self.swipe.dy_mm = 0.0;
+                        self.swipe.active = false;
+                        self.swipe.marker_active = false;
+                        self.swipe.base = None;
+                        self.swipe.target = None;
+                        self.swipe.width_mm = width;
+                    }
+                    GestureSwipeEvent::Update(update) => {
+                        if self.touchpad_device.as_ref() != Some(&device) || fingers != 3 {
+                            return Ok(());
+                        }
+                        self.swipe.dx_mm += update.dx();
+                        self.swipe.dy_mm += update.dy();
+                        if !self.swipe.active {
+                            if self.swipe.dx_mm.abs() <= self.swipe.dy_mm.abs() * 1.25 {
+                                return Ok(());
+                            }
+                            let direction = if self.swipe.dx_mm > 0.0 { 1 } else { -1 };
+                            let Some(mi) = self.swipe.monitor else {
+                                return Ok(());
+                            };
+                            let m = &self.monitors[mi];
+                            if mi != self.selmon || m.curtag == 0 || m.curtag > TAG_COUNT as usize {
+                                return Ok(());
+                            }
+                            let current = m.curtag - 1;
+                            let target = wrap_tag(current as i32 - direction);
+                            self.swipe.direction = direction;
+                            if !self.begin_swipe(mi, current, target, direction) {
+                                return Ok(());
+                            }
+                        }
+                        self.update_swipe(true)?;
+                    }
+                    GestureSwipeEvent::End(end) => {
+                        if self.touchpad_device.as_ref() != Some(&device) || fingers != 3 {
+                            return Ok(());
+                        }
+                        let cancelled = end.cancelled();
+                        self.finish_swipe(cancelled)?;
+                        self.touchpad_device = None;
+                        self.reset_swipe_transient();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn reset_swipe_transient(&mut self) {
+        self.swipe.monitor = None;
+        self.swipe.base = None;
+        self.swipe.target = None;
+        self.swipe.dx_mm = 0.0;
+        self.swipe.dy_mm = 0.0;
+        self.swipe.active = false;
+        self.swipe.marker_active = false;
+        self.swipe.saved.clear();
+    }
+
+    /// Stop polling a libinput context that can no longer make progress.
+    /// Leaving a broken fd in `poll()` makes it return immediately forever.
+    fn disable_touchpad(&mut self) {
+        if self.touchpad_input.is_none() && self.touchpad_device.is_none() {
+            return;
+        }
+        if self.swipe.active {
+            let _ = self.finish_swipe(true);
+        }
+        self.touchpad_input = None;
+        self.touchpad_device = None;
+        self.touchpad_failures = 0;
+        self.reset_swipe_transient();
+    }
+
+    /// The tag strip shows the destination while the slide is past halfway.
+    /// Root EWMH state still names the committed desktop.
+    fn preview_selected_tags(&self, mi: usize) -> Option<u32> {
+        if self.swipe.active && self.swipe.marker_active && self.swipe.monitor == Some(mi) {
+            self.swipe.target.map(|tag| 1u32 << tag)
+        } else {
+            None
+        }
+    }
+
+    /// Layout of `target` without publishing it. The tagset and bar geometry
+    /// are changed only long enough for the read-only layout helpers, then
+    /// restored before any X request or bar draw.
+    fn target_geometry(
+        &mut self,
+        mi: usize,
+        target: usize,
+    ) -> (HashMap<Window, Rect>, Option<Window>) {
+        let (saved_tagset, saved_showbar, saved_bar) = {
+            let m = &self.monitors[mi];
+            (
+                m.tagset[m.seltags],
+                m.showbar,
+                (m.wx, m.wy, m.ww, m.wh, m.by),
+            )
+        };
+        {
+            let m = &mut self.monitors[mi];
+            m.tagset[m.seltags] = 1u32 << target;
+            m.showbar = m.showbars[target + 1];
+        }
+        self.update_bar_pos(mi);
+
+        let mut boxes: HashMap<Window, Rect> = self.layout_mon(mi).into_iter().collect();
+        let fullscreen = self.fullscreen_windows(mi);
+        let owner = fullscreen.first().map(|(_, win)| *win);
+        let mrect = self.monitors[mi].rect;
+        for (_, win) in fullscreen {
+            boxes.insert(win, mrect);
+        }
+        let other: Vec<(Window, Rect)> = self
+            .clients
+            .iter()
+            .filter(|c| c.mon == mi && (c.floating || c.dragging))
+            .map(|c| (c.win, c.geom))
+            .collect();
+        for (win, geom) in other {
+            boxes.entry(win).or_insert(geom);
+        }
+
+        let m = &mut self.monitors[mi];
+        m.tagset[m.seltags] = saved_tagset;
+        m.showbar = saved_showbar;
+        (m.wx, m.wy, m.ww, m.wh, m.by) = saved_bar;
+        (boxes, owner)
+    }
+
+    /// C dwm's `begin_touchpad_swipe()`. X geometry and incoming-window map
+    /// state follow the preview; the tagset, `c.hidden`, the tiling tree and
+    /// EWMH desktop properties keep describing the committed tag.
+    fn begin_swipe(&mut self, mi: usize, base: usize, target: usize, direction: i32) -> bool {
+        if self.finder.is_active()
+            || mi != self.selmon
+            || base >= TAG_COUNT as usize
+            || target >= TAG_COUNT as usize
+        {
+            return false;
+        }
+        let current_tags = self.monitors[mi].tagset[self.monitors[mi].seltags];
+        if !current_tags.is_power_of_two()
+            || current_tags != 1u32 << base
+            || self.monitors[mi].curtag != base + 1
+        {
+            return false;
+        }
+        if !self.clients.iter().any(|c| c.mon == mi) {
+            return false;
+        }
+
+        let target_bit = 1u32 << target;
+        let (target_boxes, target_owner) = self.target_geometry(mi, target);
+        // (window, committed geometry, tags, hidden, floating, fullscreen)
+        let seeds: Vec<(Window, Rect, u32, bool, bool, bool)> = self
+            .clients
+            .iter()
+            .filter(|c| c.mon == mi)
+            .map(|c| (c.win, c.geom, c.tags, c.hidden, c.floating, c.fullscreen))
+            .collect();
+
+        let mut saved = Vec::with_capacity(seeds.len());
+        let mut to_map = Vec::new();
+        let ww = self.monitors[mi].ww;
+        for (win, geom, tags, hidden, floating, fullscreen) in seeds {
+            let is_current = tags & current_tags != 0;
+            let is_target = tags & target_bit != 0;
+            let was_mapped = self
+                .client_maps
+                .borrow()
+                .get(&win)
+                .is_some_and(|state| state.mapped);
+            let target_geom = target_boxes.get(&win).copied().unwrap_or(geom);
+            let slides = is_current != is_target;
+
+            if slides && (is_current || was_mapped) {
+                let _ = self.set_no_animation(win, true);
+            }
+            let (x, y, w, h) = if !is_current && is_target {
+                (
+                    target_geom.x - direction * ww,
+                    target_geom.y,
+                    target_geom.w,
+                    target_geom.h,
+                )
+            } else {
+                (geom.x, geom.y, geom.w, geom.h)
+            };
+            let _ = self.conn.configure_window(
+                win,
+                &ConfigureWindowAux::new()
+                    .x(x)
+                    .y(y)
+                    .width(w.max(1))
+                    .height(h.max(1)),
+            );
+
+            if is_target
+                && !is_current
+                && !was_mapped
+                && !hidden
+                && Self::map_allowed(win, floating, fullscreen, target_owner)
+            {
+                to_map.push(win);
+            }
+            saved.push(SwipeClient {
+                win,
+                geom,
+                target_geom,
+                is_current,
+                is_target,
+                was_mapped,
+                preview_mapped: false,
+            });
+        }
+
+        for win in to_map {
+            // AnDWM uses xmapclient() here, not a bare XMapWindow. Publishing
+            // NormalState and clearing _NET_WM_STATE_HIDDEN is what makes the
+            // client (and the compositor) treat the incoming window as live.
+            if let Some(state) = self.client_maps.borrow_mut().get_mut(&win) {
+                state.published_iconic = None;
+            }
+            let _ = self.wm_map(win);
+            let _ = self.set_no_animation(win, true);
+            if let Some(entry) = saved.iter_mut().find(|entry| entry.win == win) {
+                entry.preview_mapped = true;
+            }
+        }
+        let _ = self.conn.flush();
+
+        self.swipe.active = true;
+        self.swipe.monitor = Some(mi);
+        self.swipe.base = Some(base);
+        self.swipe.target = Some(target);
+        self.swipe.direction = direction;
+        self.swipe.marker_active = false;
+        self.swipe.saved = saved;
+        self.bar_dirty = true;
+        true
+    }
+
+    /// Raw delta before clamping. Negative values are what triggers reversing.
+    fn swipe_progress_raw(&self) -> f64 {
+        let Some(mi) = self.swipe.monitor else {
+            return 0.0;
+        };
+        swipe_progress_px(
+            self.swipe.direction,
+            self.swipe.dx_mm,
+            self.monitors[mi].ww,
+            self.swipe.width_mm,
+        )
+    }
+
+    fn swipe_progress(&self) -> f64 {
+        let width = self
+            .swipe
+            .monitor
+            .map_or(0.0, |mi| self.monitors[mi].ww as f64);
+        self.swipe_progress_raw().clamp(0.0, width)
+    }
+
+    fn set_swipe_animation(&self, on: bool) {
+        for entry in &self.swipe.saved {
+            if entry.is_current != entry.is_target && self.is_managed(entry.win) {
+                let _ = self.set_no_animation(entry.win, on);
+            }
+        }
+    }
+
+    /// The live two-tag slide. `px` is how far the preview has travelled.
+    fn position_swipe(&self, px: i32) -> Result {
+        let Some(mi) = self.swipe.monitor else {
+            return Ok(());
+        };
+        let ww = self.monitors[mi].ww;
+        for entry in &self.swipe.saved {
+            if !self.is_managed(entry.win) || entry.is_current == entry.is_target {
+                continue;
+            }
+            let (x, y, w, h) = if entry.is_current {
+                (
+                    entry.geom.x + self.swipe.direction * px,
+                    entry.geom.y,
+                    entry.geom.w,
+                    entry.geom.h,
+                )
+            } else {
+                (
+                    entry.target_geom.x - self.swipe.direction * ww + self.swipe.direction * px,
+                    entry.target_geom.y,
+                    entry.target_geom.w,
+                    entry.target_geom.h,
+                )
+            };
+            let _ = self.conn.configure_window(
+                entry.win,
+                &ConfigureWindowAux::new()
+                    .x(x)
+                    .y(y)
+                    .width(w.max(1))
+                    .height(h.max(1)),
+            );
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Restore committed geometry and iconified state, like AnDWM's
+    /// `restore_touchpad_swipe_clients()`. The tagset and EWMH desktop are not
+    /// changed here.
+    fn restore_swipe(&mut self) -> Result {
+        let ww = self.swipe.monitor.map_or(0, |mi| self.monitors[mi].ww);
+        for entry in &self.swipe.saved {
+            if !self.is_managed(entry.win) {
+                continue;
+            }
+            let (x, y, w, h) = if entry.preview_mapped && !entry.is_current && entry.is_target {
+                (
+                    entry.target_geom.x - self.swipe.direction * ww,
+                    entry.target_geom.y,
+                    entry.target_geom.w,
+                    entry.target_geom.h,
+                )
+            } else {
+                (entry.geom.x, entry.geom.y, entry.geom.w, entry.geom.h)
+            };
+            let _ = self.conn.configure_window(
+                entry.win,
+                &ConfigureWindowAux::new()
+                    .x(x)
+                    .y(y)
+                    .width(w.max(1))
+                    .height(h.max(1)),
+            );
+            if entry.is_current != entry.is_target {
+                let _ = self.set_no_animation(entry.win, false);
+            }
+            if entry.preview_mapped {
+                // Mirror AnDWM's restore: unmap through the WM path so
+                // WM_STATE becomes IconicState and _NET_WM_STATE_HIDDEN comes
+                // back, then let our own UnmapNotify be consumed as ours.
+                if let Some(state) = self.client_maps.borrow_mut().get_mut(&entry.win) {
+                    state.published_iconic = None;
+                }
+                let _ = self.wm_unmap(entry.win);
+            }
+        }
+        for entry in &mut self.swipe.saved {
+            entry.preview_mapped = false;
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn update_swipe(&mut self, allow_chain: bool) -> Result {
+        let Some(mi) = self.swipe.monitor else {
+            return Ok(());
+        };
+        for _ in 0..(TAG_COUNT as usize + 2) {
+            if !self.swipe.active {
+                break;
+            }
+            // view() can toggle the bar, so refresh the work-area width every
+            // pass instead of keeping the width from before a chained commit.
+            let width = self.monitors[mi].ww;
+            let progress = self.swipe_progress_raw();
+            if progress >= width as f64 {
+                if !allow_chain {
+                    break;
+                }
+                // Show the completed step before committing it.
+                self.position_swipe(width)?;
+                if !self.chain_swipe()? {
+                    break;
+                }
+                continue;
+            }
+            if progress < -TOUCHPAD_SWIPE_EPSILON {
+                if !allow_chain {
+                    break;
+                }
+                self.position_swipe(0)?;
+                if !self.reverse_swipe()? {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if !self.swipe.active {
+            return Ok(());
+        }
+        let progress = self.swipe_progress();
+        let marker = progress >= self.monitors[mi].ww as f64 * 0.50;
+        if self.swipe.marker_active != marker {
+            self.swipe.marker_active = marker;
+            self.bar_dirty = true;
+        }
+        self.position_swipe(progress as i32)?;
+        Ok(())
+    }
+
+    /// One full screen was crossed: commit it through `view()` (the only path
+    /// that emits `_NET_CURRENT_DESKTOP`), then preview the next neighbour.
+    fn chain_swipe(&mut self) -> Result<bool> {
+        let Some(mi) = self.swipe.monitor else {
+            return Ok(false);
+        };
+        let (Some(base), Some(target)) = (self.swipe.base, self.swipe.target) else {
+            return Ok(false);
+        };
+        if !self.swipe.active || mi != self.selmon || self.tags_of(mi) != 1u32 << base {
+            return Ok(false);
+        }
+        let committed = target;
+        let next = wrap_tag(committed as i32 - self.swipe.direction);
+        let step_mm = self.swipe.width_mm / TOUCHPAD_SWIPE_SPEED;
+        self.swipe.dx_mm -= self.swipe.direction as f64 * step_mm;
+
+        self.set_swipe_animation(false);
+        // Keep the finished X geometry: view()/arrange() will replace it. Do
+        // not restore or unmap, or the swap visibly jumps backwards first.
+        self.swipe.saved.clear();
+        self.swipe.active = false;
+        self.swipe.marker_active = false;
+        self.bar_dirty = true;
+        self.view(1u32 << committed)?;
+
+        self.swipe.base = Some(committed);
+        self.swipe.target = Some(next);
+        if !self.begin_swipe(mi, committed, next, self.swipe.direction) {
+            self.swipe.dx_mm = 0.0;
+        }
+        Ok(true)
+    }
+
+    /// The fingers crossed back through the starting point. Keep the committed
+    /// tag, restore the old preview, then open the neighbour on the other side.
+    fn reverse_swipe(&mut self) -> Result<bool> {
+        let Some(mi) = self.swipe.monitor else {
+            return Ok(false);
+        };
+        let Some(base) = self.swipe.base else {
+            return Ok(false);
+        };
+        if !self.swipe.active {
+            return Ok(false);
+        }
+        let target = wrap_tag(base as i32 + self.swipe.direction);
+        self.set_swipe_animation(false);
+        self.restore_swipe()?;
+        self.swipe.saved.clear();
+        self.swipe.active = false;
+        self.swipe.marker_active = false;
+        self.swipe.direction = -self.swipe.direction;
+        self.swipe.target = Some(target);
+        self.bar_dirty = true;
+        if !self.begin_swipe(mi, base, target, self.swipe.direction) {
+            self.swipe.dx_mm = 0.0;
+        }
+        Ok(true)
+    }
+
+    /// Nine eased frames, like AnDWM's `clock_nanosleep` loop.
+    fn animate_swipe(&mut self, commit: bool) -> Result {
+        let Some(mi) = self.swipe.monitor else {
+            return Ok(());
+        };
+        let width = self.monitors[mi].ww;
+        let start = self.swipe_progress() as i32;
+        for step in 1..=TOUCHPAD_SWIPE_RETURN_STEPS {
+            let t = step as f64 / TOUCHPAD_SWIPE_RETURN_STEPS as f64;
+            let eased = t * t * (3.0 - 2.0 * t);
+            let px = if commit {
+                start + ((width - start) as f64 * eased + 0.5) as i32
+            } else {
+                (start as f64 * (1.0 - eased) + 0.5) as i32
+            };
+            self.position_swipe(px)?;
+            thread::sleep(TOUCHPAD_SWIPE_RETURN_DELAY);
+        }
+        Ok(())
+    }
+
+    /// C dwm's `finish_touchpad_swipe()`. A commit keeps the preview geometry
+    /// until `view()` performs the normal tag transition and layout.
+    fn finish_swipe(&mut self, cancelled: bool) -> Result {
+        if !self.swipe.active {
+            return Ok(());
+        }
+        // Resolve a final boundary before deciding whether to promote it. A
+        // cancelled gesture cannot cross a new boundary.
+        self.update_swipe(!cancelled)?;
+        if !self.swipe.active {
+            self.swipe.monitor = None;
+            self.swipe.base = None;
+            self.swipe.target = None;
+            self.swipe.marker_active = false;
+            self.bar_dirty = true;
+            return Ok(());
+        }
+        let Some(mi) = self.swipe.monitor else {
+            return Ok(());
+        };
+        let commit = !cancelled
+            && mi == self.selmon
+            && self.swipe_progress() >= self.monitors[mi].ww as f64 * 0.50;
+        if commit {
+            self.set_swipe_animation(false);
+            self.animate_swipe(true)?;
+        } else {
+            self.swipe.active = false;
+            self.swipe.marker_active = false;
+            self.bar_dirty = true;
+            let _ = self.conn.flush();
+            self.set_swipe_animation(false);
+            self.animate_swipe(false)?;
+            self.restore_swipe()?;
+        }
+
+        let target = self.swipe.target;
+        self.swipe.active = false;
+        self.swipe.marker_active = false;
+        self.swipe.saved.clear();
+        self.swipe.monitor = None;
+        self.swipe.base = None;
+        self.swipe.target = None;
+        self.bar_dirty = true;
+        if commit && mi == self.selmon {
+            if let Some(tag) = target {
+                self.view(1u32 << tag)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A real layout pass invalidates the two-tag preview. Without this, a
+    /// keyboard tag switch or a new client arriving mid-swipe would leave the
+    /// preview-mapped incoming windows visible while `client_maps` still says
+    /// they are hidden. Chain and finish commits clear `active` before calling
+    /// `view()`, so they keep their preview geometry until the normal layout.
+    fn cancel_swipe_for_layout(&mut self) -> Result {
+        if self.swipe.active {
+            self.finish_swipe(true)?;
+        }
+        Ok(())
+    }
+
     fn set_no_animation(&self, win: Window, on: bool) -> Result {
         if on {
             self.conn.change_property32(
@@ -7204,6 +7971,7 @@ impl Wm {
     }
 
     fn view(&mut self, ui: u32) -> Result {
+        self.cancel_swipe_for_layout()?;
         let mi = self.selmon;
         let m = &mut self.monitors[mi];
         if ui & TAGMASK == m.tagset[m.seltags] {
@@ -7588,6 +8356,12 @@ impl Wm {
     /// dwm's `cleanup()`: release modal grabs, all bar windows and colormaps.
     /// `main` calls this before `exec()` on restart, since an exec skips Drop.
     pub fn shutdown(&mut self) {
+        // C dwm cancels a live slide before releasing the libinput context.
+        if self.swipe.active {
+            let _ = self.finish_swipe(true);
+        }
+        self.touchpad_device = None;
+        self.touchpad_input = None;
         if self.finder.is_active() {
             self.finder.close();
         }
@@ -7638,6 +8412,27 @@ mod tests {
 
     fn box_(w: u32, h: u32) -> Rect {
         Rect { x: 10, y: 20, w, h }
+    }
+
+    #[test]
+    fn touchpad_swipe_wraps_adjacent_tag_indices() {
+        // Forward from tag 1 crosses to the last tag; backward from the last
+        // tag wraps to tag 1, exactly like C's modulo arithmetic.
+        assert_eq!(wrap_tag(0 - 1), TAG_COUNT as usize - 1);
+        assert_eq!(wrap_tag(TAG_COUNT as i32 - 1 + 1), 0);
+        assert_eq!(wrap_tag(2 - 1), 1);
+        assert_eq!(wrap_tag(2 + 1), 3);
+    }
+
+    #[test]
+    fn touchpad_swipe_progress_uses_andwm_formula() {
+        assert_eq!(swipe_progress_px(1, 100.0, 1000, 100.0), 200.0);
+        assert_eq!(swipe_progress_px(-1, 100.0, 1000, 100.0), -200.0);
+        assert_eq!(swipe_progress_px(1, 100.0, 1000, 0.0), 0.0);
+
+        let clamped = swipe_progress_px(1, 500.0, 1000, 100.0).clamp(0.0, 1000.0);
+        assert_eq!(clamped, 1000.0);
+        assert!(clamped >= 1000.0 * 0.50);
     }
 
     #[test]

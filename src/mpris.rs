@@ -6,14 +6,13 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
 
-use image::imageops::{FilterType, crop_imm, resize};
+use image::imageops::{FilterType, resize};
 
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::OwnedValue;
 
 const PLAYER_PATH: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
-const ART_SIZE: usize = 512;
 
 #[derive(Debug)]
 pub struct Artwork {
@@ -362,7 +361,7 @@ fn busctl_dict_number(fields: &[String], key: &str) -> Option<f64> {
     fields.get(index + 2)?.parse().ok()
 }
 
-/// Decode an MPRIS cover into the square RGBA buffer the bar expects. Local
+/// Decode an MPRIS cover into an RGBA buffer at its native aspect ratio. Local
 /// files are read directly; remote URLs are fetched with a bounded curl call.
 /// This deliberately uses the `image` crate instead of an external ffmpeg: a
 /// broken/updated ffmpeg otherwise silently leaves every snapshot without
@@ -388,7 +387,7 @@ fn load_artwork(url: &str) -> Option<Artwork> {
     } else {
         return None;
     };
-    let art = square_artwork(source)?;
+    let art = native_artwork(source)?;
     eprintln!(
         "rwm: loaded MPRIS artwork from {url} ({}x{})",
         art.width, art.height
@@ -396,30 +395,32 @@ fn load_artwork(url: &str) -> Option<Artwork> {
     Some(art)
 }
 
-/// The AnDWM reference scales the source to cover the panel and centre-crops
-/// the excess. The bar does the cover-fit to its own size, so here the source
-/// is centre-cropped to a square and then scaled to the fixed artwork size.
-fn square_artwork(source: image::RgbaImage) -> Option<Artwork> {
+/// Keep the cover at its native aspect ratio. Upscaling a small thumbnail to a
+/// fixed size here made it soft and cropped away its sides; the bar now does
+/// one high-quality resize to the panel size. Only unusually large images are
+/// downscaled, preserving aspect, to bound the memory held for a cover.
+fn native_artwork(source: image::RgbaImage) -> Option<Artwork> {
+    const MAX_DIM: u32 = 1024;
     let (w, h) = source.dimensions();
-    let side = w.min(h);
-    if side == 0 {
+    if w == 0 || h == 0 {
         return None;
     }
-    let crop = crop_imm(&source, (w - side) / 2, (h - side) / 2, side, side);
-    let square = if side as usize == ART_SIZE {
-        crop.to_image()
-    } else {
+    let image = if w.max(h) > MAX_DIM {
+        let scale = MAX_DIM as f64 / w.max(h) as f64;
         resize(
-            &crop.to_image(),
-            ART_SIZE as u32,
-            ART_SIZE as u32,
+            &source,
+            (w as f64 * scale).round().max(1.0) as u32,
+            (h as f64 * scale).round().max(1.0) as u32,
             FilterType::Lanczos3,
         )
+    } else {
+        source
     };
+    let (width, height) = image.dimensions();
     Some(Artwork {
-        rgba: square.into_raw(),
-        width: ART_SIZE,
-        height: ART_SIZE,
+        rgba: image.into_raw(),
+        width: width as usize,
+        height: height as usize,
     })
 }
 
@@ -615,14 +616,22 @@ mod tests {
         let art = load_artwork(&url).expect("decode test cover");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!((art.width, art.height), (ART_SIZE, ART_SIZE));
-        assert_eq!(art.rgba.len(), ART_SIZE * ART_SIZE * 4);
+        assert_eq!((art.width, art.height), (8, 4));
+        assert_eq!(art.rgba.len(), 8 * 4 * 4);
         for pixel in art.rgba.chunks_exact(4) {
             assert!(pixel[0].abs_diff(color.0[0]) <= 2);
             assert!(pixel[1].abs_diff(color.0[1]) <= 2);
             assert!(pixel[2].abs_diff(color.0[2]) <= 2);
             assert_eq!(pixel[3], 255);
         }
+    }
+
+    #[test]
+    fn keeps_wide_cover_at_native_aspect() {
+        let source = image::RgbaImage::from_pixel(336, 188, Rgba([10, 20, 30, 255]));
+        let art = native_artwork(source).expect("normalize test cover");
+        assert_eq!((art.width, art.height), (336, 188));
+        assert_eq!(art.rgba.len(), 336 * 188 * 4);
     }
 
     #[test]

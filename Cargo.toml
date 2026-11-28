@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 frizbee = { version = "0.13", features = ["safe_read"] }
 gl = "0.14"
+input = "0.10.0"
 freetype-sys = "0.20.1"
 image = "0.25.10"
 libc = "0.2.191"

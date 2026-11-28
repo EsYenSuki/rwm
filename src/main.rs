@@ -136,7 +136,7 @@ fn main() -> Result {
         }
         // All animated bar values advance on the single deadline refresh()
         // just computed. Block on the X connection until then or an event.
-        wm.wait_event(next_refresh.saturating_duration_since(Instant::now()))?;
+        wm.wait_event_with_touchpad(next_refresh.saturating_duration_since(Instant::now()))?;
     }
     Ok(())
 }
